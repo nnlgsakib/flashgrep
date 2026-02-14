@@ -1,0 +1,210 @@
+use crate::config::paths::{get_repo_root, FlashgrepPaths};
+use crate::index::engine::Indexer;
+use crate::mcp::McpServer;
+use crate::watcher::FileWatcher;
+use crate::FlashgrepResult;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use tokio::task;
+use tracing::info;
+
+/// Flashgrep CLI
+#[derive(Parser)]
+#[command(name = "flashgrep")]
+#[command(about = "High-performance local code indexing engine")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Index a repository
+    Index {
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Force full re-index (ignore existing index)
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Start the daemon with file watcher and MCP server
+    Start {
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Show index statistics
+    Stats {
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Clear the index for a repository
+    Clear {
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },}
+
+/// Run the CLI
+pub async fn run() -> FlashgrepResult<()> {
+    let cli = Cli::parse();
+    
+    match cli.command {
+        Commands::Index { path, force } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            info!("Indexing repository: {}", repo_root.display());
+            
+            let mut indexer = Indexer::new(repo_root.clone())?;
+            
+            if force {
+                println!("Force re-indexing...");
+                indexer.clear_index()?;
+            }
+            
+            let stats = indexer.index_repository(&repo_root)?;
+            
+            println!("\n✓ Indexing complete!");
+            println!("  Files indexed: {}", stats.total_files);
+            println!("  Chunks created: {}", stats.total_chunks);
+            println!("  Symbols detected: {}", stats.total_symbols);
+            
+            Ok(())
+        }
+        Commands::Start { path } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            info!("Starting daemon for: {}", repo_root.display());
+            
+            // Check if index exists
+            if !FlashgrepPaths::new(&repo_root).exists() {
+                println!("⚠ No index found. Run 'flashgrep index' first.");
+                return Ok(());
+            }
+            
+            println!("Starting flashgrep daemon...");
+            println!("Repository: {}", repo_root.display());
+            
+            // Start MCP server in one task
+            let mcp_server = McpServer::new(repo_root.clone())?;
+            let mcp_handle = task::spawn(async move {
+                if let Err(e) = mcp_server.start().await {
+                    eprintln!("MCP server error: {}", e);
+                }
+            });
+            
+            // Start file watcher in another task
+            let watcher_root = repo_root.clone();
+            let watcher_handle = task::spawn_blocking(move || {
+                let mut watcher = match FileWatcher::new(watcher_root) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("Failed to create file watcher: {}", e);
+                        return;
+                    }
+                };
+                
+                println!("File watcher started");
+                
+                if let Err(e) = watcher.watch() {
+                    eprintln!("File watcher error: {}", e);
+                }
+            });
+            
+            // Wait for either task to complete (or Ctrl+C)
+            tokio::select! {
+                _ = mcp_handle => {
+                    println!("MCP server stopped");
+                }
+                _ = watcher_handle => {
+                    println!("File watcher stopped");
+                }
+            }
+            
+            Ok(())
+        }
+        Commands::Stats { path } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            
+            if !FlashgrepPaths::new(&repo_root).exists() {
+                println!("⚠ No index found. Run 'flashgrep index' first.");
+                return Ok(());
+            }
+            
+            let indexer = Indexer::new(repo_root)?;
+            let stats = indexer.get_stats()?;
+            
+            println!("\n📊 Index Statistics");
+            println!("==================");
+            println!("  Total files: {}", stats.total_files);
+            println!("  Total chunks: {}", stats.total_chunks);
+            println!("  Total symbols: {}", stats.total_symbols);
+            println!("  Index size: {} MB", stats.index_size_bytes / 1024 / 1024);
+            if let Some(last_update) = stats.last_update {
+                let datetime = chrono::DateTime::from_timestamp(last_update, 0);
+                if let Some(dt) = datetime {
+                    println!("  Last update: {}", dt.format("%Y-%m-%d %H:%M:%S"));
+                }
+            }
+            
+            Ok(())
+        }
+        Commands::Clear { path } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            
+            if !FlashgrepPaths::new(&repo_root).exists() {
+                println!("⚠ No index found.");
+                return Ok(());
+            }
+            
+            print!("Are you sure you want to clear the index? [y/N]: ");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            
+            if input.trim().eq_ignore_ascii_case("y") {
+                let mut indexer = Indexer::new(repo_root)?;
+                indexer.clear_index()?;
+                println!("✓ Index cleared");
+            } else {
+                println!("Cancelled");
+            }
+            
+            Ok(())
+        }
+    }
+}
+
+/// Print help information about .flashgrepignore
+pub fn print_ignore_help() {
+    println!("
+.flashgrepignore file format:
+  The .flashgrepignore file uses gitignore-style patterns to exclude files and
+  directories from indexing. Place this file in the root of your repository.
+
+Pattern syntax:
+  *       - Wildcard, matches any sequence of characters
+  ?       - Matches a single character
+  **/     - Matches any number of directory levels
+  /       - Anchors pattern to root
+  !       - Negates a pattern (re-includes previously excluded files)
+  #       - Comment line (ignored)
+
+Examples:
+  # Ignore all log files
+  *.log
+
+  # Ignore the build directory
+  build/
+
+  # Ignore all .tmp files except important.tmp
+  *.tmp
+  !important.tmp
+
+  # Ignore a specific file at root
+  /config.local.json
+");
+}

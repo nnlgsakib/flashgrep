@@ -1,6 +1,70 @@
 [package]
 name = "flashgrep"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Flashgrep Contributors"]
+description = "High-performance local code indexing engine"
+license = "MIT"
+repository = "https://github.com/yourusername/flashgrep"
 
 [dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1.36", features = ["full"] }
+
+# Search engine
+tantivy = { version = "0.21", default-features = false, features = ["mmap"] }
+zstd-safe = "=6.0.6"
+zstd-sys = "=2.0.9"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+
+# File watching
+notify = "6.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Pattern matching
+regex = "1.10"
+glob = "0.3"
+
+# Logging and error handling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+# HTTP/JSON-RPC
+axum = "0.7"
+tower = "0.4"
+hyper = { version = "1.2", features = ["full"] }
+
+# Utilities
+walkdir = "2.5"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+config = "0.14"
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = true

@@ -1,4 +1,21 @@
-/target
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI assistants
 /.claude
 /.cline
 /.clinerules
@@ -6,3 +23,12 @@
 /.gemini
 /.opencode
 /.kilocode
+
+# Flashgrep
+.flashgrep/
+
+# Test artifacts
+*.log
+
+# Project specific
+prompt
