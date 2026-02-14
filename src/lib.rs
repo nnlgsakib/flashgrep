@@ -3,15 +3,15 @@
 //! A fast, language-agnostic code search tool designed for LLM coding agents.
 //! Provides full-text and structural search with minimal memory footprint.
 
+pub mod chunking;
 pub mod cli;
 pub mod config;
 pub mod db;
 pub mod index;
-pub mod chunking;
-pub mod symbols;
-pub mod search;
-pub mod watcher;
 pub mod mcp;
+pub mod search;
+pub mod symbols;
+pub mod watcher;
 
 use anyhow::Result;
 use std::path::Path;
@@ -64,25 +64,25 @@ pub fn get_flashgrep_dir(repo_root: &Path) -> std::path::PathBuf {
 pub enum FlashgrepError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
-    
+
     #[error("Search error: {0}")]
     Search(String),
-    
+
     #[error("Index not found at {0}")]
     IndexNotFound(std::path::PathBuf),
-    
+
     #[error("Invalid configuration: {0}")]
     Config(String),
-    
+
     #[error("File watcher error: {0}")]
     FileWatcher(String),
-    
+
     #[error("MCP server error: {0}")]
     McpServer(String),
-    
+
     #[error("Task error: {0}")]
     Task(String),
 }

@@ -1,5 +1,6 @@
 //! MCP skill implementation
 
+use crate::mcp::bootstrap::BOOTSTRAP_TOOL_ALIASES;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -19,7 +20,7 @@ impl Default for SkillInfo {
             version: "0.1.0".to_string(),
             description: "High-performance local code indexing engine".to_string(),
             author: "Flashgrep Contributors".to_string(),
-            repository: "https://github.com/yourusername/flashgrep".to_string(),
+            repository: "https://github.com/nnlgsakib/flashgrep".to_string(),
         }
     }
 }
@@ -123,6 +124,46 @@ pub fn get_skill_documentation() -> SkillDocumentation {
         },
     );
 
+    commands.insert(
+        "glob".to_string(),
+        CommandDocumentation {
+            description:
+                "Advanced glob discovery with include/exclude, extension filters, depth bounds, sorting, and limits"
+                    .to_string(),
+            parameters: vec![
+                ParameterDocumentation {
+                    name: "pattern".to_string(),
+                    type_: "string".to_string(),
+                    description: "Primary glob include pattern".to_string(),
+                    required: false,
+                },
+                ParameterDocumentation {
+                    name: "path".to_string(),
+                    type_: "string".to_string(),
+                    description: "Root directory to search".to_string(),
+                    required: false,
+                },
+                ParameterDocumentation {
+                    name: "include/exclude/extensions".to_string(),
+                    type_: "array".to_string(),
+                    description: "Composable filters for one-pass discovery".to_string(),
+                    required: false,
+                },
+                ParameterDocumentation {
+                    name: "max_depth/limit/sort_by/sort_order".to_string(),
+                    type_: "mixed".to_string(),
+                    description: "Bounded deterministic traversal and output ordering"
+                        .to_string(),
+                    required: false,
+                },
+            ],
+            examples: vec![
+                r#"{"pattern":"**/*.rs","exclude":["target/**"],"limit":100}"#.to_string(),
+                r#"{"path":"src","extensions":[".rs"],"max_depth":2,"sort_by":"name","sort_order":"asc"}"#.to_string(),
+            ],
+        },
+    );
+
     // Search with context tool
     commands.insert(
         "search-with-context".to_string(),
@@ -194,8 +235,68 @@ pub fn get_skill_documentation() -> SkillDocumentation {
         },
     );
 
+    for alias in BOOTSTRAP_TOOL_ALIASES {
+        let doc = if alias == "bootstrap_skill" {
+            CommandDocumentation {
+                description: "Canonical MCP bootstrap method for Flashgrep skill injection"
+                    .to_string(),
+                parameters: vec![
+                    ParameterDocumentation {
+                        name: "trigger".to_string(),
+                        type_: "string".to_string(),
+                        description:
+                            "Optional trigger alias (flashgrep-init, fgrep-boot, flashgrep_init, fgrep_boot)"
+                                .to_string(),
+                        required: false,
+                    },
+                    ParameterDocumentation {
+                        name: "compact".to_string(),
+                        type_: "boolean".to_string(),
+                        description: "Return compact policy payload without full skill markdown"
+                            .to_string(),
+                        required: false,
+                    },
+                    ParameterDocumentation {
+                        name: "force".to_string(),
+                        type_: "boolean".to_string(),
+                        description: "Force reinjection even when already injected in session"
+                            .to_string(),
+                        required: false,
+                    },
+                ],
+                examples: vec![
+                    r#"{"trigger": "flashgrep-init", "compact": true}"#.to_string(),
+                    r#"{"force": true}"#.to_string(),
+                ],
+            }
+        } else {
+            CommandDocumentation {
+                description: format!("Alias for {}", BOOTSTRAP_TOOL_ALIASES[0]),
+                parameters: vec![ParameterDocumentation {
+                    name: "compact".to_string(),
+                    type_: "boolean".to_string(),
+                    description: "Return compact policy payload without full skill markdown"
+                        .to_string(),
+                    required: false,
+                }],
+                examples: vec![r#"{}"#.to_string()],
+            }
+        };
+
+        commands.insert(alias.to_string(), doc);
+    }
+
     SkillDocumentation {
-        overview: "Flashgrep is a high-performance local code indexing engine that supports fast searching with grep-like capabilities via the Model Context Protocol (MCP).".to_string(),
+        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Use flashgrep-init/fgrep-boot to inject Flashgrep-first guidance and prefer indexed tools (query/files/symbol/read_code/write_code) over generic grep/glob flows.".to_string(),
         commands,
     }
+}
+
+pub fn bootstrap_policy() -> Vec<String> {
+    vec![
+        "Prefer Flashgrep tools before generic grep/glob when searching code.".to_string(),
+        "Use query/files/symbol for indexed discovery and navigation.".to_string(),
+        "Use read_code with budgets for token-efficient reads.".to_string(),
+        "Use write_code for targeted, precondition-safe edits.".to_string(),
+    ]
 }

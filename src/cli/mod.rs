@@ -4,7 +4,7 @@ use crate::db::Database;
 use crate::index::engine::Indexer;
 use crate::mcp::stdio::McpStdioServer;
 use crate::search::Searcher;
-use crate::watcher::registry::{kill_process, is_process_alive, WatcherRegistry};
+use crate::watcher::registry::{is_process_alive, kill_process, WatcherRegistry};
 use crate::watcher::FileWatcher;
 use crate::FlashgrepResult;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -169,33 +169,33 @@ pub enum Commands {
 /// Run the CLI
 pub async fn run() -> FlashgrepResult<()> {
     let cli = Cli::parse();
-    
+
     match cli.command {
         Commands::Index { path, force } => {
             let repo_root = get_repo_root(path.as_ref())?;
             info!("Indexing repository: {}", repo_root.display());
-            
+
             let mut indexer = Indexer::new(repo_root.clone())?;
-            
+
             if force {
                 println!("Force re-indexing...");
                 indexer.clear_index()?;
             }
-            
+
             let stats = indexer.index_repository(&repo_root)?;
-            
+
             println!("\n✓ Indexing complete!");
             println!("  Files indexed: {}", stats.total_files);
             println!("  Chunks created: {}", stats.total_chunks);
             println!("  Symbols detected: {}", stats.total_symbols);
-            
+
             Ok(())
         }
         Commands::Start { path, background } => {
             let repo_root = get_repo_root(path.as_ref())?;
             let canonical_repo_root = WatcherRegistry::canonicalize_repo_path(&repo_root)?;
             info!("Starting file watcher for: {}", repo_root.display());
-            
+
             // Check if index exists
             if !FlashgrepPaths::new(&canonical_repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
@@ -235,10 +235,10 @@ pub async fn run() -> FlashgrepResult<()> {
             }
 
             registry.upsert(&canonical_repo_root, std::process::id())?;
-            
+
             println!("Starting file watcher...");
             println!("Repository: {}", canonical_repo_root.display());
-            
+
             // Start file watcher
             let watcher_root = canonical_repo_root.clone();
             let watcher_handle = task::spawn_blocking(move || {
@@ -249,17 +249,17 @@ pub async fn run() -> FlashgrepResult<()> {
                         return;
                     }
                 };
-                
+
                 println!("File watcher started");
-                
+
                 if let Err(e) = watcher.watch() {
                     eprintln!("File watcher error: {}", e);
                 }
             });
-            
+
             // Wait for file watcher to complete (or Ctrl+C)
             watcher_handle.await?;
-            
+
             Ok(())
         }
         Commands::Stop { path } => {
@@ -270,25 +270,36 @@ pub async fn run() -> FlashgrepResult<()> {
             let mut registry = WatcherRegistry::load_default()?;
             let removed = registry.cleanup_stale()?;
             if removed > 0 {
-                println!("Removed {} stale watcher entr{}.", removed, if removed == 1 { "y" } else { "ies" });
+                println!(
+                    "Removed {} stale watcher entr{}.",
+                    removed,
+                    if removed == 1 { "y" } else { "ies" }
+                );
             }
 
             match registry.get(&canonical_repo_root)? {
                 Some(entry) => {
                     if is_process_alive(entry.pid) {
-                        println!("Stopping watcher for {} (PID {})...", canonical_repo_root.display(), entry.pid);
+                        println!(
+                            "Stopping watcher for {} (PID {})...",
+                            canonical_repo_root.display(),
+                            entry.pid
+                        );
                         kill_process(entry.pid)?;
                     }
                     let _ = registry.remove(&canonical_repo_root)?;
                     println!("✓ Watcher stopped for {}", canonical_repo_root.display());
                 }
                 None => {
-                    println!("No active watcher found for {}", canonical_repo_root.display());
+                    println!(
+                        "No active watcher found for {}",
+                        canonical_repo_root.display()
+                    );
                 }
             }
 
             print_active_watchers(&registry);
-            
+
             Ok(())
         }
         Commands::Watchers => {
@@ -327,7 +338,11 @@ pub async fn run() -> FlashgrepResult<()> {
                 })
                 .collect();
 
-            render_results(&rendered, output, &format!("query in {}", repo_root.display()))?;
+            render_results(
+                &rendered,
+                output,
+                &format!("query in {}", repo_root.display()),
+            )?;
             Ok(())
         }
         Commands::Files {
@@ -359,7 +374,11 @@ pub async fn run() -> FlashgrepResult<()> {
                 })
                 .collect();
 
-            render_results(&rendered, output, &format!("files in {}", repo_root.display()))?;
+            render_results(
+                &rendered,
+                output,
+                &format!("files in {}", repo_root.display()),
+            )?;
             Ok(())
         }
         Commands::Symbol {
@@ -407,7 +426,8 @@ pub async fn run() -> FlashgrepResult<()> {
         } => {
             if start_line == 0 || end_line == 0 || start_line > end_line {
                 return Err(crate::FlashgrepError::Config(
-                    "Invalid line range. Use start_line >= 1 and end_line >= start_line".to_string(),
+                    "Invalid line range. Use start_line >= 1 and end_line >= start_line"
+                        .to_string(),
                 ));
             }
 
@@ -442,7 +462,7 @@ pub async fn run() -> FlashgrepResult<()> {
         }
         Commands::Stats { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
-            
+
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
                 return Ok(());
@@ -451,7 +471,7 @@ pub async fn run() -> FlashgrepResult<()> {
             let paths = FlashgrepPaths::new(&repo_root);
             let db = Database::open(&paths.metadata_db())?;
             let stats = db.get_stats()?;
-            
+
             println!("\n📊 Index Statistics");
             println!("==================");
             println!("  Total files: {}", stats.total_files);
@@ -464,81 +484,85 @@ pub async fn run() -> FlashgrepResult<()> {
                     println!("  Last update: {}", dt.format("%Y-%m-%d %H:%M:%S"));
                 }
             }
-            
+
             Ok(())
         }
-        Commands::Mcp { path, port, log_level } => {
+        Commands::Mcp {
+            path,
+            port,
+            log_level,
+        } => {
             let repo_root = get_repo_root(path.as_ref())?;
             info!("Starting MCP server for: {}", repo_root.display());
-            
+
             // Check if index exists
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
                 return Ok(());
             }
-            
+
             // Create config with optional overrides
             let mut config = if FlashgrepPaths::new(&repo_root).config_file().exists() {
                 Config::from_file(&FlashgrepPaths::new(&repo_root).config_file())?
             } else {
                 Config::default()
             };
-            
+
             if let Some(p) = port {
                 config.mcp_port = p;
             }
-            
+
             // Set log level if specified
             if let Some(level) = log_level {
                 // This is a simplification - in real code, you'd need to properly configure the logging
                 println!("Log level: {}", level);
             }
-            
+
             println!("Starting MCP server...");
             println!("Repository: {}", repo_root.display());
             println!("Port: {}", config.mcp_port);
-            
+
             // Create MCP server instance
             let server = crate::mcp::McpServer::new(repo_root.clone())?;
-            
+
             // Run server and wait for shutdown
             server.start().await?;
-            
+
             Ok(())
         }
         Commands::McpStdio { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
             info!("Starting MCP stdio server for: {}", repo_root.display());
-            
+
             // Check if index exists
             if !FlashgrepPaths::new(&repo_root).exists() {
                 eprintln!("⚠ No index found. Run 'flashgrep index' first.");
                 return Ok(());
             }
-            
+
             // Create and start stdio MCP server
             let server = McpStdioServer::new(repo_root)?;
-            
+
             // Run server (this blocks on stdin)
             server.start()?;
-            
+
             Ok(())
         }
         Commands::Clear { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
-            
+
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found.");
                 return Ok(());
             }
-            
+
             print!("Are you sure you want to clear the index? [y/N]: ");
             use std::io::Write;
             std::io::stdout().flush()?;
-            
+
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
-            
+
             if input.trim().eq_ignore_ascii_case("y") {
                 let mut indexer = Indexer::new(repo_root)?;
                 indexer.clear_index()?;
@@ -546,7 +570,7 @@ pub async fn run() -> FlashgrepResult<()> {
             } else {
                 println!("Cancelled");
             }
-            
+
             Ok(())
         }
     }
@@ -649,7 +673,8 @@ fn render_results(results: &[CliResult], output: OutputMode, label: &str) -> Fla
 
 /// Print help information about .flashgrepignore
 pub fn print_ignore_help() {
-    println!("
+    println!(
+        "
 .flashgrepignore file format:
   The .flashgrepignore file uses gitignore-style patterns to exclude files and
   directories from indexing. Place this file in the root of your repository.
@@ -675,7 +700,8 @@ Examples:
 
   # Ignore a specific file at root
   /config.local.json
-");
+"
+    );
 }
 
 #[cfg(test)]
@@ -722,14 +748,7 @@ mod tests {
 
     #[test]
     fn parse_files_with_filter_and_limit() {
-        let cli = Cli::parse_from([
-            "flashgrep",
-            "files",
-            "--filter",
-            "tests",
-            "--limit",
-            "5",
-        ]);
+        let cli = Cli::parse_from(["flashgrep", "files", "--filter", "tests", "--limit", "5"]);
         match cli.command {
             Commands::Files { filter, limit, .. } => {
                 assert_eq!(filter.as_deref(), Some("tests"));

@@ -143,7 +143,8 @@ Use stdio transport for MCP clients that launch local tools as child processes.
 1. Build and install `flashgrep`.
 2. Index the repository you want to search: `flashgrep index`.
 3. Configure your MCP client with the Flashgrep server entry.
-4. Start your client and verify Flashgrep tools are available (`query`, `get_slice`, `get_symbol`, `list_files`, `stats`).
+4. Start your client and verify Flashgrep tools are available (`query`, `glob`, `get_slice`, `read_code`, `write_code`, `get_symbol`, `list_files`, `stats`, `bootstrap_skill`, `flashgrep-init`, `fgrep-boot`).
+5. Run bootstrap from your agent via MCP tool call (`bootstrap_skill` or `flashgrep_init`) so the session gets Flashgrep-first guidance without manual skill setup.
 
 Example MCP config:
 
@@ -166,6 +167,28 @@ Notes:
 - `RUST_LOG=info` is optional and mainly useful for troubleshooting.
 - If your client cannot connect, run `flashgrep index` again and verify `flashgrep stats` works in the same repository.
 
+Bootstrap example (`tools/call`):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "flashgrep_init",
+    "arguments": {
+      "compact": true
+    }
+  },
+  "id": 100
+}
+```
+
+Bootstrap behavior:
+- First call returns `status: injected`
+- Repeated call in same server session returns `status: already_injected`
+- Errors return typed codes such as `invalid_trigger`, `skill_not_found`, or `skill_unreadable`
+- Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
+
 ### Skill Files
 
 Flashgrep provides skill documentation that can be used by any coding agent:
@@ -180,6 +203,61 @@ Use `skills/SKILL.md` as the default generic guide. Use the `.opencode/` path on
 The MCP server exposes JSON-RPC methods for coding agents. See [MCP Setup (Stdio)](#mcp-setup-stdio) and [Skill Files](#skill-files) for setup and discovery guidance.
 
 **Available Methods:**
+
+#### `bootstrap_skill(trigger?, compact?, force?)`
+
+Bootstrap Flashgrep skill guidance into the current MCP session.
+
+Accepted trigger aliases: `bootstrap_skill`, `flashgrep-init`, `flashgrep_init`, `fgrep-boot`, `fgrep_boot`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "bootstrap_skill",
+    "arguments": {
+      "trigger": "flashgrep-init",
+      "compact": true
+    }
+  },
+  "id": 0
+}
+```
+
+#### `glob(...)`
+
+Advanced glob file discovery with composable filters and deterministic sorting.
+
+Supported options include:
+- `pattern`, `path`
+- `include`, `exclude`
+- `extensions`
+- `max_depth`, `recursive`, `include_hidden`, `follow_symlinks`
+- `case_sensitive`
+- `sort_by` (`path|name|modified|size`), `sort_order` (`asc|desc`)
+- `limit`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "glob",
+    "arguments": {
+      "path": "src",
+      "pattern": "**/*.rs",
+      "exclude": ["**/target/**", "**/.git/**"],
+      "extensions": [".rs"],
+      "max_depth": 4,
+      "sort_by": "name",
+      "sort_order": "asc",
+      "limit": 200
+    }
+  },
+  "id": 8
+}
+```
 
 #### `query(text, limit)`
 
@@ -211,6 +289,63 @@ Retrieve specific lines from a file.
     "end_line": 50
   },
   "id": 2
+}
+```
+
+#### `read_code(...)`
+
+Token-efficient code read for agent workflows. Supports two mutually exclusive modes:
+
+- Slice mode: `file_path` (+ optional `start_line`, `end_line`, `continuation_start_line`)
+- Symbol mode: `symbol_name` (+ optional `symbol_context_lines`)
+
+Optional budgets: `max_lines`, `max_bytes`, `max_tokens`.
+Optional metadata profile: `metadata_level` (`minimal` or `standard`).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "read_code",
+  "params": {
+    "file_path": "src/mcp/stdio.rs",
+    "start_line": 1,
+    "max_lines": 80,
+    "metadata_level": "minimal"
+  },
+  "id": 6
+}
+```
+
+Response includes deterministic truncation markers and continuation:
+
+- `truncated`: whether output was cut by limits
+- `continuation_start_line`: next line to continue from
+- `applied_limits`: consumed + configured budgets
+
+#### `write_code(file_path, start_line, end_line, replacement, precondition?)`
+
+Minimal-diff write that replaces only a target line range. Supports optional optimistic preconditions:
+
+- `expected_file_hash`
+- `expected_start_line_text`
+- `expected_end_line_text`
+
+On mismatch, returns structured conflict details with `ok: false` and `error: precondition_failed`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "write_code",
+  "params": {
+    "file_path": "src/example.rs",
+    "start_line": 10,
+    "end_line": 12,
+    "replacement": "updated text",
+    "precondition": {
+      "expected_start_line_text": "old text"
+    }
+  },
+  "id": 7
 }
 ```
 

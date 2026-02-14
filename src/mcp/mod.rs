@@ -1,15 +1,26 @@
+pub mod bootstrap;
+pub mod code_io;
+pub mod glob_tool;
+pub mod skill;
 pub mod stdio;
+pub mod tools;
 
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
 use crate::db::Database;
+use crate::mcp::bootstrap::{build_bootstrap_payload, is_bootstrap_tool};
+use crate::mcp::code_io::{read_code, write_code};
+use crate::mcp::glob_tool::run_glob;
 use crate::search::Searcher;
 use crate::FlashgrepResult;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
+
+static SKILL_INJECTED_TCP: AtomicBool = AtomicBool::new(false);
 
 /// MCP server for handling JSON-RPC requests
 pub struct McpServer {
@@ -26,22 +37,22 @@ impl McpServer {
         } else {
             Config::default()
         };
-        
+
         Ok(Self { config, paths })
     }
-    
+
     /// Start the MCP server
     pub async fn start(&self) -> FlashgrepResult<()> {
         let addr = format!("127.0.0.1:{}", self.config.mcp_port);
         let listener = TcpListener::bind(&addr).await?;
-        
+
         info!("MCP server listening on: {}", addr);
         println!("MCP server listening on: {}", addr);
-        
+
         loop {
             let (stream, addr) = listener.accept().await?;
             debug!("New connection from: {}", addr);
-            
+
             let paths = self.paths.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(stream, paths).await {
@@ -56,7 +67,7 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    
+
     // Open Tantivy index for searching
     let tantivy_index = match tantivy::Index::open_in_dir(paths.text_index_dir()) {
         Ok(idx) => Some(idx),
@@ -65,18 +76,18 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
             None
         }
     };
-    
+
     while reader.read_line(&mut line).await? > 0 {
         let trimmed_line = line.trim();
-        
+
         // Skip empty lines which might be keep-alive or protocol noise
         if trimmed_line.is_empty() {
             line.clear();
             continue;
         }
-        
+
         debug!("Received: {}", trimmed_line);
-        
+
         match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(request) => {
                 let response = handle_request(request, &paths, tantivy_index.as_ref()).await?;
@@ -87,28 +98,39 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
             }
             Err(e) => {
                 // Log parse errors but don't send back responses for invalid protocol
-                debug!("Failed to parse JSON-RPC request: {} for line: '{}'", e, trimmed_line);
+                debug!(
+                    "Failed to parse JSON-RPC request: {} for line: '{}'",
+                    e, trimmed_line
+                );
                 // Skip sending response for invalid requests that aren't valid JSON-RPC
             }
         }
-        
+
         line.clear();
     }
-    
+
     Ok(())
 }
 
 async fn handle_request(
-    request: JsonRpcRequest, 
+    request: JsonRpcRequest,
     paths: &FlashgrepPaths,
-    tantivy_index: Option<&tantivy::Index>
+    tantivy_index: Option<&tantivy::Index>,
 ) -> FlashgrepResult<JsonRpcResponse> {
     let result = match request.method.as_str() {
         // Existing methods
         "query" => {
-            let text = request.params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let limit = request.params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            
+            let text = request
+                .params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+
             if text.is_empty() {
                 Some(serde_json::json!({
                     "results": [],
@@ -122,16 +144,19 @@ async fn handle_request(
                     let searcher = Searcher::new(index, &paths.metadata_db())?;
                     match searcher.query(text, limit) {
                         Ok(results) => {
-                            let json_results: Vec<_> = results.iter().map(|r| {
-                                serde_json::json!({
-                                    "file_path": r.file_path.to_string_lossy(),
-                                    "start_line": r.start_line,
-                                    "end_line": r.end_line,
-                                    "symbol_name": r.symbol_name,
-                                    "relevance_score": r.relevance_score,
-                                    "preview": r.preview,
+                            let json_results: Vec<_> = results
+                                .iter()
+                                .map(|r| {
+                                    serde_json::json!({
+                                        "file_path": r.file_path.to_string_lossy(),
+                                        "start_line": r.start_line,
+                                        "end_line": r.end_line,
+                                        "symbol_name": r.symbol_name,
+                                        "relevance_score": r.relevance_score,
+                                        "preview": r.preview,
+                                    })
                                 })
-                            }).collect();
+                                .collect();
                             serde_json::json!({
                                 "results": json_results,
                                 "query": text,
@@ -161,10 +186,22 @@ async fn handle_request(
             }
         }
         "get_slice" => {
-            let file_path = request.params.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let start_line = request.params.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            let end_line = request.params.get("end_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            
+            let file_path = request
+                .params
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let start_line = request
+                .params
+                .get("start_line")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+            let end_line = request
+                .params
+                .get("end_line")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+
             if file_path.is_empty() {
                 Some(serde_json::json!({
                     "error": "Missing file_path parameter",
@@ -187,7 +224,7 @@ async fn handle_request(
                 let lines: Vec<&str> = content.lines().collect();
                 let start = start_line.saturating_sub(1);
                 let end = end_line.min(lines.len());
-                
+
                 if start < lines.len() {
                     let slice = lines[start..end].join("\n");
                     Some(serde_json::json!({
@@ -207,9 +244,21 @@ async fn handle_request(
                 }
             }
         }
+        "read_code" => Some(read_code(paths, &request.params)?),
+        "write_code" => Some(write_code(&request.params)?),
+        "glob" => Some(run_glob(&request.params)?),
+        method if is_bootstrap_tool(method) => Some(handle_skill_bootstrap_payload(
+            paths,
+            request.method.as_str(),
+            &request.params,
+        )?),
         "get_symbol" => {
-            let symbol_name = request.params.get("symbol_name").and_then(|v| v.as_str()).unwrap_or("");
-            
+            let symbol_name = request
+                .params
+                .get("symbol_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
             if symbol_name.is_empty() {
                 Some(serde_json::json!({
                     "error": "Missing symbol_name parameter",
@@ -217,16 +266,19 @@ async fn handle_request(
             } else {
                 let db = Database::open(&paths.metadata_db())?;
                 let symbols = db.find_symbols_by_name(symbol_name)?;
-                
-                let json_symbols: Vec<_> = symbols.iter().map(|s| {
-                    serde_json::json!({
-                        "symbol_name": s.symbol_name,
-                        "file_path": s.file_path.to_string_lossy(),
-                        "line_number": s.line_number,
-                        "symbol_type": s.symbol_type.to_string(),
+
+                let json_symbols: Vec<_> = symbols
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "symbol_name": s.symbol_name,
+                            "file_path": s.file_path.to_string_lossy(),
+                            "line_number": s.line_number,
+                            "symbol_type": s.symbol_type.to_string(),
+                        })
                     })
-                }).collect();
-                
+                    .collect();
+
                 Some(serde_json::json!({
                     "symbol_name": symbol_name,
                     "symbols": json_symbols,
@@ -237,11 +289,12 @@ async fn handle_request(
         "list_files" => {
             let db = Database::open(&paths.metadata_db())?;
             let files = db.get_all_files()?;
-            
-            let file_strings: Vec<String> = files.iter()
+
+            let file_strings: Vec<String> = files
+                .iter()
                 .map(|p| p.to_string_lossy().to_string())
                 .collect();
-            
+
             Some(serde_json::json!({
                 "files": file_strings,
                 "total": files.len(),
@@ -250,7 +303,7 @@ async fn handle_request(
         "stats" => {
             let db = Database::open(&paths.metadata_db())?;
             let stats = db.get_stats()?;
-            
+
             Some(serde_json::json!({
                 "total_files": stats.total_files,
                 "total_chunks": stats.total_chunks,
@@ -262,10 +315,23 @@ async fn handle_request(
         }
         // New MCP tool methods
         "search" => {
-            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let files = request.params.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let case_sensitive = request.params.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(true);
-            
+            let pattern = request
+                .params
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let files = request
+                .params
+                .get("files")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let case_sensitive = request
+                .params
+                .get("case_sensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
             if pattern.is_empty() {
                 Some(serde_json::json!({
                     "results": [],
@@ -273,7 +339,7 @@ async fn handle_request(
                 }))
             } else {
                 let mut results = Vec::new();
-                
+
                 for file in files {
                     if let Some(file_path) = file.as_str() {
                         if let Ok(content) = std::fs::read_to_string(file_path) {
@@ -282,14 +348,14 @@ async fn handle_request(
                             } else {
                                 pattern.to_lowercase()
                             };
-                            
+
                             for (line_num, line) in content.lines().enumerate() {
                                 let line_to_check = if case_sensitive {
                                     line.to_string()
                                 } else {
                                     line.to_lowercase()
                                 };
-                                
+
                                 if line_to_check.contains(&search_pattern) {
                                     results.push(serde_json::json!({
                                         "file": file_path,
@@ -301,18 +367,35 @@ async fn handle_request(
                         }
                     }
                 }
-                
+
                 Some(serde_json::json!({
                     "results": results,
                 }))
             }
         }
         "search-in-directory" => {
-            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let directory = request.params.get("directory").and_then(|v| v.as_str()).unwrap_or("");
-            let extensions = request.params.get("extensions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let case_sensitive = request.params.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(true);
-            
+            let pattern = request
+                .params
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let directory = request
+                .params
+                .get("directory")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let extensions = request
+                .params
+                .get("extensions")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let case_sensitive = request
+                .params
+                .get("case_sensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
             if pattern.is_empty() || directory.is_empty() {
                 Some(serde_json::json!({
                     "results": [],
@@ -320,13 +403,13 @@ async fn handle_request(
                 }))
             } else {
                 let mut results = Vec::new();
-                
+
                 if let Ok(dir_entries) = std::fs::read_dir(directory) {
                     for entry in dir_entries.flatten() {
                         if entry.file_type().map_or(false, |ft| ft.is_file()) {
                             let file_path = entry.path();
                             let file_name = file_path.to_string_lossy().to_string();
-                            
+
                             // Check if file matches extensions
                             let matches_extension = if extensions.is_empty() {
                                 true
@@ -339,7 +422,7 @@ async fn handle_request(
                                     }
                                 })
                             };
-                            
+
                             if matches_extension {
                                 if let Ok(content) = std::fs::read_to_string(&file_path) {
                                     let search_pattern = if case_sensitive {
@@ -347,14 +430,14 @@ async fn handle_request(
                                     } else {
                                         pattern.to_lowercase()
                                     };
-                                    
+
                                     for (line_num, line) in content.lines().enumerate() {
                                         let line_to_check = if case_sensitive {
                                             line.to_string()
                                         } else {
                                             line.to_lowercase()
                                         };
-                                        
+
                                         if line_to_check.contains(&search_pattern) {
                                             results.push(serde_json::json!({
                                                 "file": file_name,
@@ -368,18 +451,35 @@ async fn handle_request(
                         }
                     }
                 }
-                
+
                 Some(serde_json::json!({
                     "results": results,
                 }))
             }
         }
         "search-with-context" => {
-            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let files = request.params.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let context = request.params.get("context").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-            let case_sensitive = request.params.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(true);
-            
+            let pattern = request
+                .params
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let files = request
+                .params
+                .get("files")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let context = request
+                .params
+                .get("context")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+            let case_sensitive = request
+                .params
+                .get("case_sensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
             if pattern.is_empty() {
                 Some(serde_json::json!({
                     "results": [],
@@ -387,7 +487,7 @@ async fn handle_request(
                 }))
             } else {
                 let mut results = Vec::new();
-                
+
                 for file in files {
                     if let Some(file_path) = file.as_str() {
                         if let Ok(content) = std::fs::read_to_string(file_path) {
@@ -397,21 +497,21 @@ async fn handle_request(
                             } else {
                                 pattern.to_lowercase()
                             };
-                            
+
                             for (line_num, line) in lines.iter().enumerate() {
                                 let line_to_check = if case_sensitive {
                                     line.to_string()
                                 } else {
                                     line.to_lowercase()
                                 };
-                                
+
                                 if line_to_check.contains(&search_pattern) {
                                     let start = line_num.saturating_sub(context);
                                     let end = (line_num + context + 1).min(lines.len());
-                                    
+
                                     let before = lines[start..line_num].to_vec();
                                     let after = lines[line_num + 1..end].to_vec();
-                                    
+
                                     results.push(serde_json::json!({
                                         "file": file_path,
                                         "line": line_num + 1,
@@ -426,17 +526,30 @@ async fn handle_request(
                         }
                     }
                 }
-                
+
                 Some(serde_json::json!({
                     "results": results,
                 }))
             }
         }
         "search-by-regex" => {
-            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let files = request.params.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            let flags = request.params.get("flags").and_then(|v| v.as_str()).unwrap_or("");
-            
+            let pattern = request
+                .params
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let files = request
+                .params
+                .get("files")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let flags = request
+                .params
+                .get("flags")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
             if pattern.is_empty() {
                 Some(serde_json::json!({
                     "results": [],
@@ -444,7 +557,7 @@ async fn handle_request(
                 }))
             } else {
                 let mut results = Vec::new();
-                
+
                 // Build regex with flags
                 let mut regex_builder = regex::RegexBuilder::new(pattern);
                 if flags.contains('i') {
@@ -456,7 +569,7 @@ async fn handle_request(
                 if flags.contains('s') {
                     regex_builder.dot_matches_new_line(true);
                 }
-                
+
                 match regex_builder.build() {
                     Ok(regex) => {
                         for file in files {
@@ -487,7 +600,7 @@ async fn handle_request(
                         });
                     }
                 }
-                
+
                 Some(serde_json::json!({
                     "results": results,
                 }))
@@ -506,13 +619,21 @@ async fn handle_request(
             });
         }
     };
-    
+
     Ok(JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
         id: request.id,
         result,
         error: None,
     })
+}
+
+fn handle_skill_bootstrap_payload(
+    paths: &FlashgrepPaths,
+    requested_tool: &str,
+    arguments: &serde_json::Value,
+) -> FlashgrepResult<serde_json::Value> {
+    build_bootstrap_payload(paths, requested_tool, arguments, &SKILL_INJECTED_TCP)
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,4 +661,34 @@ struct JsonRpcError {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn glob_method_works_in_tcp_handler() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main file");
+
+        let paths = FlashgrepPaths::new(&root);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "glob".to_string(),
+            params: serde_json::json!({
+                "path": root,
+                "pattern": "**/*.rs",
+                "limit": 10
+            }),
+            id: Some(1),
+        };
+
+        let response = handle_request(req, &paths, None).await.expect("response");
+        let result = response.result.expect("result payload");
+        assert!(result["total"].as_u64().unwrap_or(0) >= 1);
+    }
 }
