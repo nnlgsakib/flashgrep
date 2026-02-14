@@ -2,6 +2,7 @@ use crate::config::paths::{get_repo_root, FlashgrepPaths};
 use crate::config::Config;
 use crate::index::engine::Indexer;
 use crate::mcp::McpServer;
+use crate::mcp::stdio::McpStdioServer;
 use crate::watcher::FileWatcher;
 use crate::FlashgrepResult;
 use clap::{Parser, Subcommand};
@@ -30,13 +31,19 @@ pub enum Commands {
         #[arg(short, long)]
         force: bool,
     },
-    /// Start the daemon with file watcher and MCP server
+    /// Start file watcher only
     Start {
         /// Path to the repository (defaults to current directory)
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
     },
-    /// Start MCP server only
+    /// Stop file watcher
+    Stop {
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Start MCP server (TCP mode)
     Mcp {
         /// Path to the repository (defaults to current directory)
         #[arg(value_name = "PATH")]
@@ -47,6 +54,12 @@ pub enum Commands {
         /// Log level (default: info)
         #[arg(short, long)]
         log_level: Option<String>,
+    },
+    /// Start MCP server (stdio mode for MCP clients)
+    McpStdio {
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
     },
     /// Show index statistics
     Stats {
@@ -88,7 +101,7 @@ pub async fn run() -> FlashgrepResult<()> {
         }
         Commands::Start { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
-            info!("Starting daemon for: {}", repo_root.display());
+            info!("Starting file watcher for: {}", repo_root.display());
             
             // Check if index exists
             if !FlashgrepPaths::new(&repo_root).exists() {
@@ -96,18 +109,10 @@ pub async fn run() -> FlashgrepResult<()> {
                 return Ok(());
             }
             
-            println!("Starting flashgrep daemon...");
+            println!("Starting file watcher...");
             println!("Repository: {}", repo_root.display());
             
-            // Start MCP server in one task
-            let mcp_server = McpServer::new(repo_root.clone())?;
-            let mcp_handle = task::spawn(async move {
-                if let Err(e) = mcp_server.start().await {
-                    eprintln!("MCP server error: {}", e);
-                }
-            });
-            
-            // Start file watcher in another task
+            // Start file watcher
             let watcher_root = repo_root.clone();
             let watcher_handle = task::spawn_blocking(move || {
                 let mut watcher = match FileWatcher::new(watcher_root) {
@@ -125,15 +130,20 @@ pub async fn run() -> FlashgrepResult<()> {
                 }
             });
             
-            // Wait for either task to complete (or Ctrl+C)
-            tokio::select! {
-                _ = mcp_handle => {
-                    println!("MCP server stopped");
-                }
-                _ = watcher_handle => {
-                    println!("File watcher stopped");
-                }
-            }
+            // Wait for file watcher to complete (or Ctrl+C)
+            watcher_handle.await?;
+            
+            Ok(())
+        }
+        Commands::Stop { path } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            info!("Stopping file watcher for: {}", repo_root.display());
+            
+            println!("Stopping file watcher...");
+            
+            // Currently, we don't have a way to stop the file watcher gracefully
+            // This would require implementing a process management system
+            println!("Note: File watcher will stop when the process is terminated (Ctrl+C)");
             
             Ok(())
         }
@@ -199,6 +209,24 @@ pub async fn run() -> FlashgrepResult<()> {
             
             // Run server and wait for shutdown
             server.start().await?;
+            
+            Ok(())
+        }
+        Commands::McpStdio { path } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            info!("Starting MCP stdio server for: {}", repo_root.display());
+            
+            // Check if index exists
+            if !FlashgrepPaths::new(&repo_root).exists() {
+                eprintln!("⚠ No index found. Run 'flashgrep index' first.");
+                return Ok(());
+            }
+            
+            // Create and start stdio MCP server
+            let server = McpStdioServer::new(repo_root)?;
+            
+            // Run server (this blocks on stdin)
+            server.start()?;
             
             Ok(())
         }

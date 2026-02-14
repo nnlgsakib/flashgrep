@@ -360,6 +360,20 @@ impl Database {
         debug!("Database analyzed");
         Ok(())
     }
+
+    /// Clear all data from the database
+    /// Deletes all records from files, chunks, and symbols tables
+    pub fn clear_all(&self) -> FlashgrepResult<()> {
+        let conn = self.pool.get()?;
+
+        // Delete from child tables first (though CASCADE should handle this)
+        conn.execute("DELETE FROM symbols", [])?;
+        conn.execute("DELETE FROM chunks", [])?;
+        conn.execute("DELETE FROM files", [])?;
+
+        debug!("Database cleared: all tables emptied");
+        Ok(())
+    }
 }
 
 fn parse_symbol_type(s: &str) -> models::SymbolType {

@@ -237,17 +237,16 @@ impl Indexer {
     pub fn clear_index(&mut self) -> FlashgrepResult<()> {
         info!("Clearing index...");
 
-        // Clear Tantivy index
+        // Clear Tantivy index (text search)
         self.writer.delete_all_documents()?;
         self.writer.commit()?;
+        info!("Text index cleared");
 
-        // Clear database (recreate it)
-        drop(std::mem::replace(
-            &mut self.db,
-            Database::open(&self.paths.metadata_db())?,
-        ));
+        // Clear metadata database (file records, chunks, symbols)
+        self.db.clear_all()?;
+        info!("Metadata database cleared");
 
-        info!("Index cleared");
+        info!("Index cleared successfully");
         Ok(())
     }
 

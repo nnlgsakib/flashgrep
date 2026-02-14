@@ -82,6 +82,9 @@ pub enum FlashgrepError {
     
     #[error("MCP server error: {0}")]
     McpServer(String),
+    
+    #[error("Task error: {0}")]
+    Task(String),
 }
 
 impl From<anyhow::Error> for FlashgrepError {
@@ -126,6 +129,12 @@ impl From<r2d2::Error> for FlashgrepError {
     }
 }
 
+impl From<tokio::task::JoinError> for FlashgrepError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        FlashgrepError::Task(err.to_string())
+    }
+}
+
 impl FlashgrepError {
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -136,6 +145,7 @@ impl FlashgrepError {
             FlashgrepError::Config(_) => 5,
             FlashgrepError::FileWatcher(_) => 6,
             FlashgrepError::McpServer(_) => 7,
+            FlashgrepError::Task(_) => 8,
         }
     }
 }

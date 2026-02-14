@@ -1,3 +1,5 @@
+pub mod stdio;
+
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
 use crate::db::Database;
@@ -65,7 +67,15 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
     };
     
     while reader.read_line(&mut line).await? > 0 {
-        debug!("Received: {}", line.trim());
+        let trimmed_line = line.trim();
+        
+        // Skip empty lines which might be keep-alive or protocol noise
+        if trimmed_line.is_empty() {
+            line.clear();
+            continue;
+        }
+        
+        debug!("Received: {}", trimmed_line);
         
         match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(request) => {
@@ -76,21 +86,9 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
                 writer.flush().await?;
             }
             Err(e) => {
-                error!("Failed to parse JSON-RPC request: {}", e);
-                let error_response = JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: None,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: "Parse error".to_string(),
-                        data: None,
-                    }),
-                };
-                let response_json = serde_json::to_string(&error_response)?;
-                writer.write_all(response_json.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+                // Log parse errors but don't send back responses for invalid protocol
+                debug!("Failed to parse JSON-RPC request: {} for line: '{}'", e, trimmed_line);
+                // Skip sending response for invalid requests that aren't valid JSON-RPC
             }
         }
         

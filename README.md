@@ -85,7 +85,9 @@ The daemon:
 
 ### MCP Server API
 
-The MCP server exposes JSON-RPC methods for coding agents:
+The MCP server exposes JSON-RPC methods for coding agents. For comprehensive documentation including best practices, workflows, and examples, see the [AI Agent Skill Guide](.opencode/skills/flashgrep-mcp/SKILL.md).
+
+**Available Methods:**
 
 #### `query(text, limit)`
 
