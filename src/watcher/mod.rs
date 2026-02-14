@@ -1,3 +1,5 @@
+pub mod registry;
+
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
 use crate::index::engine::Indexer;
@@ -7,6 +9,8 @@ use crate::index::scanner::{
 use crate::FlashgrepResult;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
@@ -19,11 +23,13 @@ pub struct FileWatcher {
     config: Config,
     debounce_duration: Duration,
     ignore_patterns: FlashgrepIgnore,
+    lock_path: PathBuf,
 }
 
 impl FileWatcher {
     /// Create a new file watcher
     pub fn new(repo_root: PathBuf) -> FlashgrepResult<Self> {
+        let lock_path = acquire_watcher_lock(&repo_root)?;
         let indexer = Indexer::new(repo_root.clone())?;
 
         // Load or create config
@@ -46,6 +52,7 @@ impl FileWatcher {
             config,
             debounce_duration: Duration::from_millis(500),
             ignore_patterns,
+            lock_path,
         })
     }
 
@@ -230,5 +237,55 @@ Thumbs.db
         }
 
         Ok(())
+    }
+}
+
+impl Drop for FileWatcher {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+fn acquire_watcher_lock(repo_root: &PathBuf) -> FlashgrepResult<PathBuf> {
+    let paths = FlashgrepPaths::new(repo_root);
+    std::fs::create_dir_all(paths.root())?;
+    let lock_path = paths.root().join("watcher.lock");
+
+    if lock_path.exists() {
+        let stale = match std::fs::read_to_string(&lock_path) {
+            Ok(raw) => match raw.trim().parse::<u32>() {
+                Ok(pid) => !registry::is_process_alive(pid),
+                Err(_) => true,
+            },
+            Err(_) => true,
+        };
+
+        if stale {
+            let _ = std::fs::remove_file(&lock_path);
+        } else {
+            return Err(crate::FlashgrepError::FileWatcher(format!(
+                "Watcher already running for {}",
+                repo_root.display()
+            )));
+        }
+    }
+
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(mut file) => {
+            let pid = std::process::id();
+            let _ = writeln!(file, "{}", pid);
+            Ok(lock_path)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(crate::FlashgrepError::FileWatcher(format!(
+                "Watcher already running for {}",
+                repo_root.display()
+            )))
+        }
+        Err(err) => Err(err.into()),
     }
 }
