@@ -106,6 +106,7 @@ async fn handle_request(
     tantivy_index: Option<&tantivy::Index>
 ) -> FlashgrepResult<JsonRpcResponse> {
     let result = match request.method.as_str() {
+        // Existing methods
         "query" => {
             let text = request.params.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let limit = request.params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -260,6 +261,239 @@ async fn handle_request(
                 "index_size_mb": stats.index_size_bytes / 1024 / 1024,
                 "last_update": stats.last_update,
             }))
+        }
+        // New MCP tool methods
+        "search" => {
+            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let files = request.params.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let case_sensitive = request.params.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(true);
+            
+            if pattern.is_empty() {
+                Some(serde_json::json!({
+                    "results": [],
+                    "error": "Empty pattern",
+                }))
+            } else {
+                let mut results = Vec::new();
+                
+                for file in files {
+                    if let Some(file_path) = file.as_str() {
+                        if let Ok(content) = std::fs::read_to_string(file_path) {
+                            let search_pattern = if case_sensitive {
+                                pattern.to_string()
+                            } else {
+                                pattern.to_lowercase()
+                            };
+                            
+                            for (line_num, line) in content.lines().enumerate() {
+                                let line_to_check = if case_sensitive {
+                                    line.to_string()
+                                } else {
+                                    line.to_lowercase()
+                                };
+                                
+                                if line_to_check.contains(&search_pattern) {
+                                    results.push(serde_json::json!({
+                                        "file": file_path,
+                                        "line": line_num + 1,
+                                        "content": line,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                Some(serde_json::json!({
+                    "results": results,
+                }))
+            }
+        }
+        "search-in-directory" => {
+            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let directory = request.params.get("directory").and_then(|v| v.as_str()).unwrap_or("");
+            let extensions = request.params.get("extensions").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let case_sensitive = request.params.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(true);
+            
+            if pattern.is_empty() || directory.is_empty() {
+                Some(serde_json::json!({
+                    "results": [],
+                    "error": "Missing pattern or directory",
+                }))
+            } else {
+                let mut results = Vec::new();
+                
+                if let Ok(dir_entries) = std::fs::read_dir(directory) {
+                    for entry in dir_entries.flatten() {
+                        if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                            let file_path = entry.path();
+                            let file_name = file_path.to_string_lossy().to_string();
+                            
+                            // Check if file matches extensions
+                            let matches_extension = if extensions.is_empty() {
+                                true
+                            } else {
+                                extensions.iter().any(|ext| {
+                                    if let Some(ext_str) = ext.as_str() {
+                                        file_path.extension().map_or(false, |e| e == ext_str)
+                                    } else {
+                                        false
+                                    }
+                                })
+                            };
+                            
+                            if matches_extension {
+                                if let Ok(content) = std::fs::read_to_string(&file_path) {
+                                    let search_pattern = if case_sensitive {
+                                        pattern.to_string()
+                                    } else {
+                                        pattern.to_lowercase()
+                                    };
+                                    
+                                    for (line_num, line) in content.lines().enumerate() {
+                                        let line_to_check = if case_sensitive {
+                                            line.to_string()
+                                        } else {
+                                            line.to_lowercase()
+                                        };
+                                        
+                                        if line_to_check.contains(&search_pattern) {
+                                            results.push(serde_json::json!({
+                                                "file": file_name,
+                                                "line": line_num + 1,
+                                                "content": line,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                Some(serde_json::json!({
+                    "results": results,
+                }))
+            }
+        }
+        "search-with-context" => {
+            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let files = request.params.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let context = request.params.get("context").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+            let case_sensitive = request.params.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(true);
+            
+            if pattern.is_empty() {
+                Some(serde_json::json!({
+                    "results": [],
+                    "error": "Empty pattern",
+                }))
+            } else {
+                let mut results = Vec::new();
+                
+                for file in files {
+                    if let Some(file_path) = file.as_str() {
+                        if let Ok(content) = std::fs::read_to_string(file_path) {
+                            let lines: Vec<&str> = content.lines().collect();
+                            let search_pattern = if case_sensitive {
+                                pattern.to_string()
+                            } else {
+                                pattern.to_lowercase()
+                            };
+                            
+                            for (line_num, line) in lines.iter().enumerate() {
+                                let line_to_check = if case_sensitive {
+                                    line.to_string()
+                                } else {
+                                    line.to_lowercase()
+                                };
+                                
+                                if line_to_check.contains(&search_pattern) {
+                                    let start = line_num.saturating_sub(context);
+                                    let end = (line_num + context + 1).min(lines.len());
+                                    
+                                    let before = lines[start..line_num].to_vec();
+                                    let after = lines[line_num + 1..end].to_vec();
+                                    
+                                    results.push(serde_json::json!({
+                                        "file": file_path,
+                                        "line": line_num + 1,
+                                        "content": line,
+                                        "context": {
+                                            "before": before,
+                                            "after": after,
+                                        },
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                Some(serde_json::json!({
+                    "results": results,
+                }))
+            }
+        }
+        "search-by-regex" => {
+            let pattern = request.params.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            let files = request.params.get("files").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let flags = request.params.get("flags").and_then(|v| v.as_str()).unwrap_or("");
+            
+            if pattern.is_empty() {
+                Some(serde_json::json!({
+                    "results": [],
+                    "error": "Empty pattern",
+                }))
+            } else {
+                let mut results = Vec::new();
+                
+                // Build regex with flags
+                let mut regex_builder = regex::RegexBuilder::new(pattern);
+                if flags.contains('i') {
+                    regex_builder.case_insensitive(true);
+                }
+                if flags.contains('m') {
+                    regex_builder.multi_line(true);
+                }
+                if flags.contains('s') {
+                    regex_builder.dot_matches_new_line(true);
+                }
+                
+                match regex_builder.build() {
+                    Ok(regex) => {
+                        for file in files {
+                            if let Some(file_path) = file.as_str() {
+                                if let Ok(content) = std::fs::read_to_string(file_path) {
+                                    for (line_num, line) in content.lines().enumerate() {
+                                        if regex.is_match(line) {
+                                            results.push(serde_json::json!({
+                                                "file": file_path,
+                                                "line": line_num + 1,
+                                                "content": line,
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Ok(JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: Some(serde_json::json!({
+                                "results": [],
+                                "error": format!("Invalid regex: {}", e),
+                            })),
+                            error: None,
+                        });
+                    }
+                }
+                
+                Some(serde_json::json!({
+                    "results": results,
+                }))
+            }
         }
         _ => {
             return Ok(JsonRpcResponse {

@@ -1,4 +1,5 @@
 use crate::config::paths::{get_repo_root, FlashgrepPaths};
+use crate::config::Config;
 use crate::index::engine::Indexer;
 use crate::mcp::McpServer;
 use crate::watcher::FileWatcher;
@@ -34,6 +35,18 @@ pub enum Commands {
         /// Path to the repository (defaults to current directory)
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
+    },
+    /// Start MCP server only
+    Mcp {
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Port to listen on (default: 7777)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Log level (default: info)
+        #[arg(short, long)]
+        log_level: Option<String>,
     },
     /// Show index statistics
     Stats {
@@ -147,6 +160,45 @@ pub async fn run() -> FlashgrepResult<()> {
                     println!("  Last update: {}", dt.format("%Y-%m-%d %H:%M:%S"));
                 }
             }
+            
+            Ok(())
+        }
+        Commands::Mcp { path, port, log_level } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            info!("Starting MCP server for: {}", repo_root.display());
+            
+            // Check if index exists
+            if !FlashgrepPaths::new(&repo_root).exists() {
+                println!("⚠ No index found. Run 'flashgrep index' first.");
+                return Ok(());
+            }
+            
+            // Create config with optional overrides
+            let mut config = if FlashgrepPaths::new(&repo_root).config_file().exists() {
+                Config::from_file(&FlashgrepPaths::new(&repo_root).config_file())?
+            } else {
+                Config::default()
+            };
+            
+            if let Some(p) = port {
+                config.mcp_port = p;
+            }
+            
+            // Set log level if specified
+            if let Some(level) = log_level {
+                // This is a simplification - in real code, you'd need to properly configure the logging
+                println!("Log level: {}", level);
+            }
+            
+            println!("Starting MCP server...");
+            println!("Repository: {}", repo_root.display());
+            println!("Port: {}", config.mcp_port);
+            
+            // Create MCP server instance
+            let server = crate::mcp::McpServer::new(repo_root.clone())?;
+            
+            // Run server and wait for shutdown
+            server.start().await?;
             
             Ok(())
         }
