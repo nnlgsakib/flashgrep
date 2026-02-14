@@ -132,6 +132,11 @@ Thumbs.db
                 debug!("File event: {:?}", event);
 
                 for path in event.paths {
+                    if Self::is_ignore_file(&path) {
+                        self.reload_ignore_patterns_and_reconcile()?;
+                        continue;
+                    }
+
                     // Skip if path should be ignored
                     if self.should_ignore_path(&path) {
                         debug!("Ignoring path: {}", path.display());
@@ -209,12 +214,40 @@ Thumbs.db
         false
     }
 
+    fn is_ignore_file(path: &PathBuf) -> bool {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| n == ".flashgrepignore")
+            .unwrap_or(false)
+    }
+
+    fn reload_ignore_patterns_and_reconcile(&mut self) -> FlashgrepResult<()> {
+        self.ignore_patterns = FlashgrepIgnore::from_root(&self.repo_root);
+        let (removed, kept) = self
+            .indexer
+            .reconcile_ignored_files(&self.repo_root, &self.ignore_patterns)?;
+        info!(
+            "Reloaded .flashgrepignore and reconciled index: {} removed, {} kept",
+            removed, kept
+        );
+        Ok(())
+    }
+
     /// Handle a single file change
     fn handle_change(&mut self, path: &PathBuf) -> FlashgrepResult<()> {
+        if self.ignore_patterns.is_ignored(path, &self.repo_root) {
+            debug!(
+                "Path became ignored, pruning if indexed: {}",
+                path.display()
+            );
+            self.indexer.remove_file_from_index(path)?;
+            return Ok(());
+        }
+
         if !path.exists() {
             // File was deleted
             info!("File deleted: {}", path.display());
-            self.indexer.db().delete_file(path)?;
+            self.indexer.remove_file_from_index(path)?;
         } else if path.is_file() {
             // Skip binary files during indexing
             if let Ok(true) = is_binary_file(path) {
@@ -287,5 +320,43 @@ fn acquire_watcher_lock(repo_root: &PathBuf) -> FlashgrepResult<PathBuf> {
             )))
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_ignore_change_reloads_and_prunes_index() -> FlashgrepResult<()> {
+        let temp_dir = TempDir::new()?;
+        let repo_root = temp_dir.path().to_path_buf();
+
+        std::fs::create_dir_all(repo_root.join(".opencode/pkg"))?;
+        std::fs::write(
+            repo_root.join(".opencode/pkg/ignored.rs"),
+            "fn ignored_symbol() { let _ = \"WATCHER_IGNORE_TOKEN\"; }",
+        )?;
+        std::fs::write(repo_root.join("main.rs"), "fn main() {}\n")?;
+        std::fs::write(repo_root.join(".flashgrepignore"), "# initially empty\n")?;
+
+        let mut watcher = FileWatcher::new(repo_root.clone())?;
+        watcher.indexer.index_repository(&repo_root)?;
+
+        let before = watcher.indexer.db().get_all_files()?;
+        assert!(before
+            .iter()
+            .any(|p| p.to_string_lossy().contains(".opencode")));
+
+        std::fs::write(repo_root.join(".flashgrepignore"), ".opencode/\n")?;
+        watcher.reload_ignore_patterns_and_reconcile()?;
+
+        let after = watcher.indexer.db().get_all_files()?;
+        assert!(!after
+            .iter()
+            .any(|p| p.to_string_lossy().contains(".opencode")));
+
+        Ok(())
     }
 }

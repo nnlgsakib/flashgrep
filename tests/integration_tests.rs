@@ -4,7 +4,8 @@ use flashgrep::config::Config;
 use flashgrep::db::models::{FileMetadata, SymbolType};
 use flashgrep::db::Database;
 use flashgrep::index::engine::Indexer;
-use flashgrep::index::scanner::{should_index_file, FileScanner};
+use flashgrep::index::scanner::{should_index_file, FileScanner, FlashgrepIgnore};
+use flashgrep::search::Searcher;
 use flashgrep::symbols::SymbolDetector;
 use std::fs;
 use std::path::PathBuf;
@@ -384,4 +385,90 @@ fn function_{}() {{
         duration
     );
     assert_eq!(stats.total_files, 100);
+}
+
+#[test]
+fn test_ignored_directories_do_not_appear_in_files_query_symbol() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path().to_path_buf();
+
+    fs::create_dir_all(repo_root.join("src")).unwrap();
+    create_test_file(
+        &repo_root.join("src"),
+        "main.rs",
+        "fn main() { let x = 1; }",
+    );
+
+    fs::create_dir_all(repo_root.join(".opencode/node_modules/zod")).unwrap();
+    create_test_file(
+        &repo_root.join(".opencode/node_modules/zod"),
+        "core.rs",
+        "fn ignored_fn() { let _ = \"IGNORED_TOKEN_ZOD\"; }",
+    );
+
+    fs::write(repo_root.join(".flashgrepignore"), ".opencode/\n").unwrap();
+
+    let mut indexer = Indexer::new(repo_root.clone()).unwrap();
+    indexer.index_repository(&repo_root).unwrap();
+
+    let db = indexer.db();
+    let files = db.get_all_files().unwrap();
+    assert!(!files
+        .iter()
+        .any(|p| p.to_string_lossy().contains(".opencode")));
+
+    let ignored_symbols = db.find_symbols_by_name("ignored_fn").unwrap();
+    assert!(ignored_symbols.is_empty());
+
+    let paths = FlashgrepPaths::new(&repo_root);
+    let searcher = Searcher::new(indexer.tantivy_index(), &paths.metadata_db()).unwrap();
+    let query_hits = searcher.query("IGNORED_TOKEN_ZOD", 10).unwrap();
+    assert!(query_hits.is_empty());
+}
+
+#[test]
+fn test_ignore_file_update_prunes_newly_ignored_indexed_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let repo_root = temp_dir.path().to_path_buf();
+
+    fs::create_dir_all(repo_root.join(".opencode/pkg")).unwrap();
+    create_test_file(
+        &repo_root.join(".opencode/pkg"),
+        "keep_then_prune.rs",
+        "fn transient_symbol() { let _ = \"TRANSIENT_IGNORE_TOKEN\"; }",
+    );
+    create_test_file(&repo_root, "main.rs", "fn main() {}\n");
+
+    fs::write(repo_root.join(".flashgrepignore"), "# initially empty\n").unwrap();
+
+    let mut indexer = Indexer::new(repo_root.clone()).unwrap();
+    indexer.index_repository(&repo_root).unwrap();
+
+    let before_files = indexer.db().get_all_files().unwrap();
+    assert!(before_files
+        .iter()
+        .any(|p| p.to_string_lossy().contains(".opencode")));
+
+    fs::write(repo_root.join(".flashgrepignore"), ".opencode/\n").unwrap();
+    let ignore = FlashgrepIgnore::from_root(&repo_root);
+    let (removed, _kept) = indexer
+        .reconcile_ignored_files(&repo_root, &ignore)
+        .unwrap();
+    assert!(removed >= 1);
+
+    let after_files = indexer.db().get_all_files().unwrap();
+    assert!(!after_files
+        .iter()
+        .any(|p| p.to_string_lossy().contains(".opencode")));
+
+    let symbols = indexer
+        .db()
+        .find_symbols_by_name("transient_symbol")
+        .unwrap();
+    assert!(symbols.is_empty());
+
+    let paths = FlashgrepPaths::new(&repo_root);
+    let searcher = Searcher::new(indexer.tantivy_index(), &paths.metadata_db()).unwrap();
+    let hits = searcher.query("TRANSIENT_IGNORE_TOKEN", 10).unwrap();
+    assert!(hits.is_empty());
 }

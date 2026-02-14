@@ -25,3 +25,13 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+
+# AI assistants
+.claude/
+.cline/
+.clinerules/
+.codex/
+.gemini/
+.opencode/
+.kilocode/

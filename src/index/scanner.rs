@@ -3,6 +3,19 @@ use crate::FlashgrepResult;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// Build a normalized repository-relative path for ignore checks.
+/// Uses '/' separators across platforms.
+pub fn normalize_repo_relative_path(path: &Path, root: &PathBuf) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Default directories to ignore
 pub const DEFAULT_IGNORED_DIRS: &[&str; 7] = &[
     ".git",
@@ -102,6 +115,17 @@ impl FileScanner {
             return false;
         }
 
+        // Check ignored directories from config/defaults on all path components
+        for component in path.components() {
+            if let std::path::Component::Normal(name) = component {
+                if let Some(name_str) = name.to_str() {
+                    if should_ignore_directory(name_str, &self.config) {
+                        return false;
+                    }
+                }
+            }
+        }
+
         // Check if we should index this file type
         if !should_index_file(path, &self.config) {
             return false;
@@ -188,17 +212,15 @@ impl FlashgrepIgnore {
 
     /// Check if a path is ignored
     pub fn is_ignored(&self, path: &Path, root: &PathBuf) -> bool {
-        let relative_path = path.strip_prefix(root).unwrap_or(path);
-        let relative_str = relative_path.to_string_lossy();
-        let is_dir = path.is_dir();
+        let relative_str = normalize_repo_relative_path(path, root);
 
         let mut ignored = false;
 
         for pattern in &self.patterns {
-            let matches = if pattern.is_directory_only && !is_dir {
-                false
+            let matches = if pattern.is_directory_only {
+                Self::directory_match(&relative_str, &pattern.pattern)
             } else {
-                Self::match_pattern(&relative_str, &pattern.pattern, is_dir)
+                Self::match_pattern(&relative_str, &pattern.pattern)
             };
 
             if matches {
@@ -209,10 +231,14 @@ impl FlashgrepIgnore {
         ignored
     }
 
+    /// Match directory-only patterns against a normalized path.
+    fn directory_match(path: &str, pattern: &str) -> bool {
+        path == pattern || path.starts_with(&format!("{}/", pattern))
+    }
+
     /// Match a path against a gitignore-style pattern
-    fn match_pattern(path: &str, pattern: &str, _is_dir: bool) -> bool {
-        // Handle directory separators
-        let path_parts: Vec<&str> = path.split(std::path::MAIN_SEPARATOR_STR).collect();
+    fn match_pattern(path: &str, pattern: &str) -> bool {
+        let path_parts: Vec<&str> = path.split('/').collect();
         let _pattern_parts: Vec<&str> = pattern.split('/').collect();
 
         // Simple glob matching
@@ -357,6 +383,34 @@ temp*
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|p| p.ends_with("main.rs")));
         assert!(files.iter().any(|p| p.ends_with("readme.md")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_directory_pattern_ignores_nested_files() -> FlashgrepResult<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path().to_path_buf();
+
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(root.join("src/main.rs"), "fn main() {}")?;
+
+        std::fs::create_dir_all(root.join(".opencode/node_modules/zod"))?;
+        std::fs::write(
+            root.join(".opencode/node_modules/zod/core.js"),
+            "export const z = 1;",
+        )?;
+
+        std::fs::write(root.join(".flashgrepignore"), ".opencode/\n")?;
+
+        let config = Config::default();
+        let scanner = FileScanner::new(root.clone(), config);
+        let files: Vec<_> = scanner.scan().collect();
+
+        assert!(files.iter().any(|p| p.ends_with("src/main.rs")));
+        assert!(!files
+            .iter()
+            .any(|p| p.to_string_lossy().contains(".opencode")));
 
         Ok(())
     }

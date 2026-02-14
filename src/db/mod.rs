@@ -251,6 +251,27 @@ impl Database {
         Ok(())
     }
 
+    /// Delete multiple files and all associated chunks/symbols in one transaction.
+    /// Returns number of file records deleted.
+    pub fn delete_files_bulk(&self, file_paths: &[PathBuf]) -> FlashgrepResult<usize> {
+        if file_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        let mut deleted = 0usize;
+        {
+            let mut stmt = tx.prepare("DELETE FROM files WHERE file_path = ?1")?;
+            for path in file_paths {
+                deleted += stmt.execute([path.to_string_lossy().to_string()])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Check if a file needs reindexing (returns true if file is new or modified)
     pub fn needs_reindex(
         &self,
@@ -449,6 +470,40 @@ mod tests {
 
         let stats = db.get_stats()?;
         assert_eq!(stats.total_chunks, 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_files_bulk_is_idempotent() -> FlashgrepResult<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::open(&db_path)?;
+
+        let file_a = FileMetadata {
+            id: None,
+            file_path: PathBuf::from("a.rs"),
+            file_size: 10,
+            last_modified: 123,
+            language: Some("rust".to_string()),
+        };
+        let file_b = FileMetadata {
+            id: None,
+            file_path: PathBuf::from("b.rs"),
+            file_size: 20,
+            last_modified: 124,
+            language: Some("rust".to_string()),
+        };
+        db.insert_file(&file_a)?;
+        db.insert_file(&file_b)?;
+
+        let deleted_first =
+            db.delete_files_bulk(&[PathBuf::from("a.rs"), PathBuf::from("b.rs")])?;
+        assert_eq!(deleted_first, 2);
+
+        let deleted_second =
+            db.delete_files_bulk(&[PathBuf::from("a.rs"), PathBuf::from("b.rs")])?;
+        assert_eq!(deleted_second, 0);
 
         Ok(())
     }

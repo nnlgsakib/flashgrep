@@ -3,12 +3,12 @@ use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
 use crate::db::models::{Chunk, FileMetadata};
 use crate::db::Database;
-use crate::index::scanner::FileScanner;
+use crate::index::scanner::{FileScanner, FlashgrepIgnore};
 use crate::symbols::SymbolDetector;
 use crate::FlashgrepResult;
 use std::path::PathBuf;
 use tantivy::schema::*;
-use tantivy::{Index, IndexWriter};
+use tantivy::{Index, IndexWriter, Term};
 use tracing::{debug, error, info};
 
 /// Main indexing engine
@@ -246,6 +246,54 @@ impl Indexer {
 
         info!("Index cleared successfully");
         Ok(())
+    }
+
+    /// Remove one file from both Tantivy and metadata store.
+    pub fn remove_file_from_index(&mut self, file_path: &PathBuf) -> FlashgrepResult<()> {
+        let schema = self.index.schema();
+        let file_path_field = schema.get_field("file_path").unwrap();
+        self.writer.delete_term(Term::from_field_text(
+            file_path_field,
+            &file_path.to_string_lossy(),
+        ));
+        self.writer.commit()?;
+        self.db.delete_file(file_path)?;
+        Ok(())
+    }
+
+    /// Remove indexed files that are now ignored by ignore patterns.
+    /// Returns (removed, kept) counts.
+    pub fn reconcile_ignored_files(
+        &mut self,
+        repo_root: &PathBuf,
+        ignore_patterns: &FlashgrepIgnore,
+    ) -> FlashgrepResult<(usize, usize)> {
+        let indexed_files = self.db.get_all_files()?;
+        let mut to_remove = Vec::new();
+        let mut kept = 0usize;
+
+        for path in indexed_files {
+            if ignore_patterns.is_ignored(&path, repo_root) {
+                to_remove.push(path);
+            } else {
+                kept += 1;
+            }
+        }
+
+        if to_remove.is_empty() {
+            return Ok((0, kept));
+        }
+
+        let removed = self.db.delete_files_bulk(&to_remove)?;
+
+        // Rebuild index content to guarantee text index and metadata consistency
+        // regardless of existing schema term/tokenization behavior.
+        self.writer.delete_all_documents()?;
+        self.writer.commit()?;
+        self.db.clear_all()?;
+        let _ = self.index_repository(repo_root)?;
+
+        Ok((removed, kept))
     }
 
     /// Get the database reference
