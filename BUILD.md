@@ -12,7 +12,7 @@ This document describes how to build Flashgrep from source.
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/flashgrep.git
+git clone https://github.com/nnlgsakib/flashgrep
 cd flashgrep
 
 # Build release binary
@@ -32,7 +32,7 @@ sudo apt-get update
 sudo apt-get install -y build-essential cmake pkg-config
 
 # Clone and build
-git clone https://github.com/yourusername/flashgrep.git
+git clone https://github.com/nnlgsakib/flashgrep
 cd flashgrep
 cargo build --release
 
@@ -47,7 +47,7 @@ sudo cp target/release/flashgrep /usr/local/bin/
 brew install cmake
 
 # Clone and build
-git clone https://github.com/yourusername/flashgrep.git
+git clone https://github.com/nnlgsakib/flashgrep
 cd flashgrep
 cargo build --release
 
@@ -62,7 +62,7 @@ cp target/release/flashgrep /usr/local/bin/
 # Or use Visual Studio Community with C++ tools
 
 # Clone and build
-git clone https://github.com/yourusername/flashgrep.git
+git clone https://github.com/nnlgsakib/flashgrep
 cd flashgrep
 cargo build --release
 

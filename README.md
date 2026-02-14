@@ -18,7 +18,7 @@ A high-performance, local code indexing engine designed for LLM coding agents. F
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/flashgrep.git
+git clone https://github.com/nnlgsakib/flashgrep
 cd flashgrep
 
 # Build release binary
@@ -83,9 +83,48 @@ The daemon:
 - Runs MCP server on `localhost:7777`
 - Supports graceful shutdown (Ctrl+C)
 
+### MCP Setup (Stdio)
+
+Use stdio transport for MCP clients that launch local tools as child processes.
+
+1. Build and install `flashgrep`.
+2. Index the repository you want to search: `flashgrep index`.
+3. Configure your MCP client with the Flashgrep server entry.
+4. Start your client and verify Flashgrep tools are available (`query`, `get_slice`, `get_symbol`, `list_files`, `stats`).
+
+Example MCP config:
+
+```json
+{
+  "mcpServers": {
+    "flashgrep": {
+      "type": "local",
+      "command": ["flashgrep", "mcp-stdio"],
+      "enabled": true,
+      "environment": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}
+```
+
+Notes:
+- `RUST_LOG=info` is optional and mainly useful for troubleshooting.
+- If your client cannot connect, run `flashgrep index` again and verify `flashgrep stats` works in the same repository.
+
+### Skill Files
+
+Flashgrep provides skill documentation that can be used by any coding agent:
+
+- Primary (agent-agnostic): `skills/SKILL.md`
+- Optional OpenCode-managed path: `.opencode/skills/flashgrep-mcp/SKILL.md`
+
+Use `skills/SKILL.md` as the default generic guide. Use the `.opencode/` path only when your workflow explicitly uses OpenCode-managed skills.
+
 ### MCP Server API
 
-The MCP server exposes JSON-RPC methods for coding agents. For comprehensive documentation including best practices, workflows, and examples, see the [AI Agent Skill Guide](.opencode/skills/flashgrep-mcp/SKILL.md).
+The MCP server exposes JSON-RPC methods for coding agents. See [MCP Setup (Stdio)](#mcp-setup-stdio) and [Skill Files](#skill-files) for setup and discovery guidance.
 
 **Available Methods:**
 
