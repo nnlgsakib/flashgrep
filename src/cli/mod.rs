@@ -1,11 +1,14 @@
 use crate::config::paths::{get_repo_root, FlashgrepPaths};
 use crate::config::Config;
+use crate::db::Database;
 use crate::index::engine::Indexer;
 use crate::mcp::stdio::McpStdioServer;
+use crate::search::Searcher;
 use crate::watcher::registry::{kill_process, is_process_alive, WatcherRegistry};
 use crate::watcher::FileWatcher;
 use crate::FlashgrepResult;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -20,6 +23,29 @@ use tracing::info;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputMode {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Serialize)]
+struct CliResult {
+    file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    relevance_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -50,6 +76,64 @@ pub enum Commands {
     },
     /// Show active background watchers
     Watchers,
+    /// Indexed text search (grep-like)
+    Query {
+        /// Search text/query
+        text: String,
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Maximum number of results
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputMode::Text)]
+        output: OutputMode,
+    },
+    /// List indexed files (glob-like)
+    Files {
+        /// Optional substring filter for file paths
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Maximum number of results
+        #[arg(short, long, default_value_t = 200)]
+        limit: usize,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputMode::Text)]
+        output: OutputMode,
+    },
+    /// Find symbol definitions/usages
+    Symbol {
+        /// Symbol name to search
+        symbol_name: String,
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Maximum number of results
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputMode::Text)]
+        output: OutputMode,
+    },
+    /// Get line range from a file
+    Slice {
+        /// File path (absolute or relative to repository root)
+        file_path: PathBuf,
+        /// Start line (1-indexed)
+        start_line: usize,
+        /// End line (1-indexed, inclusive)
+        end_line: usize,
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputMode::Text)]
+        output: OutputMode,
+    },
     /// Start MCP server (TCP mode)
     Mcp {
         /// Path to the repository (defaults to current directory)
@@ -213,6 +297,149 @@ pub async fn run() -> FlashgrepResult<()> {
             print_active_watchers(&registry);
             Ok(())
         }
+        Commands::Query {
+            text,
+            path,
+            limit,
+            output,
+        } => {
+            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let mut results = searcher.query(&text, limit.max(1))?;
+            results.sort_by(|a, b| {
+                b.relevance_score
+                    .total_cmp(&a.relevance_score)
+                    .then_with(|| a.file_path.cmp(&b.file_path))
+                    .then_with(|| a.start_line.cmp(&b.start_line))
+                    .then_with(|| a.end_line.cmp(&b.end_line))
+            });
+            results.truncate(limit.max(1));
+
+            let rendered: Vec<CliResult> = results
+                .into_iter()
+                .map(|r| CliResult {
+                    file_path: r.file_path.to_string_lossy().to_string(),
+                    start_line: Some(r.start_line),
+                    end_line: Some(r.end_line),
+                    symbol_name: r.symbol_name,
+                    relevance_score: Some(r.relevance_score),
+                    preview: Some(r.preview),
+                    content: r.content,
+                })
+                .collect();
+
+            render_results(&rendered, output, &format!("query in {}", repo_root.display()))?;
+            Ok(())
+        }
+        Commands::Files {
+            filter,
+            path,
+            limit,
+            output,
+        } => {
+            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let mut files = searcher.list_files()?;
+            files.sort();
+
+            if let Some(needle) = filter.as_ref() {
+                let needle = needle.to_lowercase();
+                files.retain(|p| p.to_string_lossy().to_lowercase().contains(&needle));
+            }
+
+            files.truncate(limit.max(1));
+            let rendered: Vec<CliResult> = files
+                .into_iter()
+                .map(|p| CliResult {
+                    file_path: p.to_string_lossy().to_string(),
+                    start_line: None,
+                    end_line: None,
+                    symbol_name: None,
+                    relevance_score: None,
+                    preview: None,
+                    content: None,
+                })
+                .collect();
+
+            render_results(&rendered, output, &format!("files in {}", repo_root.display()))?;
+            Ok(())
+        }
+        Commands::Symbol {
+            symbol_name,
+            path,
+            limit,
+            output,
+        } => {
+            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let mut symbols = searcher.get_symbol(&symbol_name)?;
+            symbols.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then_with(|| a.line_number.cmp(&b.line_number))
+                    .then_with(|| a.symbol_name.cmp(&b.symbol_name))
+            });
+            symbols.truncate(limit.max(1));
+
+            let rendered: Vec<CliResult> = symbols
+                .into_iter()
+                .map(|s| CliResult {
+                    file_path: s.file_path.to_string_lossy().to_string(),
+                    start_line: Some(s.line_number),
+                    end_line: Some(s.line_number),
+                    symbol_name: Some(s.symbol_name),
+                    relevance_score: None,
+                    preview: Some(format!("type={}", s.symbol_type)),
+                    content: None,
+                })
+                .collect();
+
+            render_results(
+                &rendered,
+                output,
+                &format!("symbol {} in {}", symbol_name, repo_root.display()),
+            )?;
+            Ok(())
+        }
+        Commands::Slice {
+            file_path,
+            start_line,
+            end_line,
+            path,
+            output,
+        } => {
+            if start_line == 0 || end_line == 0 || start_line > end_line {
+                return Err(crate::FlashgrepError::Config(
+                    "Invalid line range. Use start_line >= 1 and end_line >= start_line".to_string(),
+                ));
+            }
+
+            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let normalized_path = if file_path.is_absolute() {
+                file_path
+            } else {
+                repo_root.join(file_path)
+            };
+            let content = searcher
+                .get_slice(&normalized_path, start_line, end_line)?
+                .ok_or_else(|| {
+                    crate::FlashgrepError::Config(format!(
+                        "Could not read slice for {}:{}-{}",
+                        normalized_path.display(),
+                        start_line,
+                        end_line
+                    ))
+                })?;
+
+            let rendered = vec![CliResult {
+                file_path: normalized_path.to_string_lossy().to_string(),
+                start_line: Some(start_line),
+                end_line: Some(end_line),
+                symbol_name: None,
+                relevance_score: None,
+                preview: None,
+                content: Some(content),
+            }];
+            render_results(&rendered, output, "slice")?;
+            Ok(())
+        }
         Commands::Stats { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
             
@@ -220,9 +447,10 @@ pub async fn run() -> FlashgrepResult<()> {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
                 return Ok(());
             }
-            
-            let indexer = Indexer::new(repo_root)?;
-            let stats = indexer.get_stats()?;
+
+            let paths = FlashgrepPaths::new(&repo_root);
+            let db = Database::open(&paths.metadata_db())?;
+            let stats = db.get_stats()?;
             
             println!("\n📊 Index Statistics");
             println!("==================");
@@ -373,6 +601,52 @@ fn spawn_process_for_background(
     Ok(child.id())
 }
 
+fn create_searcher(path: Option<&PathBuf>) -> FlashgrepResult<(PathBuf, Searcher)> {
+    let repo_root = get_repo_root(path)?;
+    let paths = FlashgrepPaths::new(&repo_root);
+    if !paths.exists() {
+        return Err(crate::FlashgrepError::Config(format!(
+            "No index found for {}. Run 'flashgrep index' first.",
+            repo_root.display()
+        )));
+    }
+
+    let index = tantivy::Index::open_in_dir(paths.text_index_dir())?;
+    let searcher = Searcher::new(&index, &paths.metadata_db())?;
+    Ok((repo_root, searcher))
+}
+
+fn render_results(results: &[CliResult], output: OutputMode, label: &str) -> FlashgrepResult<()> {
+    match output {
+        OutputMode::Json => {
+            println!("{}", serde_json::to_string(results)?);
+        }
+        OutputMode::Text => {
+            println!("{}: {} result(s)", label, results.len());
+            for r in results {
+                let mut line = r.file_path.clone();
+                if let (Some(start), Some(end)) = (r.start_line, r.end_line) {
+                    line = format!("{}:{}-{}", line, start, end);
+                }
+                if let Some(name) = &r.symbol_name {
+                    line = format!("{} symbol={}", line, name);
+                }
+                if let Some(score) = r.relevance_score {
+                    line = format!("{} score={:.3}", line, score);
+                }
+                println!("- {}", line);
+                if let Some(preview) = &r.preview {
+                    println!("  {}", preview.replace('\n', "\\n"));
+                }
+                if let Some(content) = &r.content {
+                    println!("  {}", content.replace('\n', "\\n"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Print help information about .flashgrepignore
 pub fn print_ignore_help() {
     println!("
@@ -431,6 +705,61 @@ mod tests {
         let args = vec![OsString::from("--version")];
         let pid = spawn_process_for_background(&exe, &args, false)?;
         assert!(pid > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_query_with_json_output() {
+        let cli = Cli::parse_from(["flashgrep", "query", "main", "--output", "json"]);
+        match cli.command {
+            Commands::Query { text, output, .. } => {
+                assert_eq!(text, "main");
+                assert_eq!(output, OutputMode::Json);
+            }
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
+    fn parse_files_with_filter_and_limit() {
+        let cli = Cli::parse_from([
+            "flashgrep",
+            "files",
+            "--filter",
+            "tests",
+            "--limit",
+            "5",
+        ]);
+        match cli.command {
+            Commands::Files { filter, limit, .. } => {
+                assert_eq!(filter.as_deref(), Some("tests"));
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected files command"),
+        }
+    }
+
+    #[test]
+    fn parse_slice_requires_line_args() {
+        let cli = Cli::try_parse_from(["flashgrep", "slice", "src/main.rs"]);
+        assert!(cli.is_err());
+    }
+
+    #[test]
+    fn render_json_is_valid() -> FlashgrepResult<()> {
+        let data = vec![CliResult {
+            file_path: "src/main.rs".to_string(),
+            start_line: Some(1),
+            end_line: Some(3),
+            symbol_name: Some("main".to_string()),
+            relevance_score: Some(1.0),
+            preview: Some("fn main".to_string()),
+            content: None,
+        }];
+
+        let encoded = serde_json::to_string(&data)?;
+        let parsed: serde_json::Value = serde_json::from_str(&encoded)?;
+        assert!(parsed.is_array());
         Ok(())
     }
 }

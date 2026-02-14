@@ -17,7 +17,6 @@ pub struct Indexer {
     index: Index,
     writer: IndexWriter,
     config: Config,
-    paths: FlashgrepPaths,
     symbol_detector: SymbolDetector,
     chunker: Chunker,
 }
@@ -53,7 +52,6 @@ impl Indexer {
             index,
             writer,
             config,
-            paths,
             symbol_detector: SymbolDetector::new(),
             chunker: Chunker::new(),
         })

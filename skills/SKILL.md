@@ -617,6 +617,63 @@ flashgrep_query:48
 - Use `type` for type definitions
 - Look for `package` for file organization
 
+## CLI Fast Search Commands
+
+Flashgrep also provides direct CLI commands powered by the same indexed core, so you can use them frequently in terminal workflows instead of traditional `grep`/`glob` scans.
+
+### `flashgrep query <text>`
+
+Indexed full-text search (grep-like):
+
+```bash
+flashgrep query "fn main" --limit 20
+flashgrep query "TODO:" --output json
+```
+
+### `flashgrep files`
+
+List indexed files (glob-like exploration):
+
+```bash
+flashgrep files --limit 100
+flashgrep files --filter tests --output json
+```
+
+### `flashgrep symbol <name>`
+
+Lookup symbol locations quickly:
+
+```bash
+flashgrep symbol main
+flashgrep symbol Indexer --limit 10 --output json
+```
+
+### `flashgrep slice <file_path> <start_line> <end_line>`
+
+Extract a precise code range:
+
+```bash
+flashgrep slice src/cli/mod.rs 1 60
+flashgrep slice src/search/mod.rs 35 70 --output json
+```
+
+### JSON output shape
+
+All CLI fast-search commands support a consistent JSON array of objects with shared fields such as `file_path`, `start_line`, `end_line`, `symbol_name`, `relevance_score`, `preview`, and `content` when available.
+
+```json
+[
+  {
+    "file_path": "src/search/mod.rs",
+    "start_line": 39,
+    "end_line": 94,
+    "symbol_name": null,
+    "relevance_score": 12.37,
+    "preview": "pub fn query(&self, text: &str, limit: usize) -> FlashgrepResult<Vec<SearchResult>> {"
+  }
+]
+```
+
 ## Summary
 
 Flashgrep provides fast, indexed code search ideal for:

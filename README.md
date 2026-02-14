@@ -41,8 +41,11 @@ cd /path/to/your/project
 # Create initial index
 flashgrep index
 
-# Start the daemon (file watcher + MCP server)
-flashgrep start
+# Run fast indexed CLI search (grep-like)
+flashgrep query "main" --limit 10
+
+# Start watcher in background (optional)
+flashgrep start -b
 ```
 
 ## Usage
@@ -82,6 +85,56 @@ The daemon:
 - Watches files for changes and auto-updates index
 - Runs MCP server on `localhost:7777`
 - Supports graceful shutdown (Ctrl+C)
+
+#### `flashgrep query <TEXT> [PATH]`
+
+Run indexed full-text search (grep-like) using the existing Flashgrep index.
+
+```bash
+# Find top matches
+flashgrep query "fn main" --limit 20
+
+# Script-friendly JSON output
+flashgrep query "TODO:" --output json
+```
+
+#### `flashgrep files [PATH]`
+
+List indexed files quickly (glob-like exploration without filesystem scans).
+
+```bash
+# List indexed files
+flashgrep files --limit 100
+
+# Filter file paths
+flashgrep files --filter mcp --output json
+```
+
+#### `flashgrep symbol <SYMBOL_NAME> [PATH]`
+
+Find symbol entries from indexed metadata.
+
+```bash
+flashgrep symbol McpServer --limit 10
+flashgrep symbol main --output json
+```
+
+#### `flashgrep slice <FILE_PATH> <START_LINE> <END_LINE> [PATH]`
+
+Extract an exact code range from a file.
+
+```bash
+flashgrep slice src/mcp/mod.rs 1 60
+flashgrep slice src/search/mod.rs 35 70 --output json
+```
+
+#### `flashgrep watchers`
+
+Show active background watcher processes.
+
+```bash
+flashgrep watchers
+```
 
 ### MCP Setup (Stdio)
 
@@ -251,6 +304,27 @@ The config is stored in `.flashgrep/config.json`:
 - **SQLite Store**: Metadata storage with connection pooling and batch inserts
 - **File Watcher**: Incremental re-indexing with debouncing
 - **MCP Server**: JSON-RPC over TCP for agent integration
+
+### Why It Is Faster Than Grep/Glob
+
+Flashgrep is usually faster than traditional `grep`/`glob` workflows on repeated queries because it is index-first:
+
+- **One-time indexing, many fast reads**: Flashgrep scans/chunks once, then serves queries from Tantivy + SQLite metadata.
+- **No full tree scan per query**: traditional grep often re-walks directories and re-reads files every run.
+- **Structured metadata paths**: symbol lookup and file listing use indexed tables instead of regex over raw files.
+- **Watcher-assisted freshness**: background watcher updates changed files incrementally, avoiding full rebuilds.
+- **Deterministic bounded output**: command limits are enforced before render for stable, script-friendly responses.
+
+Use `grep` for tiny one-off folders; use Flashgrep for active development on medium/large repos where you run many searches per session.
+
+### End-to-End Query Flow
+
+1. **Scanner** discovers indexable files and applies ignore rules.
+2. **Chunker** splits files into bounded line ranges and computes content hashes.
+3. **Symbol Detector** extracts structural entries (function/class/import/etc.).
+4. **Tantivy** stores searchable text chunks and ranking fields.
+5. **SQLite** stores files/chunks/symbol metadata for lookup/list/stat operations.
+6. **CLI/MCP layers** query these stores in read mode and render text/JSON outputs.
 
 ### Index Structure
 
