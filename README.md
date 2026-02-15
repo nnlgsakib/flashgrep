@@ -228,6 +228,21 @@ Bootstrap behavior:
 - Errors return typed codes such as `invalid_trigger`, `skill_not_found`, or `skill_unreadable`
 - Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
 
+Bootstrap policy metadata:
+- `policy_metadata.policy_strength`: enforcement mode (default: `strict`)
+- `policy_metadata.preferred_tools`: Flashgrep-first tool routing groups
+- `policy_metadata.fallback_rules`: allowed fallback gates with typed `reason_code`
+- `policy_metadata.compliance_checks`: client-side compliance expectations
+
+Fallback gate defaults:
+- `flashgrep_index_unavailable`
+- `flashgrep_operation_not_supported`
+- `flashgrep_tool_runtime_failure`
+
+Compatibility and rollback notes:
+- Legacy bootstrap fields (`status`, `canonical_trigger`, `skill_hash`, `skill_version`, `policy`) remain available.
+- If a client cannot consume strict metadata, continue reading legacy fields while treating `policy_metadata` as additive.
+
 ### Skill Files
 
 Flashgrep provides skill documentation that can be used by any coding agent:

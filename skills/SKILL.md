@@ -20,6 +20,12 @@ Expected:
 - repeat call: `status = already_injected`
 - invalid alias/trigger: `error = invalid_trigger`
 
+Bootstrap policy contract (machine-readable):
+- `policy_metadata.policy_strength = strict`
+- `policy_metadata.preferred_tools` lists Flashgrep-first routes
+- `policy_metadata.fallback_rules` define allowed fallback gates + reason codes
+- `policy_metadata.compliance_checks` defines expected compliance behavior
+
 ## 2) Primary Tool Selection
 
 Pick the smallest tool that solves the task:
@@ -32,7 +38,14 @@ Pick the smallest tool that solves the task:
 6. `write_code` / `flashgrep_write_code`: minimal line-range edits.
 7. `stats` / `flashgrep_stats`: index health and readiness.
 
-Use legacy search tools only if needed for compatibility:
+Hard rule: do NOT use legacy/native search tools unless a fallback gate applies.
+
+Allowed fallback gates (must record reason code):
+- `flashgrep_index_unavailable`
+- `flashgrep_operation_not_supported`
+- `flashgrep_tool_runtime_failure`
+
+Use legacy search tools only when a fallback gate is active:
 - `search`
 - `search-in-directory`
 - `search-with-context`
@@ -136,9 +149,18 @@ Behavior:
 ## 5) Guardrails
 
 - Prefer Flashgrep tools over shell grep/find for repeated work.
+- Enforce Flashgrep-first routing; require explicit fallback gate + reason code before native fallback tools.
 - Keep outputs bounded (`limit`, `offset`, read budgets).
 - Use deterministic sorting for automation (`path`, `asc`).
 - If results are empty, verify index with `stats`, then broaden scope.
 - Use regex mode only when needed; literal/smart is cheaper and safer.
 - For large repos, narrow path scope early (`include`/`exclude`, `max_depth`).
 - For large IO, keep request payloads small and expect chunked continuation/retry loops.
+
+## 6) Compliance Recovery
+
+If the agent drifts to native tools:
+1. Re-run bootstrap with `{ "force": true, "compact": true }`.
+2. Re-check `policy_metadata.policy_strength` and fallback gates.
+3. Restart task routing from Flashgrep tools (`query`/`glob`/`read_code`/`write_code`).
+4. Keep fallback usage only under a declared gate + reason code.

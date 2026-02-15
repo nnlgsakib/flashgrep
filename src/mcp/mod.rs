@@ -826,4 +826,43 @@ mod tests {
             .expect("follow response");
         assert!(follow_resp.result.is_some());
     }
+
+    #[tokio::test]
+    async fn bootstrap_policy_metadata_is_present_and_alias_consistent_tcp() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("skills")).expect("skills dir");
+        std::fs::write(root.join("skills/SKILL.md"), "# skill\n").expect("skill file");
+
+        let paths = FlashgrepPaths::new(&root);
+        let canonical_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "bootstrap_skill".to_string(),
+            params: serde_json::json!({"compact": true, "force": true}),
+            id: Some(1),
+        };
+        let alias_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "fgrep_boot".to_string(),
+            params: serde_json::json!({"compact": true, "force": true}),
+            id: Some(2),
+        };
+
+        let canonical = handle_request(canonical_req, &paths, None)
+            .await
+            .expect("canonical response")
+            .result
+            .expect("canonical payload");
+        let alias = handle_request(alias_req, &paths, None)
+            .await
+            .expect("alias response")
+            .result
+            .expect("alias payload");
+
+        assert_eq!(
+            canonical["policy_metadata"]["policy_strength"],
+            serde_json::Value::String("strict".to_string())
+        );
+        assert_eq!(canonical["policy_metadata"], alias["policy_metadata"]);
+    }
 }

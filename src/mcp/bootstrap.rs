@@ -1,5 +1,7 @@
 use crate::config::paths::FlashgrepPaths;
-use crate::mcp::skill::{bootstrap_policy, get_skill_documentation, get_skill_info};
+use crate::mcp::skill::{
+    bootstrap_policy, bootstrap_policy_metadata, get_skill_documentation, get_skill_info,
+};
 use crate::{FlashgrepError, FlashgrepResult};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -55,6 +57,7 @@ pub fn build_bootstrap_payload(
             "status": "already_injected",
             "canonical_trigger": canonical_trigger,
             "policy": bootstrap_policy(),
+            "policy_metadata": bootstrap_policy_metadata(),
         }));
     }
 
@@ -88,6 +91,7 @@ pub fn build_bootstrap_payload(
     let skill_version = info.version.clone();
     let docs = get_skill_documentation();
     let policy = bootstrap_policy();
+    let policy_metadata = bootstrap_policy_metadata();
 
     if compact {
         Ok(json!({
@@ -99,6 +103,7 @@ pub fn build_bootstrap_payload(
             "skill_version": skill_version,
             "skill_info": info,
             "policy": policy,
+            "policy_metadata": policy_metadata,
         }))
     } else {
         Ok(json!({
@@ -111,6 +116,7 @@ pub fn build_bootstrap_payload(
             "skill_info": info,
             "skill_overview": docs.overview,
             "policy": policy,
+            "policy_metadata": policy_metadata,
             "skill_markdown": skill_text,
         }))
     }
@@ -191,6 +197,33 @@ mod tests {
             second["status"],
             Value::String("already_injected".to_string())
         );
+        assert_eq!(
+            second["policy_metadata"]["policy_strength"],
+            Value::String("strict".to_string())
+        );
+    }
+
+    #[test]
+    fn bootstrap_includes_policy_metadata_and_legacy_fields() {
+        let (_temp, paths, injected) = setup_paths_with_skill(Some("# skill"));
+        let payload = build_bootstrap_payload(
+            &paths,
+            "flashgrep-init",
+            &json!({"compact": true, "force": true}),
+            &injected,
+        )
+        .expect("payload");
+
+        assert!(payload["policy"].is_array());
+        assert!(payload["policy_metadata"].is_object());
+        assert_eq!(
+            payload["policy_metadata"]["policy_strength"],
+            Value::String("strict".to_string())
+        );
+        assert!(payload["status"].as_str().is_some());
+        assert!(payload["canonical_trigger"].as_str().is_some());
+        assert!(payload["skill_hash"].as_str().is_some());
+        assert!(payload["skill_version"].as_str().is_some());
     }
 
     #[test]

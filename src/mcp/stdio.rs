@@ -969,9 +969,25 @@ mod tests {
                 .handle_skill_bootstrap_tool("fgrep-boot", &json!({"compact": true, "force": true}))
                 .expect("alias bootstrap result"),
         );
+        let canonical_payload = payload_text(
+            server
+                .handle_skill_bootstrap_tool(
+                    "bootstrap_skill",
+                    &json!({"compact": true, "force": true}),
+                )
+                .expect("canonical bootstrap result"),
+        );
         assert_eq!(
             alias_payload["canonical_trigger"],
             Value::String("flashgrep-init".to_string())
+        );
+        assert_eq!(
+            alias_payload["policy_metadata"]["policy_strength"],
+            Value::String("strict".to_string())
+        );
+        assert_eq!(
+            alias_payload["policy_metadata"],
+            canonical_payload["policy_metadata"]
         );
 
         let invalid_payload = payload_text(

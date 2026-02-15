@@ -94,7 +94,18 @@ fn create_bootstrap_alias_tool(name: &str) -> ToolDefinition {
                 "status": { "type": "string" },
                 "canonical_trigger": { "type": "string" },
                 "skill_hash": { "type": "string" },
-                "skill_version": { "type": "string" }
+                "skill_version": { "type": "string" },
+                "policy": { "type": "array", "items": { "type": "string" } },
+                "policy_metadata": {
+                    "type": "object",
+                    "properties": {
+                        "policy_version": { "type": "string" },
+                        "policy_strength": { "type": "string" },
+                        "preferred_tools": { "type": "object" },
+                        "fallback_rules": { "type": "array" },
+                        "compliance_checks": { "type": "object" }
+                    }
+                }
             },
             "required": ["status", "canonical_trigger"]
         }),

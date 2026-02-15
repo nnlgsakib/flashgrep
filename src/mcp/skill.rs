@@ -2,6 +2,7 @@
 
 use crate::mcp::bootstrap::BOOTSTRAP_TOOL_ALIASES;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -299,4 +300,41 @@ pub fn bootstrap_policy() -> Vec<String> {
         "Use read_code with budgets for token-efficient reads.".to_string(),
         "Use write_code for targeted, precondition-safe edits.".to_string(),
     ]
+}
+
+pub fn bootstrap_policy_metadata() -> Value {
+    json!({
+        "policy_version": "1.0",
+        "policy_strength": "strict",
+        "preferred_tools": {
+            "search": ["query", "glob", "files", "get_symbol"],
+            "read": ["read_code", "get_slice"],
+            "write": ["write_code"]
+        },
+        "fallback_rules": [
+            {
+                "gate_id": "index_unavailable",
+                "condition": "index_not_found_or_unreadable",
+                "allowed_tools": ["search", "search-in-directory", "search-with-context", "search-by-regex"],
+                "reason_code": "flashgrep_index_unavailable"
+            },
+            {
+                "gate_id": "unsupported_operation",
+                "condition": "flashgrep_tool_contract_missing_required_operation",
+                "allowed_tools": ["search", "search-in-directory", "search-by-regex"],
+                "reason_code": "flashgrep_operation_not_supported"
+            },
+            {
+                "gate_id": "tool_runtime_failure",
+                "condition": "flashgrep_tool_returns_error_after_valid_retry",
+                "allowed_tools": ["search", "search-in-directory", "search-with-context", "search-by-regex"],
+                "reason_code": "flashgrep_tool_runtime_failure"
+            }
+        ],
+        "compliance_checks": {
+            "requires_bootstrap_injected": true,
+            "requires_gated_fallback_reason": true,
+            "recommended_preferred_tool_hit_rate": ">=0.9"
+        }
+    })
 }
