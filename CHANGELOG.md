@@ -48,4 +48,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cross-platform support (Linux, macOS, Windows)
 - Single static binary distribution
 
-[0.1.0]: https://github.com/yourusername/flashgrep/releases/tag/v0.1.0
+[0.1.0]: https://github.com/nnlgsakib/flashgrep/releases/tag/v0.1.0

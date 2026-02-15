@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Budget-constrained code reads
-The system MUST provide code read operations that enforce caller-provided `max_tokens`, `max_bytes`, and `max_lines` limits with deterministic truncation behavior and MUST support continuation loops to complete arbitrarily large logical reads.
+The system MUST provide code read operations that enforce caller-provided `max_tokens`, `max_bytes`, and `max_lines` limits with deterministic truncation behavior and MUST avoid generating responses that destabilize MCP transport sessions.
 
 #### Scenario: Read respects explicit limits
 - **WHEN** a caller requests a file read with one or more explicit budget limits
@@ -11,12 +11,12 @@ The system MUST provide code read operations that enforce caller-provided `max_t
 - **WHEN** a file read is truncated due to any enforced limit
 - **THEN** the system returns continuation information that allows the caller to request the next segment without repeating already returned content
 
-#### Scenario: Full logical read completed via continuation
-- **WHEN** requested content is larger than one bounded response
-- **THEN** the system MUST allow repeated continuation requests until the full requested scope is retrieved exactly
+#### Scenario: Read request beyond safety bounds returns structured limit error
+- **WHEN** a caller omits limits or requests a range that exceeds server safety bounds for MCP response payloads
+- **THEN** the system MUST return a structured size-limit error or bounded truncated result and MUST keep the MCP session open
 
 ### Requirement: Minimal-diff writes with precondition safety
-The system MUST provide write operations that apply replacements only within explicit line ranges, validate optional preconditions before mutating files, and support chunked replacement workflows for very large content.
+The system MUST provide write operations that apply replacements only within explicit line ranges, validate optional preconditions before mutating files, and reject oversized replacements with machine-actionable errors.
 
 #### Scenario: Write succeeds with matching preconditions
 - **WHEN** a caller submits a line-range replacement and preconditions match current file state
@@ -26,6 +26,6 @@ The system MUST provide write operations that apply replacements only within exp
 - **WHEN** a caller submits a line-range replacement and preconditions do not match current file state
 - **THEN** the system rejects the write and returns structured conflict details sufficient for caller retry/rebase
 
-#### Scenario: Oversized replacement can proceed as chunked workflow
-- **WHEN** replacement content exceeds single-request safety size
-- **THEN** the system MUST provide continuation-compatible write semantics so callers can complete the full logical replacement in deterministic chunks
+#### Scenario: Oversized write replacement is rejected without transport failure
+- **WHEN** a caller submits replacement content larger than configured write payload limits
+- **THEN** the system MUST return a structured size-limit error including maximum allowed replacement size and MUST NOT terminate the MCP connection

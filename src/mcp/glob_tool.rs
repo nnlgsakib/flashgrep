@@ -22,6 +22,7 @@ pub fn glob_input_schema() -> Value {
             "case_sensitive": {"type": "boolean", "description": "Case-sensitive glob matching"},
             "sort_by": {"type": "string", "enum": ["path", "name", "modified", "size"]},
             "sort_order": {"type": "string", "enum": ["asc", "desc"]},
+            "offset": {"type": "integer", "minimum": 0, "description": "Result offset for stable pagination"},
             "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of results"}
         }
     })
@@ -39,10 +40,10 @@ pub fn run_glob(arguments: &Value) -> FlashgrepResult<Value> {
     let include_patterns = compile_patterns(&opts.includes)?;
     let exclude_patterns = compile_patterns(&opts.excludes)?;
 
-    for entry in walker
-        .into_iter()
-        .filter_entry(|e| entry_allowed(e.path(), &opts.root, opts.include_hidden))
-    {
+    for entry in walker.into_iter().filter_entry(|e| {
+        entry_allowed(e.path(), &opts.root, opts.include_hidden)
+            && !should_prune_dir(e.path(), &opts.root, &exclude_patterns, opts.case_sensitive)
+    }) {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -88,9 +89,24 @@ pub fn run_glob(arguments: &Value) -> FlashgrepResult<Value> {
 
     sort_matches(&mut matches, opts.sort_by, opts.sort_order);
 
+    let total = matches.len();
+
+    if opts.offset > 0 {
+        if opts.offset >= matches.len() {
+            matches.clear();
+        } else {
+            matches = matches.into_iter().skip(opts.offset).collect();
+        }
+    }
     if let Some(limit) = opts.limit {
         matches.truncate(limit);
     }
+
+    let next_offset = if opts.limit.is_some() && opts.offset.saturating_add(matches.len()) < total {
+        Some(opts.offset.saturating_add(matches.len()))
+    } else {
+        None
+    };
 
     Ok(json!({
         "results": matches.iter().map(|m| json!({
@@ -100,7 +116,10 @@ pub fn run_glob(arguments: &Value) -> FlashgrepResult<Value> {
             "size": m.size,
             "modified_unix": m.modified
         })).collect::<Vec<_>>(),
-        "total": matches.len(),
+        "total": total,
+        "returned": matches.len(),
+        "next_offset": next_offset,
+        "completed": next_offset.is_none(),
         "options": {
             "root": opts.root.to_string_lossy(),
             "includes": opts.includes,
@@ -113,6 +132,7 @@ pub fn run_glob(arguments: &Value) -> FlashgrepResult<Value> {
             "case_sensitive": opts.case_sensitive,
             "sort_by": opts.sort_by.as_str(),
             "sort_order": opts.sort_order.as_str(),
+            "offset": opts.offset,
             "limit": opts.limit,
         }
     }))
@@ -131,6 +151,7 @@ struct GlobOptions {
     case_sensitive: bool,
     sort_by: SortBy,
     sort_order: SortOrder,
+    offset: usize,
     limit: Option<usize>,
 }
 
@@ -189,6 +210,7 @@ impl GlobOptions {
             .get("limit")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
+        let offset = arguments.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
         if let Some(0) = limit {
             return Err(FlashgrepError::Config(
@@ -214,6 +236,7 @@ impl GlobOptions {
             case_sensitive,
             sort_by,
             sort_order,
+            offset,
             limit,
         })
     }
@@ -346,6 +369,22 @@ fn matches_any(path: &str, patterns: &[Pattern], case_sensitive: bool) -> bool {
     patterns.iter().any(|p| p.matches_with(path, opts))
 }
 
+fn should_prune_dir(path: &Path, root: &Path, excludes: &[Pattern], case_sensitive: bool) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let rel = relative_unix_path(path, root);
+    if rel.is_empty() {
+        return false;
+    }
+    let dir_candidate = if rel.ends_with('/') {
+        rel
+    } else {
+        format!("{}/", rel)
+    };
+    matches_any(&dir_candidate, excludes, case_sensitive)
+}
+
 fn extension_allowed(path: &Path, extensions: &[String]) -> bool {
     if extensions.is_empty() {
         return true;
@@ -473,6 +512,24 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_offset_window() {
+        let (_tmp, root) = setup();
+        let result = run_glob(&json!({
+            "path": root,
+            "pattern": "**/*.rs",
+            "sort_by": "path",
+            "sort_order": "asc",
+            "offset": 1,
+            "limit": 2
+        }))
+        .expect("glob result");
+
+        let paths = result["results"].as_array().expect("results array");
+        assert!(result["total"].as_u64().unwrap_or(0) >= paths.len() as u64);
+        assert!(paths.len() <= 2);
+    }
+
+    #[test]
     fn invalid_sort_option_returns_error() {
         let (_tmp, root) = setup();
         let err = run_glob(&json!({"path": root, "pattern": "**/*", "sort_by": "bad"}))
@@ -486,5 +543,48 @@ mod tests {
         let result = run_glob(&json!({"path": root, "pattern": "**/*.rs"})).expect("glob result");
         let paths = result["results"].as_array().expect("results array");
         assert!(!paths.is_empty());
+    }
+
+    #[test]
+    fn continuation_windows_have_no_gaps_or_duplicates() {
+        let (_tmp, root) = setup();
+        let first = run_glob(&json!({
+            "path": root,
+            "pattern": "**/*.rs",
+            "sort_by": "path",
+            "sort_order": "asc",
+            "offset": 0,
+            "limit": 2
+        }))
+        .expect("first page");
+
+        let next_offset = first["next_offset"].as_u64().unwrap_or(0);
+        let second = run_glob(&json!({
+            "path": root,
+            "pattern": "**/*.rs",
+            "sort_by": "path",
+            "sort_order": "asc",
+            "offset": next_offset,
+            "limit": 2
+        }))
+        .expect("second page");
+
+        let empty: Vec<Value> = Vec::new();
+        let first_paths: Vec<String> = first["results"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|v| v["relative_path"].as_str().map(|s| s.to_string()))
+            .collect();
+        let second_paths: Vec<String> = second["results"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|v| v["relative_path"].as_str().map(|s| s.to_string()))
+            .collect();
+
+        for p in &first_paths {
+            assert!(!second_paths.contains(p));
+        }
     }
 }

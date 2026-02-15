@@ -40,6 +40,7 @@ fn create_glob_tool() -> ToolDefinition {
                 "case_sensitive": {"type": "boolean"},
                 "sort_by": {"type": "string", "enum": ["path", "name", "modified", "size"]},
                 "sort_order": {"type": "string", "enum": ["asc", "desc"]},
+                "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1}
             }
         }),

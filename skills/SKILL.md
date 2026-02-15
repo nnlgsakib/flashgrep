@@ -1,836 +1,144 @@
-# Flashgrep MCP Server - AI Agent Skill Guide
+# Flashgrep MCP Skill
 
-## Overview
+Use this skill to run high-speed, index-first code discovery and editing with Flashgrep MCP tools.
 
-Flashgrep is a high-performance code search MCP server optimized for large codebases. It provides:
+## 1) Session Bootstrap
 
-- **Indexed search**: Pre-built indexes for instant full-text and symbol search
-- **Symbol navigation**: Jump to definitions for functions, classes, variables
-- **Code slicing**: Extract specific line ranges from files
-- **Token-efficient reading**: Budgeted reads with deterministic truncation + continuation
-- **Minimal-diff writing**: Safe line-range writes with optional precondition checks
-- **Advanced glob discovery**: One-pass include/exclude, extensions, depth, sort, and limit controls
-- **Fast queries**: Near-instant search across millions of lines of code
-
-Use flashgrep when you need to:
-- Find code patterns, functions, or symbols in large projects
-- Navigate to specific code locations
-- Analyze code structure and relationships
-- Extract code snippets for analysis or modification
-
-## Native Bootstrap (No Manual Skill Loading)
-
-If your agent supports MCP tool calls, start every session by invoking one of:
-
+Call once at session start:
 - `bootstrap_skill`
-- `flashgrep-init` / `flashgrep_init`
-- `fgrep-boot` / `fgrep_boot`
+- `flashgrep-init` or `flashgrep_init`
+- `fgrep-boot` or `fgrep_boot`
 
-This returns injected Flashgrep guidance directly from `skills/SKILL.md`, so you do not need to manually load external skill files.
-
-Recommended bootstrap request:
+Recommended call:
 
 ```json
-{
-  "name": "flashgrep_init",
-  "arguments": {
-    "compact": true
-  }
-}
+{"name":"flashgrep_init","arguments":{"compact":true}}
 ```
 
-Expected bootstrap behavior:
-- First call: `status = injected`
-- Repeated call in same session: `status = already_injected`
-- Invalid trigger: `error = invalid_trigger`
-- Missing/unreadable skill file: `error = skill_not_found` or `skill_unreadable`
+Expected:
+- first call: `status = injected`
+- repeat call: `status = already_injected`
+- invalid alias/trigger: `error = invalid_trigger`
 
-After bootstrap, prefer Flashgrep-native tools in this order:
-1. `flashgrep_query`
-2. `flashgrep_list_files` / `flashgrep_get_symbol`
-3. `flashgrep_read_code`
-4. `flashgrep_write_code`
+## 2) Primary Tool Selection
 
-## Available Tools
+Pick the smallest tool that solves the task:
 
-### 1. `flashgrep_query` - Full-text code search
+1. `query` / `flashgrep_query`: indexed grep-style search.
+2. `glob` / `files` / `list_files` / `flashgrep_glob`: indexed or advanced path discovery.
+3. `get_symbol` / `flashgrep_get_symbol`: symbol lookup.
+4. `read_code` / `flashgrep_read_code`: budgeted code reads.
+5. `get_slice` / `flashgrep_get_slice`: exact line ranges.
+6. `write_code` / `flashgrep_write_code`: minimal line-range edits.
+7. `stats` / `flashgrep_stats`: index health and readiness.
 
-Search the indexed codebase for text patterns with fast fuzzy matching.
+Use legacy search tools only if needed for compatibility:
+- `search`
+- `search-in-directory`
+- `search-with-context`
+- `search-by-regex`
 
-**Parameters:**
-- `text` (required): Search query text
-- `limit` (optional): Maximum results (default: 10)
+## 3) Tool Reference (What + When)
 
-**Usage:**
-```
-flashgrep_query:0
-{
-  "text": "function handleError",
-  "limit": 20
-}
-```
+### `query`
+Use for indexed text matching with parity options.
 
-**Returns:** Array of matches with file paths, line numbers, and content.
+Core args:
+- `text` (required)
+- `mode`: `smart | literal | regex`
+- `case_sensitive` (or `regex_flags` in regex mode)
+- `include`, `exclude`
+- `context`
+- `limit`
 
-**Best for:**
-- Finding function definitions or calls
-- Searching for specific code patterns
-- Locating error handling code
-- Finding imports and exports
-- Searching for TODOs or comments
+Patterns:
+- literal: `{ "text": "a+b", "mode": "literal" }`
+- regex: `{ "text": "fn\\s+\\w+", "mode": "regex", "regex_flags": "i" }`
+- scoped: add `include` and `exclude`
 
----
+### `glob`
+Use for deterministic file discovery with one-pass filtering.
 
-### 2. `flashgrep_get_slice` - Extract code range
-
-Get specific line ranges from a file for detailed analysis.
-
-**Parameters:**
-- `file_path` (required): Absolute path to the file
-- `start_line` (required): Starting line number (1-indexed)
-- `end_line` (required): Ending line number (1-indexed)
-
-**Usage:**
-```
-flashgrep_get_slice:1
-{
-  "file_path": "/home/user/project/src/utils.js",
-  "start_line": 45,
-  "end_line": 60
-}
-```
-
-**Returns:** Lines of code with line numbers as `45: function name() {`.
-
-**Best for:**
-- Reading function implementations
-- Viewing class definitions
-- Analyzing specific code blocks
-- Understanding context around search results
-
----
-
-### 2.5. `flashgrep_glob` - Advanced one-pass file discovery
-
-Use glob when you need filesystem-style discovery with rich filters in one call.
-
-Common options:
-- `pattern`, `path`
+Core args:
+- `path`, `pattern`
 - `include`, `exclude`
 - `extensions`
-- `max_depth`, `recursive`, `include_hidden`, `follow_symlinks`
-- `sort_by`, `sort_order`, `limit`
-
-Example:
-```
-flashgrep_glob:2
-{
-  "path": "src",
-  "pattern": "**/*.rs",
-  "exclude": ["**/target/**", "**/.git/**"],
-  "extensions": [".rs"],
-  "max_depth": 4,
-  "sort_by": "name",
-  "sort_order": "asc",
-  "limit": 200
-}
-```
-
-Best for:
-- One-pass file selection before deeper analysis
-- Large-repo scans where early pruning improves speed
-- Deterministic batches for repeatable workflows
-
----
-
-### 3. `flashgrep_read_code` - Token-efficient bounded reads
-
-Read code with explicit budgets for token/byte/line efficiency. Supports two modes:
-
-- **Slice mode:** `file_path` (+ optional `start_line`, `end_line`, `continuation_start_line`)
-- **Symbol mode:** `symbol_name` (+ optional `symbol_context_lines`)
-
-**Parameters:**
-- `file_path` or `symbol_name` (exactly one required)
-- `start_line` / `end_line` (optional for slice mode)
-- `continuation_start_line` (optional)
-- `max_lines` (optional)
-- `max_bytes` (optional)
-- `max_tokens` (optional, approximate)
-- `metadata_level` (optional): `minimal` or `standard`
-
-**Usage:**
-```
-flashgrep_read_code:2
-{
-  "file_path": "/home/user/project/src/server.ts",
-  "start_line": 1,
-  "max_lines": 80,
-  "max_bytes": 2000,
-  "metadata_level": "minimal"
-}
-```
-
-**Returns:** JSON payload with `content`, `truncated`, `continuation_start_line`, and `applied_limits`.
-
-**Best for:**
-- Low-token iterative code reading
-- Streaming large files in bounded chunks
-- Agent workflows that require deterministic output size
-
----
-
-### 4. `flashgrep_write_code` - Minimal-diff line-range write
-
-Update only a specific line range in a file with optional optimistic preconditions.
-
-**Parameters:**
-- `file_path` (required)
-- `start_line` (required)
-- `end_line` (required)
-- `replacement` (required)
-- `precondition` (optional):
-  - `expected_file_hash`
-  - `expected_start_line_text`
-  - `expected_end_line_text`
-
-**Usage:**
-```
-flashgrep_write_code:3
-{
-  "file_path": "/home/user/project/docs/code.md",
-  "start_line": 1,
-  "end_line": 1,
-  "replacement": "# Updated by MCP",
-  "precondition": {
-    "expected_start_line_text": "# Old title"
-  }
-}
-```
-
-**Returns:** JSON payload with `ok=true` on success, or `ok=false` with structured conflict details on precondition mismatch.
-
-**Best for:**
-- Safe targeted edits
-- Multi-agent workflows with race/conflict protection
-- Avoiding whole-file rewrites
-
----
-
-### 5. `flashgrep_get_symbol` - Find symbol definition
-
-Locate the definition of a specific function, class, variable, or type.
-
-**Parameters:**
-- `symbol_name` (required): Name of the symbol to find
-
-**Usage:**
-```
-flashgrep_get_symbol:2
-{
-  "symbol_name": "handleError"
-}
-```
-
-**Returns:** File path, line number, and content of the symbol definition.
-
-**Best for:**
-- Jumping to function definitions
-- Finding class declarations
-- Locating type definitions
-- Understanding where symbols are declared
-
----
-
-### 6. `flashgrep_list_files` - List indexed files
-
-Get a complete list of all files indexed by flashgrep.
-
-**Parameters:** None
-
-**Usage:**
-```
-flashgrep_list_files:3
-{}
-```
-
-**Returns:** Array of all indexed file paths.
-
-**Best for:**
-- Understanding project structure
-- Verifying files are indexed
-- Finding file paths for slicing
-- Initial project exploration
-
----
-
-### 7. `flashgrep_stats` - Index statistics
-
-Get statistics about the indexed codebase.
-
-**Parameters:** None
-
-**Usage:**
-```
-flashgrep_stats:4
-{}
-```
-
-**Returns:** Count of indexed files, total lines of code, index size, etc.
-
-**Best for:**
-- Understanding codebase scale
-- Verifying indexing status
-- Before/after comparison when adding files
-
-## Common Search Patterns
-
-### Finding Functions
-```
-# JavaScript/TypeScript
-flashgrep_query:5
-{
-  "text": "function handleError"
-}
-
-# Python
-flashgrep_query:6
-{
-  "text": "def process_data"
-}
-
-# Rust
-flashgrep_query:7
-{
-  "text": "fn calculate_total"
-}
-
-# Arrow functions / methods
-flashgrep_query:8
-{
-  "text": "const processData = "
-}
-```
-
-### Finding Classes
-```
-# JavaScript/TypeScript classes
-flashgrep_query:9
-{
-  "text": "class UserController"
-}
-
-# Python classes
-flashgrep_query:10
-{
-  "text": "class DataProcessor"
-}
-
-# Rust structs
-flashgrep_query:11
-{
-  "text": "struct Config"
-}
-```
-
-### Finding Imports/Exports
-```
-# JavaScript imports
-flashgrep_query:12
-{
-  "text": "import { useState }"
-}
-
-# Python imports
-flashgrep_query:13
-{
-  "text": "from flask import Flask"
-}
-
-# Exports
-flashgrep_query:14
-{
-  "text": "export default"
-}
-flashgrep_query:15
-{
-  "text": "module.exports"
-}
-```
-
-### Finding Error Handling
-```
-flashgrep_query:16
-{
-  "text": "try {"   
-}
-flashgrep_query:17
-{
-  "text": "catch (error)"
-}
-flashgrep_query:18
-{
-  "text": "throw new Error"
-}
-```
-
-### Finding Tests
-```
-flashgrep_query:19
-{
-  "text": "describe('"
-}
-flashgrep_query:20
-{
-  "text": "it('should"
-}
-flashgrep_query:21
-{
-  "text": "test('"
-}
-flashgrep_query:22
-{
-  "text": "def test_"
-}
-```
-
-### Finding TODOs and Comments
-```
-flashgrep_query:23
-{
-  "text": "TODO:"
-}
-flashgrep_query:24
-{
-  "text": "FIXME:"
-}
-flashgrep_query:25
-{
-  "text": "NOTE:"
-}
-```
-
-### Finding Configuration
-```
-flashgrep_query:26
-{
-  "text": "module.exports = {"
-}
-flashgrep_query:27
-{
-  "text": "export default {"
-}
-flashgrep_query:28
-{
-  "text": "const config = {"
-}
-```
-
-## Example Workflows
-
-### Workflow 1: Understanding a Function
-
-**Goal:** Find and understand the `processPayment` function.
-
-**Steps:**
-1. **Find the definition:**
-   ```
-   flashgrep_get_symbol:29
-   {
-     "symbol_name": "processPayment"
-   }
-   ```
-
-2. **Read the full function:**
-   (Using file path and line numbers from step 1)
-   ```
-   flashgrep_get_slice:30
-   {
-     "file_path": "/home/user/project/src/payment.js",
-     "start_line": 45,
-     "end_line": 80
-   }
-   ```
-
-3. **Find where it's called:**
-   ```
-   flashgrep_query:31
-   {
-     "text": "processPayment("
-   }
-   ```
-
-### Workflow 2: Tracing Error Handling
-
-**Goal:** Find all error handling related to database connections.
-
-**Steps:**
-1. **Search for database error patterns:**
-   ```
-   flashgrep_query:32
-   {
-     "text": "DatabaseError"
-   }
-   ```
-
-2. **Look for related catch blocks:**
-   ```
-   flashgrep_query:33
-   {
-     "text": "catch.*database"
-   }
-   ```
-
-3. **Read a specific error handler:**
-   ```
-   flashgrep_get_slice:34
-   {
-     "file_path": "/home/user/project/src/db.js",
-     "start_line": 120,
-     "end_line": 140
-   }
-   ```
-
-### Workflow 3: Finding All API Endpoints
-
-**Goal:** Discover all API endpoints in an Express.js application.
-
-**Steps:**
-1. **Search for route definitions:**
-   ```
-   flashgrep_query:35
-   {
-     "text": "app.get("
-   }
-   ```
-
-2. **Find other HTTP methods:**
-   ```
-   flashgrep_query:36
-   {
-     "text": "app.post("
-   }
-   ```
-
-3. **Also check router methods:**
-   ```
-   flashgrep_query:37
-   {
-     "text": "router.get("
-   }
-   ```
-
-### Workflow 4: Analyzing a Class
-
-**Goal:** Understand the `UserService` class structure.
-
-**Steps:**
-1. **Find the class definition:**
-   ```
-   flashgrep_query:38
-   {
-     "text": "class UserService"
-   }
-   ```
-
-2. **Get the full class:**
-   (Assuming class is ~50 lines)
-   ```
-   flashgrep_get_slice:39
-   {
-     "file_path": "/home/user/project/src/services/user.js",
-     "start_line": 1,
-     "end_line": 100
-   }
-   ```
-
-3. **Find class methods:**
-   ```
-   flashgrep_query:40
-   {
-     "text": "async.*UserService|UserService.prototype"
-   }
-   ```
-
-### Workflow 5: Project Structure Overview
-
-**Goal:** Get a high-level understanding of a project.
-
-**Steps:**
-1. **Check indexing status:**
-   ```
-   flashgrep_stats:41
-   {}
-   ```
-
-2. **List all files:**
-   ```
-   flashgrep_list_files:42
-   {}
-   ```
-
-3. **Find main entry points:**
-   ```
-   flashgrep_query:43
-   {
-     "text": "index.js"
-   }
-   ```
-
-4. **Find package/configuration files:**
-   ```
-   flashgrep_query:44
-   {
-     "text": "package.json"
-   }
-   ```
-
-## Error Handling
-
-### Common Errors and Solutions
-
-**Error: "File not found" in get_slice**
-- **Cause:** File path doesn't exist or isn't indexed
-- **Solution:** Use `flashgrep_list_files` to verify the correct path
-- **Example:**
-  ```
-  # Wrong
-  "file_path": "src/utils.js"
-  
-  # Correct
-  "file_path": "/home/user/project/src/utils.js"
-  ```
-
-**Error: "Symbol not found" in get_symbol**
-- **Cause:** Symbol name doesn't exist in the index
-- **Solution:** 
-  1. Search for partial matches with `flashgrep_query`
-  2. Check spelling and case sensitivity
-  3. Verify the symbol is defined, not just used
-
-**Error: Empty query results**
-- **Cause:** No matches found
-- **Solution:**
-  1. Try broader search terms
-  2. Use partial words instead of full phrases
-  3. Check if the codebase is indexed
-
-**Error: Line numbers out of range**
-- **Cause:** Requested lines beyond file length
-- **Solution:** Use search results to find valid line ranges, then slice
-
-### Defensive Programming
-
-Always verify results before using them:
-
-```javascript
-// Good: Check results exist before slicing
-const results = await flashgrep_query({ text: "function processData" });
-if (results && results.length > 0) {
-  const firstMatch = results[0];
-  await flashgrep_get_slice({
-    file_path: firstMatch.file_path,
-    start_line: firstMatch.line_number,
-    end_line: firstMatch.line_number + 20
-  });
-}
-```
-
-## Best Practices
-
-### 1. Start Broad, Then Narrow
-- Begin with broad searches (`flashgrep_query`)
-- Use `get_symbol` for precise navigation
-- Extract context with `get_slice`
-- Prefer `read_code` with budgets for token-efficient deep reads
-
-### 2. Use Absolute Paths
-- Always use absolute file paths
-- Get paths from search results or `list_files`
-- Don't assume relative paths work
-
-### 3. Batch Related Searches
-- Run multiple independent queries in parallel
-- Combine results for comprehensive analysis
-
-**Example:**
-```
-# Parallel searches for different HTTP methods
-flashgrep_query:45
-{ "text": "app.get(" }
-flashgrep_query:46
-{ "text": "app.post(" }
-flashgrep_query:47
-{ "text": "app.put(" }
-flashgrep_query:48
-{ "text": "app.delete(" }
-```
-
-### 4. Extract Meaningful Context
-- When using `get_slice`, include surrounding lines
-- Show 5-10 lines before and after for context
-- Don't extract single lines in isolation
-- For large files, switch to `read_code` and iterate with `continuation_start_line`
-
-**Example:**
-```javascript
-// Good: Include context around the target
-{
-  "start_line": targetLine - 5,
-  "end_line": targetLine + 15
-}
-
-// Bad: Too narrow
-{
-  "start_line": targetLine,
-  "end_line": targetLine
-}
-```
-
-### 5. Handle Multiple Matches
-- Functions may be defined in multiple files
-- Classes may have the same name in different modules
-- Always check file paths to disambiguate
-
-**Example:**
-```javascript
-// Results might show:
-// /src/api/user.js:45 - function processData
-// /src/db/models.js:120 - function processData
-// Choose the right one based on context
-```
-
-### 6. Use Fuzzy Matching Wisely
-- Flashgrep uses fuzzy search
-- Results are ranked by relevance
-- Review top 5-10 results for best matches
-
-### 7. Verify Before Acting
-- Read code before modifying it
-- Understand the full context
-- Check for dependencies and side effects
-
-### 8. Keep Search Terms Focused
-- Avoid overly broad searches (e.g., just "function")
-- Use distinctive identifiers
-- Include file extensions when relevant
-
-### 9. Document Your Findings
-- Note file paths and line numbers
-- Quote relevant code snippets
-- Explain the purpose of found code
-
-### 10. Index Status Awareness
-- Run `flashgrep_stats` periodically
-- Be aware of what's indexed
-- Note that uncommitted changes may not be indexed
-
-## Quick Reference
-
-| Task | Primary Tool | Example Query |
-|------|--------------|---------------|
-| Find function definition | `get_symbol` | `{"symbol_name": "processData"}` |
-| Find all function calls | `query` | `{"text": "processData("}` |
-| Read function body | `get_slice` | `{"file_path": "...", "start_line": 10, "end_line": 50}` |
-| Advanced file discovery | `glob` | `{"pattern":"**/*.rs","exclude":["**/target/**"],"limit":200}` |
-| Token-efficient read | `read_code` | `{"file_path": "...", "max_lines": 80, "metadata_level": "minimal"}` |
-| Continue large read | `read_code` | `{"file_path": "...", "continuation_start_line": 81}` |
-| Safe targeted edit | `write_code` | `{"file_path": "...", "start_line": 20, "end_line": 22, "replacement": "..."}` |
-| Find imports | `query` | `{"text": "import React"}` |
-| List all files | `list_files` | `{}` |
-| Check index status | `stats` | `{}` |
-| Find TODOs | `query` | `{"text": "TODO:"}` |
-| Find tests | `query` | `{"text": "it('should"}` |
-| Find error handling | `query` | `{"text": "catch (error)"}` |
-| Find classes | `query` | `{"text": "class User"}` |
-
-## Tips for Specific Languages
-
-### JavaScript/TypeScript
-- Search for `const`, `let`, `var` for variable declarations
-- Use `=>` to find arrow functions
-- Look for `export`/`import` for module boundaries
-
-### Python
-- Search for `def` for functions, `class` for classes
-- Use `self.` for instance methods
-- Look for `__init__` for constructors
-
-### Rust
-- Search for `fn` for functions, `struct`/`enum` for types
-- Use `impl` for implementations
-- Look for `use` for imports
-
-### Go
-- Search for `func` for functions
-- Use `type` for type definitions
-- Look for `package` for file organization
-
-## CLI Fast Search Commands
-
-Flashgrep also provides direct CLI commands powered by the same indexed core, so you can use them frequently in terminal workflows instead of traditional `grep`/`glob` scans.
-
-### `flashgrep query <text>`
-
-Indexed full-text search (grep-like):
-
-```bash
-flashgrep query "fn main" --limit 20
-flashgrep query "TODO:" --output json
-```
-
-### `flashgrep files`
-
-List indexed files (glob-like exploration):
-
-```bash
-flashgrep files --limit 100
-flashgrep files --filter tests --output json
-```
-
-### `flashgrep symbol <name>`
-
-Lookup symbol locations quickly:
-
-```bash
-flashgrep symbol main
-flashgrep symbol Indexer --limit 10 --output json
-```
-
-### `flashgrep slice <file_path> <start_line> <end_line>`
-
-Extract a precise code range:
-
-```bash
-flashgrep slice src/cli/mod.rs 1 60
-flashgrep slice src/search/mod.rs 35 70 --output json
-```
-
-### JSON output shape
-
-All CLI fast-search commands support a consistent JSON array of objects with shared fields such as `file_path`, `start_line`, `end_line`, `symbol_name`, `relevance_score`, `preview`, and `content` when available.
-
-```json
-[
-  {
-    "file_path": "src/search/mod.rs",
-    "start_line": 39,
-    "end_line": 94,
-    "symbol_name": null,
-    "relevance_score": 12.37,
-    "preview": "pub fn query(&self, text: &str, limit: usize) -> FlashgrepResult<Vec<SearchResult>> {"
-  }
-]
-```
-
-## Summary
-
-Flashgrep provides fast, indexed code search ideal for:
-- **Navigation**: Jump to definitions with `get_symbol`
-- **Discovery**: Find patterns with `query`
-- **Analysis**: Extract and read code with `get_slice` or budgeted `read_code`
-- **Discovery (filesystem-style)**: Use `glob` with include/exclude/depth/limit for one-pass filtering
-- **Safe edits**: Apply minimal-diff writes with `write_code`
-- **Exploration**: Understand structure with `list_files` and `stats`
-
-**Remember:** Always use absolute paths, include context when slicing, and verify results before acting on them.
+- `max_depth`, `recursive`
+- `include_hidden`, `follow_symlinks`
+- `sort_by`, `sort_order`
+- `offset`, `limit`
+
+Best default for automation:
+- `sort_by = path`
+- `sort_order = asc`
+- explicit `offset` and `limit`
+
+### `get_symbol`
+Use for exact symbol-name discovery before reading code.
+
+Arg:
+- `symbol_name`
+
+### `read_code`
+Use for token-efficient reading. Prefer this over full file dumps.
+
+Modes:
+- slice mode: `file_path` (+ `start_line`/`end_line`)
+- symbol mode: `symbol_name` (+ `symbol_context_lines`)
+
+Budgets:
+- `max_lines`, `max_bytes`, `max_tokens`
+- continuation via `continuation_start_line`
+- if server returns `payload_too_large`, reduce chunk size and continue
+- loop until `continuation.completed = true`
+
+### `get_slice`
+Use for exact ranges when you already know file + line bounds.
+
+Args:
+- `file_path`, `start_line`, `end_line`
+
+### `write_code`
+Use for minimal and safe edits.
+
+Args:
+- `file_path`, `start_line`, `end_line`, `replacement`
+- optional `precondition` (`expected_file_hash`, `expected_start_line_text`, `expected_end_line_text`)
+
+Behavior:
+- precondition mismatch returns conflict (`ok: false`, `error: precondition_failed`)
+- oversized replacements return `payload_too_large`; split writes into smaller chunks
+- large writes can be continued with `continuation_id`, `chunk_index`, `is_final_chunk`
+
+### `list_files` / `stats`
+- `list_files`: full indexed file inventory.
+- `stats`: verify index exists/fresh before heavy queries.
+
+## 4) Standard Workflows
+
+### Code Discovery
+1. `query` for candidate matches.
+2. `get_symbol` if symbol-oriented.
+3. `read_code` for bounded context.
+4. `get_slice` for exact extraction.
+
+### Deterministic File Expansion
+1. `glob` with `pattern` + filters.
+2. Always set `sort_by`, `sort_order`, `offset`, `limit`.
+3. Feed resulting paths into `query` or `read_code`.
+
+### Targeted Editing
+1. Locate with `query`/`get_symbol`.
+2. Confirm context with `read_code`.
+3. Edit with `write_code` + preconditions where possible.
+4. Re-read changed range with `read_code` or `get_slice`.
+
+## 5) Guardrails
+
+- Prefer Flashgrep tools over shell grep/find for repeated work.
+- Keep outputs bounded (`limit`, `offset`, read budgets).
+- Use deterministic sorting for automation (`path`, `asc`).
+- If results are empty, verify index with `stats`, then broaden scope.
+- Use regex mode only when needed; literal/smart is cheaper and safer.
+- For large repos, narrow path scope early (`include`/`exclude`, `max_depth`).
+- For large IO, keep request payloads small and expect chunked continuation/retry loops.

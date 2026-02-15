@@ -30,7 +30,7 @@ cp target/release/flashgrep /usr/local/bin/
 
 ### Pre-built Binaries
 
-Download pre-built binaries from the [releases page](https://github.com/yourusername/flashgrep/releases).
+Download pre-built binaries from the [releases page](https://github.com/nnlgsakib/flashgrep/releases).
 
 ## Quick Start
 
@@ -96,6 +96,12 @@ flashgrep query "fn main" --limit 20
 
 # Script-friendly JSON output
 flashgrep query "TODO:" --output json
+
+# Regex mode + path scope + context
+flashgrep query "fn\\s+main" --mode regex --include "src/**/*.rs" --context 2
+
+# Literal mode + case-insensitive
+flashgrep query "a+b" --mode literal --ignore-case
 ```
 
 #### `flashgrep files [PATH]`
@@ -108,6 +114,12 @@ flashgrep files --limit 100
 
 # Filter file paths
 flashgrep files --filter mcp --output json
+
+# Glob-style filtering with deterministic sorting
+flashgrep files --pattern "src/**/*.rs" --exclude "**/target/**" --sort-by path --sort-order asc
+
+# Stable pagination window
+flashgrep files --pattern "**/*" --offset 200 --limit 100
 ```
 
 #### `flashgrep symbol <SYMBOL_NAME> [PATH]`
@@ -135,6 +147,33 @@ Show active background watcher processes.
 ```bash
 flashgrep watchers
 ```
+
+### Grep/Glob Replacement Guide
+
+Flashgrep is designed to replace repeated `grep` + filesystem `glob` workflows with deterministic, index-aware operations.
+
+#### Grep-style mappings
+
+- `grep "TODO:" -R src` -> `flashgrep query "TODO:" --include "src/**/*.rs" --limit 200`
+- `grep -i "auth" -R .` -> `flashgrep query "auth" --ignore-case --limit 200`
+- `grep -E "fn\s+main" -R src` -> `flashgrep query "fn\\s+main" --mode regex --include "src/**/*.rs"`
+- `grep -F "a+b" -R src` -> `flashgrep query "a+b" --mode literal --include "src/**/*"`
+- `grep -n -C 2 "panic" src/main.rs` -> `flashgrep query "panic" --include "src/main.rs" --context 2`
+
+#### Glob-style mappings
+
+- `glob("src/**/*.rs")` -> `flashgrep files --pattern "src/**/*.rs" --sort-by path --sort-order asc`
+- `glob + exclude build dirs` -> `flashgrep files --pattern "**/*" --exclude "**/target/**" --exclude "**/node_modules/**"`
+- `glob with extension filter` -> `flashgrep files --pattern "**/*" --ext rs --ext toml`
+- `glob pagination/window` -> `flashgrep files --pattern "**/*" --sort-by path --offset 200 --limit 200`
+
+#### Production expectations
+
+- Deterministic output: use explicit `--sort-by`, `--sort-order`, `--offset`, `--limit`.
+- Bounded responses: always set `--limit` for scripts/agents.
+- Fresh index: run `flashgrep index` first; run watcher (`flashgrep start -b`) for incremental freshness.
+- Validation errors: invalid parameter combinations return structured errors (CLI config error or MCP `invalid_params`).
+- Large MCP reads/writes: prefer chunked workflows and continuation fields over single oversized payloads.
 
 ### MCP Setup (Stdio)
 
@@ -322,6 +361,12 @@ Response includes deterministic truncation markers and continuation:
 - `continuation_start_line`: next line to continue from
 - `applied_limits`: consumed + configured budgets
 
+Large-IO safety notes:
+- Flashgrep enforces MCP payload safety caps to prevent transport disconnects.
+- If a request or response is too large, tools return structured `invalid_params` or `payload_too_large` errors.
+- For large files, use chunked reads (`max_lines`, `max_bytes`, `continuation_start_line`).
+- For full retrieval, loop until `continuation.completed=true` (or `continuation_start_line` is null).
+
 #### `write_code(file_path, start_line, end_line, replacement, precondition?)`
 
 Minimal-diff write that replaces only a target line range. Supports optional optimistic preconditions:
@@ -331,6 +376,11 @@ Minimal-diff write that replaces only a target line range. Supports optional opt
 - `expected_end_line_text`
 
 On mismatch, returns structured conflict details with `ok: false` and `error: precondition_failed`.
+
+Large-IO safety notes:
+- Oversized replacements are rejected with structured `payload_too_large` metadata.
+- Retry with smaller replacement chunks to keep the MCP session stable.
+- For very large writes, use continuation fields: `continuation_id`, `chunk_index`, and `is_final_chunk`.
 
 ```json
 {
@@ -523,6 +573,30 @@ cargo test
 RUST_LOG=info cargo run -- index
 ```
 
+### Documentation Consistency Checks
+
+Before release, verify docs match shipped CLI/MCP behavior:
+
+```bash
+# Ensure grep/glob replacement guidance exists
+rg "Grep/Glob Replacement Guide" README.md
+
+# Ensure query parity options are documented
+rg "--mode regex|--mode literal|--ignore-case|--context" README.md
+
+# Ensure skill stays compact and references Flashgrep-first ordering
+rg "Tool Order|query|glob|read_code|write_code" skills/SKILL.md
+```
+
+### Release Sanity Criteria
+
+Use these pass/fail checks before release:
+
+- `flashgrep stats` returns non-zero indexed file/chunk counts for the target repo.
+- `flashgrep query` with parity flags (`--mode`, `--include/--exclude`, `--context`, `--limit`) returns deterministic output shape and no parameter errors.
+- `flashgrep files` with deterministic windowing (`--sort-by path --sort-order asc --offset --limit`) returns stable pagination windows.
+- MCP `query`/`glob` calls return structured payloads; invalid combinations return `invalid_params`.
+
 ### Project Structure
 
 ```
@@ -569,7 +643,7 @@ flashgrep index
 
 ## License
 
-MIT License - See LICENSE file for details
+Apache License 2.0 - See LICENSE file for details
 
 ## Contributing
 

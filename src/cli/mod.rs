@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::index::engine::Indexer;
 use crate::mcp::stdio::McpStdioServer;
-use crate::search::Searcher;
+use crate::search::{QueryMode, QueryOptions, Searcher};
 use crate::watcher::registry::{is_process_alive, kill_process, WatcherRegistry};
 use crate::watcher::FileWatcher;
 use crate::FlashgrepResult;
@@ -29,6 +29,35 @@ pub struct Cli {
 pub enum OutputMode {
     Text,
     Json,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum QueryModeArg {
+    Smart,
+    Literal,
+    Regex,
+}
+
+impl From<QueryModeArg> for QueryMode {
+    fn from(value: QueryModeArg) -> Self {
+        match value {
+            QueryModeArg::Smart => QueryMode::Smart,
+            QueryModeArg::Literal => QueryMode::Literal,
+            QueryModeArg::Regex => QueryMode::Regex,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum FileSortBy {
+    Path,
+    Name,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum FileSortOrder {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +115,24 @@ pub enum Commands {
         /// Maximum number of results
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
+        /// Query mode
+        #[arg(long, value_enum, default_value_t = QueryModeArg::Smart)]
+        mode: QueryModeArg,
+        /// Ignore case during matching
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+        /// Include path glob filter (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude path glob filter (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Number of context lines around each match
+        #[arg(short = 'C', long = "context", default_value_t = 0)]
+        context: usize,
+        /// Offset for deterministic continuation windows
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputMode::Text)]
         output: OutputMode,
@@ -95,6 +142,33 @@ pub enum Commands {
         /// Optional substring filter for file paths
         #[arg(short, long)]
         filter: Option<String>,
+        /// Primary glob pattern against indexed paths
+        #[arg(long, default_value = "**/*")]
+        pattern: String,
+        /// Include glob pattern (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude glob pattern (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// File extension filters (e.g. rs or .rs)
+        #[arg(long = "ext")]
+        extensions: Vec<String>,
+        /// Include hidden paths
+        #[arg(long = "include-hidden")]
+        include_hidden: bool,
+        /// Maximum path depth from repository root
+        #[arg(long = "max-depth")]
+        max_depth: Option<usize>,
+        /// Sort field for deterministic ordering
+        #[arg(long = "sort-by", value_enum, default_value_t = FileSortBy::Path)]
+        sort_by: FileSortBy,
+        /// Sort direction for deterministic ordering
+        #[arg(long = "sort-order", value_enum, default_value_t = FileSortOrder::Asc)]
+        sort_order: FileSortOrder,
+        /// Offset window for pagination
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Path to the repository (defaults to current directory)
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
@@ -312,10 +386,25 @@ pub async fn run() -> FlashgrepResult<()> {
             text,
             path,
             limit,
+            mode,
+            ignore_case,
+            include,
+            exclude,
+            context,
+            offset,
             output,
         } => {
             let (repo_root, searcher) = create_searcher(path.as_ref())?;
-            let mut results = searcher.query(&text, limit.max(1))?;
+            let mut options = QueryOptions::new(text.clone(), limit.max(1));
+            options.mode = mode.into();
+            options.case_sensitive = !ignore_case;
+            options.include = include;
+            options.exclude = exclude;
+            options.context = context;
+            options.offset = offset;
+
+            let query_response = searcher.query_with_options(&options)?;
+            let mut results = query_response.results;
             results.sort_by(|a, b| {
                 b.relevance_score
                     .total_cmp(&a.relevance_score)
@@ -341,27 +430,109 @@ pub async fn run() -> FlashgrepResult<()> {
             render_results(
                 &rendered,
                 output,
-                &format!("query in {}", repo_root.display()),
+                &format!(
+                    "query in {} (truncated={}, scanned_files={})",
+                    repo_root.display(),
+                    query_response.truncated,
+                    query_response.scanned_files
+                ),
             )?;
             Ok(())
         }
         Commands::Files {
             filter,
+            pattern,
+            include,
+            exclude,
+            extensions,
+            include_hidden,
+            max_depth,
+            sort_by,
+            sort_order,
+            offset,
             path,
             limit,
             output,
         } => {
             let (repo_root, searcher) = create_searcher(path.as_ref())?;
             let mut files = searcher.list_files()?;
-            files.sort();
+
+            let mut includes = include;
+            if !pattern.trim().is_empty() {
+                includes.insert(0, pattern);
+            }
+            let include_patterns = compile_cli_globs(&includes)?;
+            let exclude_patterns = compile_cli_globs(&exclude)?;
+            let normalized_exts: Vec<String> = extensions
+                .into_iter()
+                .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect();
+
+            files.retain(|path| {
+                let relative = path
+                    .strip_prefix(&repo_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+
+                if !include_hidden && relative.split('/').any(|part| part.starts_with('.')) {
+                    return false;
+                }
+
+                if let Some(depth) = max_depth {
+                    let actual_depth = relative.matches('/').count();
+                    if actual_depth > depth {
+                        return false;
+                    }
+                }
+
+                if !normalized_exts.is_empty() {
+                    let ext = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase());
+                    if !ext
+                        .as_ref()
+                        .map(|e| normalized_exts.contains(e))
+                        .unwrap_or(false)
+                    {
+                        return false;
+                    }
+                }
+
+                if !include_patterns.is_empty()
+                    && !include_patterns.iter().any(|p| p.matches(&relative))
+                {
+                    return false;
+                }
+
+                if exclude_patterns.iter().any(|p| p.matches(&relative)) {
+                    return false;
+                }
+
+                true
+            });
+
+            files.sort_by(|a, b| {
+                let ord = match sort_by {
+                    FileSortBy::Path => a.cmp(b),
+                    FileSortBy::Name => a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)),
+                };
+                match sort_order {
+                    FileSortOrder::Asc => ord,
+                    FileSortOrder::Desc => ord.reverse(),
+                }
+            });
 
             if let Some(needle) = filter.as_ref() {
                 let needle = needle.to_lowercase();
                 files.retain(|p| p.to_string_lossy().to_lowercase().contains(&needle));
             }
 
-            files.truncate(limit.max(1));
-            let rendered: Vec<CliResult> = files
+            let window_limit = limit.max(1);
+            let window: Vec<PathBuf> = files.into_iter().skip(offset).take(window_limit).collect();
+            let rendered: Vec<CliResult> = window
                 .into_iter()
                 .map(|p| CliResult {
                     file_path: p.to_string_lossy().to_string(),
@@ -574,6 +745,25 @@ pub async fn run() -> FlashgrepResult<()> {
             Ok(())
         }
     }
+}
+
+fn compile_cli_globs(patterns: &[String]) -> FlashgrepResult<Vec<glob::Pattern>> {
+    patterns
+        .iter()
+        .filter_map(|p| {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .map(|p| {
+            glob::Pattern::new(p).map_err(|e| {
+                crate::FlashgrepError::Config(format!("Invalid glob pattern '{}': {}", p, e))
+            })
+        })
+        .collect()
 }
 
 fn print_active_watchers(registry: &WatcherRegistry) {

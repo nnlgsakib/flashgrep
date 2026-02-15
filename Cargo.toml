@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Flashgrep Contributors"]
 description = "High-performance local code indexing engine"
-license = "MIT"
-repository = "https://github.com/yourusername/flashgrep"
+license = "Apache-2.0"
+repository = "https://github.com/nnlgsakib/flashgrep"
 
 [dependencies]
 # MCP (Model Context Protocol)

@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod code_io;
 pub mod glob_tool;
+pub mod safety;
 pub mod skill;
 pub mod stdio;
 pub mod tools;
@@ -11,12 +12,16 @@ use crate::db::Database;
 use crate::mcp::bootstrap::{build_bootstrap_payload, is_bootstrap_tool};
 use crate::mcp::code_io::{read_code, write_code};
 use crate::mcp::glob_tool::run_glob;
-use crate::search::Searcher;
+use crate::mcp::safety::{
+    check_arguments_size, chunking_guidance, invalid_params_error, payload_too_large_error,
+    MAX_MCP_GET_SLICE_BYTES, MAX_MCP_REQUEST_BYTES, MAX_MCP_RESPONSE_BYTES,
+};
+use crate::search::{QueryOptions, Searcher};
 use crate::FlashgrepResult;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 
@@ -86,15 +91,38 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
             continue;
         }
 
+        if trimmed_line.as_bytes().len() > MAX_MCP_REQUEST_BYTES {
+            let payload = payload_too_large_error(
+                "request",
+                trimmed_line.as_bytes().len(),
+                MAX_MCP_REQUEST_BYTES,
+                &chunking_guidance(MAX_MCP_REQUEST_BYTES),
+            );
+            let response = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: Some(payload),
+                error: None,
+            };
+            write_response_line(&mut writer, response).await?;
+            line.clear();
+            continue;
+        }
+
         debug!("Received: {}", trimmed_line);
 
-        match serde_json::from_str::<JsonRpcRequest>(&line) {
+        match serde_json::from_str::<JsonRpcRequest>(trimmed_line) {
             Ok(request) => {
-                let response = handle_request(request, &paths, tantivy_index.as_ref()).await?;
-                let response_json = serde_json::to_string(&response)?;
-                writer.write_all(response_json.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+                let response = match handle_request(request, &paths, tantivy_index.as_ref()).await {
+                    Ok(r) => r,
+                    Err(e) => JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: None,
+                        result: Some(invalid_params_error(&format!("request_failed: {}", e))),
+                        error: None,
+                    },
+                };
+                write_response_line(&mut writer, response).await?;
             }
             Err(e) => {
                 // Log parse errors but don't send back responses for invalid protocol
@@ -112,6 +140,31 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
     Ok(())
 }
 
+async fn write_response_line<W>(writer: &mut W, response: JsonRpcResponse) -> FlashgrepResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut response_json = serde_json::to_string(&response)?;
+    if response_json.as_bytes().len() > MAX_MCP_RESPONSE_BYTES {
+        let fallback = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: response.id,
+            result: Some(payload_too_large_error(
+                "response",
+                response_json.as_bytes().len(),
+                MAX_MCP_RESPONSE_BYTES,
+                &chunking_guidance(MAX_MCP_RESPONSE_BYTES),
+            )),
+            error: None,
+        };
+        response_json = serde_json::to_string(&fallback)?;
+    }
+    writer.write_all(response_json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 async fn handle_request(
     request: JsonRpcRequest,
     paths: &FlashgrepPaths,
@@ -120,31 +173,37 @@ async fn handle_request(
     let result = match request.method.as_str() {
         // Existing methods
         "query" => {
-            let text = request
-                .params
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let limit = request
-                .params
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let options = match QueryOptions::from_mcp_args(&request.params) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    return Ok(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: request.id,
+                        result: Some(serde_json::json!({
+                            "results": [],
+                            "error": "invalid_params",
+                            "message": e.to_string(),
+                        })),
+                        error: None,
+                    })
+                }
+            };
 
-            if text.is_empty() {
+            if options.text.is_empty() {
                 Some(serde_json::json!({
                     "results": [],
-                    "query": text,
-                    "limit": limit,
+                    "query": options.text,
+                    "limit": options.limit,
                     "error": "Empty query"
                 }))
             } else {
                 // Perform actual search using Tantivy
                 let search_results = if let Some(index) = tantivy_index {
                     let searcher = Searcher::new(index, &paths.metadata_db())?;
-                    match searcher.query(text, limit) {
-                        Ok(results) => {
-                            let json_results: Vec<_> = results
+                    match searcher.query_with_options(&options) {
+                        Ok(response) => {
+                            let json_results: Vec<_> = response
+                                .results
                                 .iter()
                                 .map(|r| {
                                     serde_json::json!({
@@ -159,17 +218,22 @@ async fn handle_request(
                                 .collect();
                             serde_json::json!({
                                 "results": json_results,
-                                "query": text,
-                                "limit": limit,
-                                "total": results.len(),
+                                "query": options.text,
+                                "limit": options.limit,
+                                "total": response.results.len(),
+                                "truncated": response.truncated,
+                                "scanned_files": response.scanned_files,
+                                "next_offset": response.next_offset,
+                                "mode": format!("{:?}", options.mode).to_lowercase(),
+                                "case_sensitive": options.case_sensitive,
                             })
                         }
                         Err(e) => {
                             error!("Search error: {}", e);
                             serde_json::json!({
                                 "results": [],
-                                "query": text,
-                                "limit": limit,
+                                "query": options.text,
+                                "limit": options.limit,
                                 "error": format!("Search failed: {}", e),
                             })
                         }
@@ -177,8 +241,8 @@ async fn handle_request(
                 } else {
                     serde_json::json!({
                         "results": [],
-                        "query": text,
-                        "limit": limit,
+                        "query": options.text,
+                        "limit": options.limit,
                         "error": "Search index not available",
                     })
                 };
@@ -186,6 +250,15 @@ async fn handle_request(
             }
         }
         "get_slice" => {
+            if let Err(e) = check_arguments_size(&request.params, MAX_MCP_REQUEST_BYTES) {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(invalid_params_error(&e.to_string())),
+                    error: None,
+                });
+            }
+
             let file_path = request
                 .params
                 .get("file_path")
@@ -195,58 +268,73 @@ async fn handle_request(
                 .params
                 .get("start_line")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
+                .unwrap_or(1);
             let end_line = request
                 .params
                 .get("end_line")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(1) as usize;
+                .unwrap_or(1);
 
             if file_path.is_empty() {
-                Some(serde_json::json!({
-                    "error": "Missing file_path parameter",
-                }))
+                Some(serde_json::json!({"error": "Missing file_path parameter"}))
             } else {
-                let content = match std::fs::read_to_string(file_path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Ok(JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: Some(serde_json::json!({
-                                "error": format!("File not found: {}", e),
-                                "file_path": file_path,
-                            })),
-                            error: None,
-                        });
-                    }
-                };
-                let lines: Vec<&str> = content.lines().collect();
-                let start = start_line.saturating_sub(1);
-                let end = end_line.min(lines.len());
+                let mut args = serde_json::json!({
+                    "file_path": file_path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "max_bytes": MAX_MCP_GET_SLICE_BYTES,
+                    "metadata_level": "standard"
+                });
+                if let Some(c) = request.params.get("continuation_start_line") {
+                    args["continuation_start_line"] = c.clone();
+                }
+                if let Some(c) = request.params.get("chunk_index") {
+                    args["chunk_index"] = c.clone();
+                }
 
-                if start < lines.len() {
-                    let slice = lines[start..end].join("\n");
-                    Some(serde_json::json!({
-                        "file_path": file_path,
-                        "start_line": start_line,
-                        "end_line": end_line,
-                        "content": slice,
-                        "total_lines": lines.len(),
-                    }))
-                } else {
-                    Some(serde_json::json!({
-                        "error": "Invalid line range",
-                        "file_path": file_path,
-                        "requested_start": start_line,
-                        "total_lines": lines.len(),
-                    }))
+                match read_code(paths, &args) {
+                    Ok(payload) => Some(serde_json::json!({
+                        "file_path": payload["file_path"],
+                        "start_line": payload["start_line"],
+                        "end_line": payload["end_line"],
+                        "content": payload["content"],
+                        "truncated": payload["truncated"],
+                        "continuation_start_line": payload["continuation_start_line"],
+                        "continuation": payload["continuation"],
+                        "applied_limits": payload["applied_limits"],
+                    })),
+                    Err(e) => Some(invalid_params_error(&e.to_string())),
                 }
             }
         }
-        "read_code" => Some(read_code(paths, &request.params)?),
-        "write_code" => Some(write_code(&request.params)?),
-        "glob" => Some(run_glob(&request.params)?),
+        "read_code" => {
+            if let Err(e) = check_arguments_size(&request.params, MAX_MCP_REQUEST_BYTES) {
+                Some(invalid_params_error(&e.to_string()))
+            } else {
+                match read_code(paths, &request.params) {
+                    Ok(payload) => Some(payload),
+                    Err(e) => Some(invalid_params_error(&e.to_string())),
+                }
+            }
+        }
+        "write_code" => {
+            if let Err(e) = check_arguments_size(&request.params, MAX_MCP_REQUEST_BYTES) {
+                Some(invalid_params_error(&e.to_string()))
+            } else {
+                match write_code(&request.params) {
+                    Ok(payload) => Some(payload),
+                    Err(e) => Some(invalid_params_error(&e.to_string())),
+                }
+            }
+        }
+        "glob" => match run_glob(&request.params) {
+            Ok(payload) => Some(payload),
+            Err(e) => Some(serde_json::json!({
+                "results": [],
+                "error": "invalid_params",
+                "message": e.to_string(),
+            })),
+        },
         method if is_bootstrap_tool(method) => Some(handle_skill_bootstrap_payload(
             paths,
             request.method.as_str(),
@@ -666,6 +754,7 @@ struct JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::safety::MAX_MCP_WRITE_REPLACEMENT_BYTES;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -690,5 +779,51 @@ mod tests {
         let response = handle_request(req, &paths, None).await.expect("response");
         let result = response.result.expect("result payload");
         assert!(result["total"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_write_error_does_not_break_followup_request() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main file");
+
+        let paths = FlashgrepPaths::new(&root);
+        let oversize = "x".repeat(MAX_MCP_WRITE_REPLACEMENT_BYTES + 1);
+
+        let write_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "write_code".to_string(),
+            params: serde_json::json!({
+                "file_path": root.join("src/main.rs").to_string_lossy(),
+                "start_line": 1,
+                "end_line": 1,
+                "replacement": oversize,
+            }),
+            id: Some(1),
+        };
+        let write_resp = handle_request(write_req, &paths, None)
+            .await
+            .expect("write response");
+        let write_payload = write_resp.result.expect("write result");
+        assert_eq!(
+            write_payload["error"],
+            serde_json::Value::String("payload_too_large".to_string())
+        );
+
+        let follow_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "get_slice".to_string(),
+            params: serde_json::json!({
+                "file_path": root.join("src/main.rs").to_string_lossy(),
+                "start_line": 1,
+                "end_line": 1
+            }),
+            id: Some(2),
+        };
+        let follow_resp = handle_request(follow_req, &paths, None)
+            .await
+            .expect("follow response");
+        assert!(follow_resp.result.is_some());
     }
 }

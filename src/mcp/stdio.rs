@@ -8,8 +8,12 @@ use crate::db::Database;
 use crate::mcp::bootstrap::{build_bootstrap_payload, is_bootstrap_tool};
 use crate::mcp::code_io::{read_code, read_code_input_schema, write_code, write_code_input_schema};
 use crate::mcp::glob_tool::{glob_input_schema, run_glob};
+use crate::mcp::safety::{
+    check_arguments_size, chunking_guidance, payload_too_large_error, MAX_MCP_GET_SLICE_BYTES,
+    MAX_MCP_REQUEST_BYTES, MAX_MCP_RESPONSE_BYTES,
+};
 use crate::mcp::tools::{create_bootstrap_tools, create_tools};
-use crate::search::Searcher;
+use crate::search::{QueryOptions, Searcher};
 use crate::FlashgrepResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -67,14 +71,39 @@ impl McpStdioServer {
                 continue;
             }
 
+            if trimmed_line.as_bytes().len() > MAX_MCP_REQUEST_BYTES {
+                let error_response = JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    result: Some(payload_too_large_error(
+                        "request",
+                        trimmed_line.as_bytes().len(),
+                        MAX_MCP_REQUEST_BYTES,
+                        &chunking_guidance(MAX_MCP_REQUEST_BYTES),
+                    )),
+                    error: None,
+                };
+                write_response_line(&mut stdout_lock, &error_response)?;
+                continue;
+            }
+
             debug!("Received: {}", trimmed_line);
 
             match serde_json::from_str::<JsonRpcRequest>(&line) {
                 Ok(request) => {
-                    let response = self.handle_request(request, tantivy_index.as_ref())?;
-                    let response_json = serde_json::to_string(&response)?;
-                    writeln!(stdout_lock, "{}", response_json)?;
-                    stdout_lock.flush()?;
+                    let response = match self.handle_request(request, tantivy_index.as_ref()) {
+                        Ok(r) => r,
+                        Err(e) => JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: None,
+                            result: Some(json!({
+                                "error": "invalid_params",
+                                "message": format!("request_failed: {}", e),
+                            })),
+                            error: None,
+                        },
+                    };
+                    write_response_line(&mut stdout_lock, &response)?;
                 }
                 Err(e) => {
                     error!("Failed to parse JSON-RPC request: {}", e);
@@ -88,9 +117,7 @@ impl McpStdioServer {
                             data: None,
                         }),
                     };
-                    let response_json = serde_json::to_string(&error_response)?;
-                    writeln!(stdout_lock, "{}", response_json)?;
-                    stdout_lock.flush()?;
+                    write_response_line(&mut stdout_lock, &error_response)?;
                 }
             }
         }
@@ -136,7 +163,14 @@ impl McpStdioServer {
                             "type": "object",
                             "properties": {
                                 "text": {"type": "string", "description": "Search text"},
-                                "limit": {"type": "integer", "description": "Maximum results", "default": 10}
+                                "limit": {"type": "integer", "description": "Maximum results", "default": 10},
+                                "mode": {"type": "string", "enum": ["smart", "literal", "regex"], "default": "smart"},
+                                "case_sensitive": {"type": "boolean", "default": true},
+                                "regex_flags": {"type": "string", "description": "Regex flags (e.g. i for case-insensitive)"},
+                                "include": {"type": "array", "items": {"type": "string"}},
+                                "exclude": {"type": "array", "items": {"type": "string"}},
+                                "context": {"type": "integer", "minimum": 0, "default": 0},
+                                "offset": {"type": "integer", "minimum": 0, "default": 0}
                             },
                             "required": ["text"]
                         }
@@ -149,7 +183,9 @@ impl McpStdioServer {
                             "properties": {
                                 "file_path": {"type": "string"},
                                 "start_line": {"type": "integer"},
-                                "end_line": {"type": "integer"}
+                                "end_line": {"type": "integer"},
+                                "continuation_start_line": {"type": "integer"},
+                                "chunk_index": {"type": "integer", "minimum": 0}
                             },
                             "required": ["file_path", "start_line", "end_line"]
                         }
@@ -273,13 +309,17 @@ impl McpStdioServer {
         arguments: &Value,
         tantivy_index: Option<&tantivy::Index>,
     ) -> FlashgrepResult<Option<Value>> {
-        let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        let limit = arguments
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10) as usize;
+        let options = match QueryOptions::from_mcp_args(arguments) {
+            Ok(opts) => opts,
+            Err(e) => {
+                return Ok(Some(serde_json::json!({
+                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                    "isError": true
+                })))
+            }
+        };
 
-        if text.is_empty() {
+        if options.text.is_empty() {
             return Ok(Some(serde_json::json!({
                 "content": [{"type": "text", "text": "Error: Empty query"}],
                 "isError": true
@@ -288,9 +328,10 @@ impl McpStdioServer {
 
         if let Some(index) = tantivy_index {
             let searcher = Searcher::new(index, &self.paths.metadata_db())?;
-            match searcher.query(text, limit) {
-                Ok(results) => {
-                    let text_results: Vec<String> = results
+            match searcher.query_with_options(&options) {
+                Ok(response) => {
+                    let text_results: Vec<String> = response
+                        .results
                         .iter()
                         .map(|r| {
                             format!(
@@ -304,8 +345,18 @@ impl McpStdioServer {
                         })
                         .collect();
 
+                    let payload = json!({
+                        "results": text_results,
+                        "total": response.results.len(),
+                        "truncated": response.truncated,
+                        "scanned_files": response.scanned_files,
+                        "next_offset": response.next_offset,
+                        "mode": format!("{:?}", options.mode).to_lowercase(),
+                        "case_sensitive": options.case_sensitive,
+                    });
+
                     Ok(Some(serde_json::json!({
-                        "content": [{"type": "text", "text": text_results.join("\n---\n")}]
+                        "content": [{"type": "text", "text": serde_json::to_string(&payload)?}]
                     })))
                 }
                 Err(e) => Ok(Some(serde_json::json!({
@@ -322,6 +373,13 @@ impl McpStdioServer {
     }
 
     fn handle_get_slice_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        if let Err(e) = check_arguments_size(arguments, MAX_MCP_REQUEST_BYTES) {
+            return Ok(Some(json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                "isError": true
+            })));
+        }
+
         let file_path = arguments
             .get("file_path")
             .and_then(|v| v.as_str())
@@ -329,11 +387,11 @@ impl McpStdioServer {
         let start_line = arguments
             .get("start_line")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
+            .unwrap_or(1);
         let end_line = arguments
             .get("end_line")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as usize;
+            .unwrap_or(1);
 
         if file_path.is_empty() {
             return Ok(Some(serde_json::json!({
@@ -342,26 +400,35 @@ impl McpStdioServer {
             })));
         }
 
-        match std::fs::read_to_string(file_path) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let start = start_line.saturating_sub(1);
-                let end = end_line.min(lines.len());
+        let mut args = json!({
+            "file_path": file_path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "max_bytes": MAX_MCP_GET_SLICE_BYTES,
+            "metadata_level": "standard"
+        });
+        if let Some(c) = arguments.get("continuation_start_line") {
+            args["continuation_start_line"] = c.clone();
+        }
+        if let Some(c) = arguments.get("chunk_index") {
+            args["chunk_index"] = c.clone();
+        }
 
-                if start < lines.len() {
-                    let slice = lines[start..end].join("\n");
-                    Ok(Some(serde_json::json!({
-                        "content": [{"type": "text", "text": slice}]
-                    })))
-                } else {
-                    Ok(Some(serde_json::json!({
-                        "content": [{"type": "text", "text": "Error: Invalid line range"}],
-                        "isError": true
-                    })))
-                }
-            }
+        match read_code(&self.paths, &args) {
+            Ok(payload) => Ok(Some(serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&json!({
+                    "file_path": payload["file_path"],
+                    "start_line": payload["start_line"],
+                    "end_line": payload["end_line"],
+                    "content": payload["content"],
+                    "truncated": payload["truncated"],
+                    "continuation_start_line": payload["continuation_start_line"],
+                    "continuation": payload["continuation"],
+                    "applied_limits": payload["applied_limits"]
+                }))?}]
+            }))),
             Err(e) => Ok(Some(serde_json::json!({
-                "content": [{"type": "text", "text": format!("Error reading file: {}", e)}],
+                "content": [{"type": "text", "text": format!("Error: {}", e)}],
                 "isError": true
             }))),
         }
@@ -409,21 +476,59 @@ impl McpStdioServer {
     }
 
     fn handle_glob_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
-        let payload = run_glob(arguments)?;
+        let payload = match run_glob(arguments) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return Ok(Some(json!({
+                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                    "isError": true
+                })))
+            }
+        };
         Ok(Some(json!({
             "content": [{"type": "text", "text": serde_json::to_string(&payload)?}]
         })))
     }
 
     fn handle_read_code_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
-        let payload = read_code(&self.paths, arguments)?;
+        if let Err(e) = check_arguments_size(arguments, MAX_MCP_REQUEST_BYTES) {
+            return Ok(Some(json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                "isError": true
+            })));
+        }
+
+        let payload = match read_code(&self.paths, arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Some(json!({
+                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                    "isError": true
+                })));
+            }
+        };
         Ok(Some(serde_json::json!({
             "content": [{"type": "text", "text": serde_json::to_string(&payload)?}]
         })))
     }
 
     fn handle_write_code_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
-        let payload = write_code(arguments)?;
+        if let Err(e) = check_arguments_size(arguments, MAX_MCP_REQUEST_BYTES) {
+            return Ok(Some(json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                "isError": true
+            })));
+        }
+
+        let payload = match write_code(arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Some(json!({
+                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                    "isError": true
+                })));
+            }
+        };
         let is_error = payload
             .get("ok")
             .and_then(|v| v.as_bool())
@@ -754,6 +859,31 @@ impl McpStdioServer {
     }
 }
 
+fn write_response_line<W: Write>(
+    writer: &mut W,
+    response: &JsonRpcResponse,
+) -> FlashgrepResult<()> {
+    let mut response_json = serde_json::to_string(response)?;
+    if response_json.as_bytes().len() > MAX_MCP_RESPONSE_BYTES {
+        let fallback = JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: response.id,
+            result: Some(payload_too_large_error(
+                "response",
+                response_json.as_bytes().len(),
+                MAX_MCP_RESPONSE_BYTES,
+                &chunking_guidance(MAX_MCP_RESPONSE_BYTES),
+            )),
+            error: None,
+        };
+        response_json = serde_json::to_string(&fallback)?;
+    }
+
+    writeln!(writer, "{}", response_json)?;
+    writer.flush()?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -785,6 +915,7 @@ struct JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::safety::MAX_MCP_WRITE_REPLACEMENT_BYTES;
     use serde_json::json;
     use std::fs;
     use tempfile::TempDir;
@@ -926,5 +1057,45 @@ mod tests {
             .expect("content text");
         let payload: Value = serde_json::from_str(payload_text).expect("payload json");
         assert!(payload["total"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn oversized_write_error_does_not_break_followup_tool_calls() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/lib.rs"), "pub fn x() {}\n").expect("write file");
+
+        let server = McpStdioServer::new(root.clone()).expect("server");
+        let oversize = "x".repeat(MAX_MCP_WRITE_REPLACEMENT_BYTES + 1);
+        let write = server
+            .handle_write_code_tool(&json!({
+                "file_path": root.join("src/lib.rs").to_string_lossy(),
+                "start_line": 1,
+                "end_line": 1,
+                "replacement": oversize
+            }))
+            .expect("write response")
+            .expect("write envelope");
+        let write_payload: Value = serde_json::from_str(
+            write["content"][0]["text"]
+                .as_str()
+                .expect("write payload text"),
+        )
+        .expect("write payload");
+        assert_eq!(
+            write_payload["error"],
+            Value::String("payload_too_large".to_string())
+        );
+
+        let follow = server
+            .handle_get_slice_tool(&json!({
+                "file_path": root.join("src/lib.rs").to_string_lossy(),
+                "start_line": 1,
+                "end_line": 1
+            }))
+            .expect("follow response")
+            .expect("follow envelope");
+        assert!(follow["content"][0]["text"].as_str().is_some());
     }
 }

@@ -21,32 +21,32 @@ impl SymbolDetector {
             function_pattern: Regex::new(
                 r"(?i)(?:^|\s)(?:fn|def|func|function)\s+([a-zA-Z_][a-zA-Z0-9_]*)"
             ).unwrap(),
-            
+
             // Class/struct definitions: class Name, struct Name, interface Name, type Name
             class_pattern: Regex::new(
                 r"(?i)(?:^|\s)(?:class|struct|interface|type)\s+([a-zA-Z_][a-zA-Z0-9_]*)"
             ).unwrap(),
-            
+
             // Import statements: import, require, include, use, from ... import
             import_pattern: Regex::new(
                 r"(?i)(?:^|\s)(?:import|require|include|use|from\s+.*import)"
             ).unwrap(),
-            
+
             // Export statements: export, module.exports, pub fn, public
             export_pattern: Regex::new(
                 r"(?i)(?:^|\s)(?:export|module\.exports|pub\s+(?:fn|struct|enum|const|let|type)|public)"
             ).unwrap(),
-            
+
             // Route definitions: .get(, .post(, @Get, router.
             route_pattern: Regex::new(
                 r"(?i)(?:^|\s)(?:\.get\s*\(|\.post\s*\(|\.put\s*\(|\.delete\s*\(|@(?:Get|Post|Put|Delete)|router\.)"
             ).unwrap(),
-            
+
             // SQL queries: SELECT, INSERT, UPDATE, DELETE
             sql_pattern: Regex::new(
                 r"(?i)(?:^|\s)(?:SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\s+"
             ).unwrap(),
-            
+
             // Visibility markers: public, private, protected, pub, internal
             visibility_pattern: Regex::new(
                 r"(?i)(?:^|\s)(?:public|private|protected|internal|pub)"

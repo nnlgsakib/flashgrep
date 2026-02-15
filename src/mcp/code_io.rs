@@ -1,9 +1,14 @@
 use crate::config::paths::FlashgrepPaths;
 use crate::db::Database;
+use crate::mcp::safety::{
+    chunking_guidance, continuation_meta, payload_too_large_error, MAX_MCP_READ_BYTES,
+    MAX_MCP_WRITE_REPLACEMENT_BYTES,
+};
 use crate::{FlashgrepError, FlashgrepResult};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_SYMBOL_CONTEXT_LINES: usize = 20;
 
@@ -20,6 +25,7 @@ pub fn read_code_input_schema() -> Value {
             "max_tokens": {"type": "integer", "minimum": 1, "description": "Approximate token budget"},
             "max_bytes": {"type": "integer", "minimum": 1, "description": "Byte budget"},
             "max_lines": {"type": "integer", "minimum": 1, "description": "Line budget"},
+            "chunk_index": {"type": "integer", "minimum": 0, "description": "Continuation chunk index"},
             "metadata_level": {
                 "type": "string",
                 "enum": ["minimal", "standard"],
@@ -38,6 +44,9 @@ pub fn write_code_input_schema() -> Value {
             "start_line": {"type": "integer", "minimum": 1, "description": "1-indexed start line (inclusive)"},
             "end_line": {"type": "integer", "minimum": 1, "description": "1-indexed end line (inclusive)"},
             "replacement": {"type": "string", "description": "Replacement text for the line range"},
+            "continuation_id": {"type": "string", "description": "Write continuation session identifier"},
+            "chunk_index": {"type": "integer", "minimum": 0, "description": "Chunk index for continuation writes"},
+            "is_final_chunk": {"type": "boolean", "description": "Whether this chunk finalizes the write"},
             "precondition": {
                 "type": "object",
                 "properties": {
@@ -85,12 +94,22 @@ pub fn read_code(paths: &FlashgrepPaths, arguments: &Value) -> FlashgrepResult<V
         }
     };
 
-    let bounded = apply_budgets(&read_target.lines, &limits).ok_or_else(|| {
-        FlashgrepError::Config(
-            "Provided budgets are too strict to return any complete line; increase limits"
-                .to_string(),
-        )
-    })?;
+    let bounded = match apply_budgets(&read_target.lines, &limits) {
+        Some(value) => value,
+        None => {
+            let observed_bytes = read_target
+                .lines
+                .first()
+                .map(|(_, l)| l.as_bytes().len())
+                .unwrap_or(0);
+            return Ok(payload_too_large_error(
+                "read_code",
+                observed_bytes,
+                limits.max_bytes.unwrap_or(MAX_MCP_READ_BYTES),
+                &chunking_guidance(limits.max_bytes.unwrap_or(MAX_MCP_READ_BYTES)),
+            ));
+        }
+    };
 
     let content = bounded
         .included_lines
@@ -110,11 +129,25 @@ pub fn read_code(paths: &FlashgrepPaths, arguments: &Value) -> FlashgrepResult<V
             "max_lines": limits.max_lines,
             "max_bytes": limits.max_bytes,
             "max_tokens": limits.max_tokens,
+            "server_max_bytes": MAX_MCP_READ_BYTES,
             "consumed_lines": bounded.consumed_lines,
             "consumed_bytes": bounded.consumed_bytes,
             "consumed_tokens": bounded.consumed_tokens
         }
     });
+
+    let chunk_index = arguments
+        .get("chunk_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    response["continuation"] = continuation_meta(
+        json!({
+            "continuation_start_line": bounded.next_start_line,
+            "file_path": read_target.file_path,
+        }),
+        chunk_index,
+        !bounded.truncated,
+    );
 
     if metadata_level == MetadataLevel::Standard {
         response["mode"] = Value::String(read_target.mode_name.to_string());
@@ -142,6 +175,23 @@ pub fn write_code(arguments: &Value) -> FlashgrepResult<Value> {
         .ok_or_else(|| {
             FlashgrepError::Config("Missing required parameter: replacement".to_string())
         })?;
+
+    if let Some(id) = arguments.get("continuation_id").and_then(Value::as_str) {
+        return write_code_chunked(arguments, id, file_path, start_line, end_line, replacement);
+    }
+
+    let replacement_size = replacement.as_bytes().len();
+    if replacement_size > MAX_MCP_WRITE_REPLACEMENT_BYTES {
+        let mut payload = payload_too_large_error(
+            "write_code",
+            replacement_size,
+            MAX_MCP_WRITE_REPLACEMENT_BYTES,
+            &chunking_guidance(MAX_MCP_WRITE_REPLACEMENT_BYTES),
+        );
+        payload["ok"] = Value::Bool(false);
+        payload["file_path"] = Value::String(file_path.to_string());
+        return Ok(payload);
+    }
 
     if start_line == 0 || end_line == 0 || start_line > end_line {
         return Err(FlashgrepError::Config(
@@ -215,6 +265,214 @@ pub fn write_code(arguments: &Value) -> FlashgrepResult<Value> {
         "file_hash_before": original_hash,
         "file_hash_after": new_hash
     }))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WriteSession {
+    continuation_id: String,
+    file_path: String,
+    start_line: usize,
+    end_line: usize,
+    file_hash_before: String,
+    had_trailing_newline: bool,
+    replacement_accumulated: String,
+    next_chunk_index: usize,
+}
+
+fn write_code_chunked(
+    arguments: &Value,
+    continuation_id: &str,
+    file_path: &str,
+    start_line: usize,
+    end_line: usize,
+    replacement_chunk: &str,
+) -> FlashgrepResult<Value> {
+    let chunk_index = arguments
+        .get("chunk_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let is_final_chunk = arguments
+        .get("is_final_chunk")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let replacement_size = replacement_chunk.as_bytes().len();
+    if replacement_size > MAX_MCP_WRITE_REPLACEMENT_BYTES {
+        let mut payload = payload_too_large_error(
+            "write_code",
+            replacement_size,
+            MAX_MCP_WRITE_REPLACEMENT_BYTES,
+            &chunking_guidance(MAX_MCP_WRITE_REPLACEMENT_BYTES),
+        );
+        payload["ok"] = Value::Bool(false);
+        payload["file_path"] = Value::String(file_path.to_string());
+        return Ok(payload);
+    }
+
+    let session_path = write_session_path(continuation_id);
+    let mut session = if chunk_index == 0 {
+        let path = PathBuf::from(file_path);
+        let original_content = std::fs::read_to_string(&path)?;
+        let original_hash = calculate_sha256(&original_content);
+        let had_trailing_newline = original_content.ends_with('\n');
+        let original_lines: Vec<String> =
+            original_content.lines().map(ToString::to_string).collect();
+        if original_lines.is_empty() {
+            return Err(FlashgrepError::Config(
+                "Cannot apply line-range write to empty file".to_string(),
+            ));
+        }
+        if end_line > original_lines.len() {
+            return Err(FlashgrepError::Config(format!(
+                "Invalid range: end_line {} exceeds file line count {}",
+                end_line,
+                original_lines.len()
+            )));
+        }
+
+        let conflict = check_preconditions(
+            arguments.get("precondition"),
+            &original_lines,
+            &original_hash,
+            start_line,
+            end_line,
+        );
+        if let Some(conflict_payload) = conflict {
+            return Ok(json!({
+                "ok": false,
+                "error": "precondition_failed",
+                "file_path": file_path,
+                "conflict": conflict_payload
+            }));
+        }
+
+        WriteSession {
+            continuation_id: continuation_id.to_string(),
+            file_path: file_path.to_string(),
+            start_line,
+            end_line,
+            file_hash_before: original_hash,
+            had_trailing_newline,
+            replacement_accumulated: String::new(),
+            next_chunk_index: 0,
+        }
+    } else {
+        let loaded = load_write_session(&session_path)?;
+        if loaded.file_path != file_path
+            || loaded.start_line != start_line
+            || loaded.end_line != end_line
+            || loaded.next_chunk_index != chunk_index
+        {
+            return Ok(json!({
+                "ok": false,
+                "error": "invalid_continuation_state",
+                "expected": {
+                    "file_path": loaded.file_path,
+                    "start_line": loaded.start_line,
+                    "end_line": loaded.end_line,
+                    "next_chunk_index": loaded.next_chunk_index
+                },
+                "received": {
+                    "file_path": file_path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "chunk_index": chunk_index
+                }
+            }));
+        }
+        loaded
+    };
+
+    session.replacement_accumulated.push_str(replacement_chunk);
+    session.next_chunk_index = chunk_index.saturating_add(1);
+
+    if !is_final_chunk {
+        save_write_session(&session_path, &session)?;
+        return Ok(json!({
+            "ok": true,
+            "continuation": continuation_meta(
+                json!({"continuation_id": continuation_id, "next_chunk_index": session.next_chunk_index}),
+                chunk_index,
+                false
+            ),
+            "received_bytes": replacement_size,
+            "file_path": file_path
+        }));
+    }
+
+    let path = PathBuf::from(file_path);
+    let original_content = std::fs::read_to_string(&path)?;
+    let original_lines: Vec<String> = original_content.lines().map(ToString::to_string).collect();
+
+    let replacement_lines: Vec<String> = if session.replacement_accumulated.is_empty() {
+        Vec::new()
+    } else {
+        session
+            .replacement_accumulated
+            .split('\n')
+            .map(ToString::to_string)
+            .collect()
+    };
+
+    let mut new_lines = Vec::new();
+    new_lines.extend_from_slice(&original_lines[..start_line - 1]);
+    new_lines.extend(replacement_lines.iter().cloned());
+    new_lines.extend_from_slice(&original_lines[end_line..]);
+
+    let mut new_content = new_lines.join("\n");
+    if session.had_trailing_newline {
+        new_content.push('\n');
+    }
+
+    std::fs::write(&path, &new_content)?;
+    let new_hash = calculate_sha256(&new_content);
+
+    let _ = std::fs::remove_file(&session_path);
+
+    Ok(json!({
+        "ok": true,
+        "file_path": file_path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "replaced_line_count": end_line - start_line + 1,
+        "new_line_count": replacement_lines.len(),
+        "file_hash_before": session.file_hash_before,
+        "file_hash_after": new_hash,
+        "continuation": continuation_meta(
+            json!({"continuation_id": continuation_id, "next_chunk_index": session.next_chunk_index}),
+            chunk_index,
+            true
+        )
+    }))
+}
+
+fn write_session_path(continuation_id: &str) -> PathBuf {
+    let safe_id: String = continuation_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    std::env::temp_dir()
+        .join("flashgrep-write-sessions")
+        .join(format!("{}.json", safe_id))
+}
+
+fn save_write_session(path: &Path, session: &WriteSession) -> FlashgrepResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_vec(session)?;
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+fn load_write_session(path: &Path) -> FlashgrepResult<WriteSession> {
+    let data = std::fs::read(path).map_err(|_| {
+        FlashgrepError::Config(
+            "Missing write continuation session; restart with chunk_index=0".to_string(),
+        )
+    })?;
+    let session: WriteSession = serde_json::from_slice(&data)?;
+    Ok(session)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -297,9 +555,18 @@ fn parse_limits(arguments: &Value) -> FlashgrepResult<Limits> {
         ));
     }
 
+    if let Some(requested) = max_bytes {
+        if requested > MAX_MCP_READ_BYTES {
+            return Err(FlashgrepError::Config(format!(
+                "max_bytes {} exceeds server safety limit {}",
+                requested, MAX_MCP_READ_BYTES
+            )));
+        }
+    }
+
     Ok(Limits {
         max_lines,
-        max_bytes,
+        max_bytes: Some(max_bytes.unwrap_or(MAX_MCP_READ_BYTES)),
         max_tokens,
     })
 }
@@ -678,5 +945,111 @@ mod tests {
             .expect("encode budgeted")
             .len();
         assert!(budgeted_bytes < full_bytes);
+    }
+
+    #[test]
+    fn write_code_rejects_oversized_replacement() {
+        let (_temp, file_path) = setup_file("line1\nline2\n");
+        let giant = "x".repeat(MAX_MCP_WRITE_REPLACEMENT_BYTES + 1);
+        let result = write_code(&json!({
+            "file_path": file_path.to_string_lossy(),
+            "start_line": 1,
+            "end_line": 1,
+            "replacement": giant
+        }))
+        .expect("write payload");
+
+        assert_eq!(result["ok"], Value::Bool(false));
+        assert_eq!(
+            result["error"],
+            Value::String("payload_too_large".to_string())
+        );
+    }
+
+    #[test]
+    fn read_code_rejects_max_bytes_over_server_limit() {
+        let (temp, file_path) = setup_file("alpha\nbeta\n");
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+        let result = read_code(
+            &paths,
+            &json!({
+                "file_path": file_path.to_string_lossy(),
+                "max_bytes": (MAX_MCP_READ_BYTES + 1)
+            }),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_code_continuation_reconstructs_full_content() {
+        let (temp, file_path) = setup_file("l1\nl2\nl3\nl4\nl5\n");
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+
+        let mut collected = String::new();
+        let mut next_line: Option<u64> = None;
+        let mut chunk_index = 0u64;
+
+        loop {
+            let mut args = json!({
+                "file_path": file_path.to_string_lossy(),
+                "max_lines": 2,
+                "chunk_index": chunk_index,
+                "metadata_level": "minimal"
+            });
+            if let Some(n) = next_line {
+                args["continuation_start_line"] = Value::Number(n.into());
+            }
+
+            let chunk = read_code(&paths, &args).expect("chunk read");
+            if !collected.is_empty() && !chunk["content"].as_str().unwrap_or("").is_empty() {
+                collected.push('\n');
+            }
+            collected.push_str(chunk["content"].as_str().unwrap_or(""));
+
+            next_line = chunk["continuation_start_line"].as_u64();
+            if next_line.is_none() {
+                break;
+            }
+            chunk_index += 1;
+        }
+
+        assert_eq!(collected, "l1\nl2\nl3\nl4\nl5");
+    }
+
+    #[test]
+    fn write_code_chunked_sequence_applies_exact_result() {
+        let (_temp, file_path) = setup_file("a\nb\nc\n");
+        let continuation_id = "test-chunked-write";
+
+        let step1 = write_code(&json!({
+            "file_path": file_path.to_string_lossy(),
+            "start_line": 2,
+            "end_line": 2,
+            "replacement": "hello ",
+            "continuation_id": continuation_id,
+            "chunk_index": 0,
+            "is_final_chunk": false
+        }))
+        .expect("step1");
+        assert_eq!(step1["ok"], Value::Bool(true));
+        assert_eq!(step1["continuation"]["completed"], Value::Bool(false));
+
+        let step2 = write_code(&json!({
+            "file_path": file_path.to_string_lossy(),
+            "start_line": 2,
+            "end_line": 2,
+            "replacement": "world",
+            "continuation_id": continuation_id,
+            "chunk_index": 1,
+            "is_final_chunk": true
+        }))
+        .expect("step2");
+        assert_eq!(step2["ok"], Value::Bool(true));
+        assert_eq!(step2["continuation"]["completed"], Value::Bool(true));
+
+        let updated = fs::read_to_string(file_path).expect("updated");
+        assert_eq!(updated, "a\nhello world\nc\n");
     }
 }
