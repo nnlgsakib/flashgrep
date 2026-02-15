@@ -12,7 +12,6 @@ use serde::Serialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use tokio::task;
 use tracing::info;
 
 /// Flashgrep CLI
@@ -313,26 +312,19 @@ pub async fn run() -> FlashgrepResult<()> {
             println!("Starting file watcher...");
             println!("Repository: {}", canonical_repo_root.display());
 
-            // Start file watcher
-            let watcher_root = canonical_repo_root.clone();
-            let watcher_handle = task::spawn_blocking(move || {
-                let mut watcher = match FileWatcher::new(watcher_root) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        eprintln!("Failed to create file watcher: {}", e);
-                        return;
-                    }
-                };
-
-                println!("File watcher started");
-
-                if let Err(e) = watcher.watch() {
-                    eprintln!("File watcher error: {}", e);
+            // Start file watcher with initial scan
+            let mut watcher = match FileWatcher::new(canonical_repo_root.clone()) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("Failed to create file watcher: {}", e);
+                    return Err(e);
                 }
-            });
+            };
 
-            // Wait for file watcher to complete (or Ctrl+C)
-            watcher_handle.await?;
+            println!("File watcher starting...");
+            
+            // Run the watcher with initial scan
+            watcher.watch_with_initial_scan().await?;
 
             Ok(())
         }

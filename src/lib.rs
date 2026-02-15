@@ -74,6 +74,9 @@ pub enum FlashgrepError {
     #[error("Index not found at {0}")]
     IndexNotFound(std::path::PathBuf),
 
+    #[error("Index state error: {0}")]
+    Index(String),
+
     #[error("Invalid configuration: {0}")]
     Config(String),
 
@@ -142,6 +145,7 @@ impl FlashgrepError {
             FlashgrepError::Database(_) => 2,
             FlashgrepError::Search(_) => 3,
             FlashgrepError::IndexNotFound(_) => 4,
+            FlashgrepError::Index(_) => 4,
             FlashgrepError::Config(_) => 5,
             FlashgrepError::FileWatcher(_) => 6,
             FlashgrepError::McpServer(_) => 7,

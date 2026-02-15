@@ -39,6 +39,18 @@ pub struct Config {
     /// Debounce duration for file watcher in milliseconds
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+
+    /// Enable initial indexing on watcher start
+    #[serde(default = "default_enable_initial_index")]
+    pub enable_initial_index: bool,
+
+    /// Progress logging interval for initial scan (number of files)
+    #[serde(default = "default_progress_interval")]
+    pub progress_interval: usize,
+
+    /// Path to store index state (relative to .flashgrep directory)
+    #[serde(default = "default_index_state_path")]
+    pub index_state_path: PathBuf,
 }
 
 impl Default for Config {
@@ -53,6 +65,9 @@ impl Default for Config {
             extensions: default_extensions(),
             ignored_dirs: default_ignored_dirs(),
             debounce_ms: default_debounce_ms(),
+            enable_initial_index: default_enable_initial_index(),
+            progress_interval: default_progress_interval(),
+            index_state_path: default_index_state_path(),
         }
     }
 }
@@ -124,6 +139,18 @@ fn default_ignored_dirs() -> Vec<String> {
 
 fn default_debounce_ms() -> u64 {
     500
+}
+
+fn default_enable_initial_index() -> bool {
+    true
+}
+
+fn default_progress_interval() -> usize {
+    1000
+}
+
+fn default_index_state_path() -> PathBuf {
+    PathBuf::from("index-state.json")
 }
 
 #[cfg(test)]

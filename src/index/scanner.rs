@@ -150,12 +150,12 @@ impl FileScanner {
 }
 
 /// Represents a .flashgrepignore file with gitignore-style patterns
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct FlashgrepIgnore {
     patterns: Vec<IgnorePattern>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct IgnorePattern {
     pattern: String,
     is_negation: bool,
