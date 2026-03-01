@@ -118,6 +118,8 @@ struct CliResult {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Show flashgrep version and runtime environment details
+    Version,
     /// Index a repository
     Index {
         /// Path to the repository (defaults to current directory)
@@ -295,9 +297,19 @@ pub enum Commands {
 
 /// Run the CLI
 pub async fn run() -> FlashgrepResult<RunOutcome> {
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    if is_version_flag_invocation(&raw_args) {
+        print_version_info();
+        return Ok(RunOutcome::Success);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Version => {
+            print_version_info();
+            Ok(RunOutcome::Success)
+        }
         Commands::Index { path, force } => {
             let repo_root = get_repo_root(path.as_ref())?;
             info!("Indexing repository: {}", repo_root.display());
@@ -920,6 +932,30 @@ fn render_results(results: &[CliResult], output: OutputMode, label: &str) -> Fla
     Ok(())
 }
 
+fn is_version_flag_invocation(args: &[OsString]) -> bool {
+    matches!(args, [_, flag] if flag == "--version" || flag == "-V")
+}
+
+fn version_output() -> String {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+
+    format!(
+        "flashgrep {}\nos: {}\narch: {}\nprofile: {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        profile
+    )
+}
+
+fn print_version_info() {
+    println!("{}", version_output());
+}
+
 /// Print help information about ignore files
 pub fn print_ignore_help() {
     println!(
@@ -960,7 +996,52 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn parse_version_subcommand() {
+        let cli = Cli::parse_from(["flashgrep", "version"]);
+        match cli.command {
+            Commands::Version => {}
+            _ => panic!("expected version command"),
+        }
+    }
+
+    #[test]
+    fn version_flag_invocation_is_detected() {
+        let args = vec![OsString::from("flashgrep"), OsString::from("--version")];
+        assert!(is_version_flag_invocation(&args));
+
+        let short_args = vec![OsString::from("flashgrep"), OsString::from("-V")];
+        assert!(is_version_flag_invocation(&short_args));
+
+        let query_args = vec![
+            OsString::from("flashgrep"),
+            OsString::from("query"),
+            OsString::from("--version"),
+        ];
+        assert!(!is_version_flag_invocation(&query_args));
+    }
+
+    #[test]
+    fn version_output_contains_platform_metadata() {
+        let output = version_output();
+        assert!(output.contains(env!("CARGO_PKG_VERSION")));
+        assert!(output.contains(std::env::consts::OS));
+        assert!(output.contains(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn help_includes_version_subcommand() {
+        let mut command = Cli::command();
+        let mut help = Vec::new();
+        command
+            .write_long_help(&mut help)
+            .expect("failed to render help");
+
+        let rendered = String::from_utf8(help).expect("help should be UTF-8");
+        assert!(rendered.contains("version"));
+    }
 
     #[test]
     fn parse_start_background_flag() {

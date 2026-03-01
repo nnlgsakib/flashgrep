@@ -379,7 +379,7 @@ fn ensure_model_cached_for_scope(
     #[cfg(not(feature = "neural"))]
     {
         return Err(FlashgrepError::Config(
-            "Neural retrieval is disabled in this build. Rebuild with --features neural"
+            "Neural retrieval is disabled in this build. Build with default features enabled (or pass --features neural explicitly)."
                 .to_string(),
         ));
     }
@@ -461,7 +461,7 @@ pub fn embed_text(paths: &FlashgrepPaths, text: &str) -> FlashgrepResult<Vec<f32
         let _ = paths;
         let _ = text;
         Err(FlashgrepError::Config(
-            "Neural retrieval is disabled in this build. Rebuild with --features neural"
+            "Neural retrieval is disabled in this build. Build with default features enabled (or pass --features neural explicitly)."
                 .to_string(),
         ))
     }
@@ -490,7 +490,7 @@ pub fn embed_texts(paths: &FlashgrepPaths, texts: &[String]) -> FlashgrepResult<
         let _ = paths;
         let _ = texts;
         Err(FlashgrepError::Config(
-            "Neural retrieval is disabled in this build. Rebuild with --features neural"
+            "Neural retrieval is disabled in this build. Build with default features enabled (or pass --features neural explicitly)."
                 .to_string(),
         ))
     }

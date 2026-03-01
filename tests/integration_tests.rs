@@ -1,10 +1,10 @@
 use flashgrep::chunking::Chunker;
-use flashgrep::config::paths::{get_repo_root, FlashgrepPaths};
+use flashgrep::config::paths::FlashgrepPaths;
 use flashgrep::config::Config;
 use flashgrep::db::models::{FileMetadata, SymbolType};
 use flashgrep::db::Database;
 use flashgrep::index::engine::Indexer;
-use flashgrep::index::scanner::{should_index_file, FileScanner, FlashgrepIgnore};
+use flashgrep::index::scanner::{FileScanner, FlashgrepIgnore};
 use flashgrep::neural::{ensure_model_for_startup_prompt, ModelStartupPromptOutcome};
 use flashgrep::search::Searcher;
 use flashgrep::symbols::SymbolDetector;

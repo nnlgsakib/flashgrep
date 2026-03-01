@@ -4,10 +4,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-    use std::thread;
-    use std::time::Duration;
-
     /// Test that MCP server starts successfully
     #[test]
     fn test_mcp_server_startup() {
@@ -85,8 +81,6 @@ mod tests {
 
 #[cfg(test)]
 mod integration {
-    use super::*;
-
     /// Integration test for full MCP workflow
     #[test]
     fn test_mcp_full_workflow() {
