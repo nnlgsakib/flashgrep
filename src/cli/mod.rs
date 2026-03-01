@@ -920,13 +920,17 @@ fn render_results(results: &[CliResult], output: OutputMode, label: &str) -> Fla
     Ok(())
 }
 
-/// Print help information about .flashgrepignore
+/// Print help information about ignore files
 pub fn print_ignore_help() {
     println!(
         "
-.flashgrepignore file format:
-  The .flashgrepignore file uses gitignore-style patterns to exclude files and
-  directories from indexing. Place this file in the root of your repository.
+Ignore file format:
+  flashgrep loads patterns from .gitignore and .flashgrepignore in your
+  repository root. Both use gitignore-style patterns.
+
+  Pattern precedence:
+  1) .gitignore is applied first
+  2) .flashgrepignore is applied second (can override with ! negations)
 
 Pattern syntax:
   *       - Wildcard, matches any sequence of characters

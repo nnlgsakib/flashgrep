@@ -156,7 +156,6 @@ fn default_index_state_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn test_config_default() {

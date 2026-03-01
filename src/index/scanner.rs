@@ -149,7 +149,7 @@ impl FileScanner {
     }
 }
 
-/// Represents a .flashgrepignore file with gitignore-style patterns
+/// Represents ignore patterns loaded from .gitignore and .flashgrepignore
 #[derive(Debug, Default, Clone)]
 pub struct FlashgrepIgnore {
     patterns: Vec<IgnorePattern>,
@@ -163,22 +163,38 @@ struct IgnorePattern {
 }
 
 impl FlashgrepIgnore {
-    /// Load ignore patterns from the root .flashgrepignore file
+    /// Load ignore patterns from root .gitignore and .flashgrepignore files.
+    ///
+    /// Patterns from `.flashgrepignore` are applied after `.gitignore`, so
+    /// repository-local flashgrep overrides can refine behavior when needed.
     pub fn from_root(root: &PathBuf) -> Self {
-        let ignore_file = root.join(".flashgrepignore");
-        if ignore_file.exists() {
-            match Self::from_file(&ignore_file) {
-                Ok(patterns) => patterns,
-                Err(_) => Self::default(),
+        let mut patterns = Vec::new();
+
+        for ignore_name in [".gitignore", ".flashgrepignore"] {
+            let ignore_file = root.join(ignore_name);
+            if ignore_file.exists() {
+                if let Ok(content) = std::fs::read_to_string(&ignore_file) {
+                    patterns.extend(Self::parse_patterns(&content));
+                }
             }
-        } else {
+        }
+
+        if patterns.is_empty() {
             Self::default()
+        } else {
+            Self { patterns }
         }
     }
 
     /// Load ignore patterns from a file
     pub fn from_file(path: &PathBuf) -> FlashgrepResult<Self> {
         let content = std::fs::read_to_string(path)?;
+        Ok(Self {
+            patterns: Self::parse_patterns(&content),
+        })
+    }
+
+    fn parse_patterns(content: &str) -> Vec<IgnorePattern> {
         let mut patterns = Vec::new();
 
         for line in content.lines() {
@@ -207,7 +223,7 @@ impl FlashgrepIgnore {
             });
         }
 
-        Ok(Self { patterns })
+        patterns
     }
 
     /// Check if a path is ignored
@@ -411,6 +427,27 @@ temp*
         assert!(!files
             .iter()
             .any(|p| p.to_string_lossy().contains(".opencode")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_gitignore_patterns_are_respected() -> FlashgrepResult<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path().to_path_buf();
+
+        std::fs::create_dir_all(root.join("src"))?;
+        std::fs::write(root.join("src/main.rs"), "fn main() {}")?;
+        std::fs::write(root.join("src/ignored.rs"), "fn ignored() {}")?;
+
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n")?;
+
+        let config = Config::default();
+        let scanner = FileScanner::new(root.clone(), config);
+        let files: Vec<_> = scanner.scan().collect();
+
+        assert!(files.iter().any(|p| p.ends_with("main.rs")));
+        assert!(!files.iter().any(|p| p.ends_with("ignored.rs")));
 
         Ok(())
     }

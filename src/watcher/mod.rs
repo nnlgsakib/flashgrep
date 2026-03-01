@@ -331,7 +331,7 @@ Thumbs.db
     fn is_ignore_file(path: &PathBuf) -> bool {
         path.file_name()
             .and_then(|s| s.to_str())
-            .map(|n| n == ".flashgrepignore")
+            .map(|n| n == ".flashgrepignore" || n == ".gitignore")
             .unwrap_or(false)
     }
 
@@ -341,7 +341,7 @@ Thumbs.db
             .indexer
             .reconcile_ignored_files(&self.repo_root, &self.ignore_patterns)?;
         info!(
-            "Reloaded .flashgrepignore and reconciled index: {} removed, {} kept",
+            "Reloaded ignore patterns (.gitignore/.flashgrepignore) and reconciled index: {} removed, {} kept",
             removed, kept
         );
         Ok(())
@@ -526,5 +526,12 @@ mod tests {
             .any(|p| p.to_string_lossy().contains(".opencode")));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_detects_both_ignore_files() {
+        assert!(FileWatcher::is_ignore_file(&PathBuf::from(".flashgrepignore")));
+        assert!(FileWatcher::is_ignore_file(&PathBuf::from(".gitignore")));
+        assert!(!FileWatcher::is_ignore_file(&PathBuf::from("main.rs")));
     }
 }
