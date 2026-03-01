@@ -530,7 +530,9 @@ mod tests {
 
     #[test]
     fn test_detects_both_ignore_files() {
-        assert!(FileWatcher::is_ignore_file(&PathBuf::from(".flashgrepignore")));
+        assert!(FileWatcher::is_ignore_file(&PathBuf::from(
+            ".flashgrepignore"
+        )));
         assert!(FileWatcher::is_ignore_file(&PathBuf::from(".gitignore")));
         assert!(!FileWatcher::is_ignore_file(&PathBuf::from("main.rs")));
     }
