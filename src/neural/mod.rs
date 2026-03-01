@@ -1,4 +1,7 @@
 use crate::config::paths::FlashgrepPaths;
+use crate::config::{
+    default_global_model_cache_path, Config, ModelCacheScope as ConfigModelCacheScope,
+};
 use crate::{FlashgrepError, FlashgrepResult};
 #[cfg(feature = "neural")]
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
@@ -13,6 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const EMBEDDING_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
 
+const MODEL_SCOPE_OVERRIDE_ENV: &str = "FLASHGREP_MODEL_CACHE_SCOPE";
+const MODEL_SCOPE_PROMPT_RESPONSE_ENV: &str = "FLASHGREP_MODEL_SCOPE_RESPONSE";
+
 #[cfg(feature = "neural")]
 static EMBEDDER: OnceCell<Mutex<TextEmbedding>> = OnceCell::new();
 
@@ -25,6 +31,21 @@ pub enum ModelStartupPromptOutcome {
     DownloadFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelStorageScope {
+    Local,
+    Global,
+}
+
+impl ModelStorageScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Global => "global",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCacheManifest {
     pub model_id: String,
@@ -34,19 +55,28 @@ pub struct ModelCacheManifest {
 }
 
 pub fn model_cache_root(paths: &FlashgrepPaths) -> PathBuf {
-    paths.root().join("model-cache")
+    resolve_embedding_cache_root(paths).unwrap_or_else(|_| paths.root().join("model-cache"))
 }
 
 pub fn model_cache_dir(paths: &FlashgrepPaths) -> PathBuf {
     model_cache_root(paths).join("BAAI__bge-small-en-v1.5")
 }
 
-fn manifest_path(paths: &FlashgrepPaths) -> PathBuf {
-    model_cache_dir(paths).join("manifest.json")
+fn model_cache_dir_from_root(cache_root: &std::path::Path) -> PathBuf {
+    cache_root.join("BAAI__bge-small-en-v1.5")
+}
+
+fn manifest_path_from_root(cache_root: &std::path::Path) -> PathBuf {
+    model_cache_dir_from_root(cache_root).join("manifest.json")
 }
 
 pub fn is_model_cached(paths: &FlashgrepPaths) -> FlashgrepResult<bool> {
-    let manifest = manifest_path(paths);
+    let scope = resolve_default_scope(paths)?;
+    Ok(find_cached_model_scope(paths, scope)?.is_some())
+}
+
+fn is_model_cached_in_root(cache_root: &std::path::Path) -> FlashgrepResult<bool> {
+    let manifest = manifest_path_from_root(cache_root);
     if !manifest.exists() {
         return Ok(false);
     }
@@ -62,11 +92,143 @@ pub fn is_model_cached(paths: &FlashgrepPaths) -> FlashgrepResult<bool> {
     Ok(parsed.model_id == EMBEDDING_MODEL_ID)
 }
 
+fn load_runtime_config(paths: &FlashgrepPaths) -> FlashgrepResult<Config> {
+    if paths.config_file().exists() {
+        Ok(Config::from_file(&paths.config_file())?)
+    } else {
+        Ok(Config::default())
+    }
+}
+
+fn parse_scope(input: &str) -> Option<ModelStorageScope> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "g" | "global" => Some(ModelStorageScope::Global),
+        "l" | "local" => Some(ModelStorageScope::Local),
+        _ => None,
+    }
+}
+
+fn resolve_default_scope(paths: &FlashgrepPaths) -> FlashgrepResult<ModelStorageScope> {
+    if let Ok(override_value) = std::env::var(MODEL_SCOPE_OVERRIDE_ENV) {
+        return parse_scope(&override_value).ok_or_else(|| {
+            FlashgrepError::Config(format!(
+                "Invalid {} value '{}'. Expected 'local' or 'global'.",
+                MODEL_SCOPE_OVERRIDE_ENV, override_value
+            ))
+        });
+    }
+
+    let config = load_runtime_config(paths)?;
+    Ok(match config.model_cache_scope {
+        ConfigModelCacheScope::Local => ModelStorageScope::Local,
+        ConfigModelCacheScope::Global => ModelStorageScope::Global,
+    })
+}
+
+fn resolve_scope_cache_root(
+    paths: &FlashgrepPaths,
+    scope: Option<ModelStorageScope>,
+) -> FlashgrepResult<PathBuf> {
+    let resolved_scope = scope.unwrap_or(ModelStorageScope::Local);
+    match resolved_scope {
+        ModelStorageScope::Local => Ok(paths.root().join("model-cache")),
+        ModelStorageScope::Global => {
+            let config = load_runtime_config(paths)?;
+            Ok(config
+                .global_model_cache_path
+                .unwrap_or_else(default_global_model_cache_path))
+        }
+    }
+}
+
+fn alternate_scope(scope: ModelStorageScope) -> ModelStorageScope {
+    match scope {
+        ModelStorageScope::Local => ModelStorageScope::Global,
+        ModelStorageScope::Global => ModelStorageScope::Local,
+    }
+}
+
+fn find_cached_model_scope(
+    paths: &FlashgrepPaths,
+    preferred_scope: ModelStorageScope,
+) -> FlashgrepResult<Option<(ModelStorageScope, PathBuf)>> {
+    let preferred_cache_root = resolve_scope_cache_root(paths, Some(preferred_scope))?;
+    if is_model_cached_in_root(&preferred_cache_root)? {
+        return Ok(Some((preferred_scope, preferred_cache_root)));
+    }
+
+    let fallback_scope = alternate_scope(preferred_scope);
+    let fallback_cache_root = resolve_scope_cache_root(paths, Some(fallback_scope))?;
+    if fallback_cache_root != preferred_cache_root && is_model_cached_in_root(&fallback_cache_root)?
+    {
+        return Ok(Some((fallback_scope, fallback_cache_root)));
+    }
+
+    Ok(None)
+}
+
+fn resolve_embedding_cache_root(paths: &FlashgrepPaths) -> FlashgrepResult<PathBuf> {
+    let preferred_scope = resolve_default_scope(paths)?;
+    if let Some((_, cache_root)) = find_cached_model_scope(paths, preferred_scope)? {
+        return Ok(cache_root);
+    }
+
+    resolve_scope_cache_root(paths, Some(preferred_scope))
+}
+
+fn resolve_embedding_cache_dir(paths: &FlashgrepPaths) -> FlashgrepResult<PathBuf> {
+    Ok(model_cache_dir_from_root(&resolve_embedding_cache_root(
+        paths,
+    )?))
+}
+
+fn choose_download_scope(
+    _paths: &FlashgrepPaths,
+    interactive: bool,
+    prompt_override: Option<String>,
+    default_scope: ModelStorageScope,
+) -> FlashgrepResult<ModelStorageScope> {
+    if let Some(value) = prompt_override {
+        return parse_scope(&value).ok_or_else(|| {
+            FlashgrepError::Config(format!(
+                "Invalid {} value '{}'. Expected 'local' or 'global'.",
+                MODEL_SCOPE_PROMPT_RESPONSE_ENV, value
+            ))
+        });
+    }
+
+    if !interactive {
+        return Ok(default_scope);
+    }
+
+    let default_label = default_scope.label();
+    print!(
+        "Choose model download scope [global/local] (default: {}): ",
+        default_label
+    );
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(default_scope);
+    }
+
+    parse_scope(trimmed).ok_or_else(|| {
+        FlashgrepError::Config(format!(
+            "Invalid scope '{}'. Expected 'global' or 'local'.",
+            trimmed
+        ))
+    })
+}
+
 pub fn ensure_model_for_startup_prompt(
     paths: &FlashgrepPaths,
     startup_context: &str,
 ) -> FlashgrepResult<ModelStartupPromptOutcome> {
     let response_override = std::env::var("FLASHGREP_MODEL_PROMPT_RESPONSE").ok();
+    let scope_prompt_override = std::env::var(MODEL_SCOPE_PROMPT_RESPONSE_ENV).ok();
     let force_non_interactive = std::env::var("FLASHGREP_NONINTERACTIVE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -78,7 +240,8 @@ pub fn ensure_model_for_startup_prompt(
         startup_context,
         interactive,
         response_override,
-        |p| ensure_model_cached(p),
+        scope_prompt_override,
+        |p, scope| ensure_model_cached_for_scope(p, scope),
     )
 }
 
@@ -87,14 +250,27 @@ fn ensure_model_for_startup_prompt_with<F>(
     startup_context: &str,
     interactive: bool,
     response_override: Option<String>,
+    scope_prompt_override: Option<String>,
     mut downloader: F,
 ) -> FlashgrepResult<ModelStartupPromptOutcome>
 where
-    F: FnMut(&FlashgrepPaths) -> FlashgrepResult<()>,
+    F: FnMut(&FlashgrepPaths, ModelStorageScope) -> FlashgrepResult<()>,
 {
-    if is_model_cached(paths)? {
+    let default_scope = resolve_default_scope(paths)?;
+    if let Some((cached_scope, cached_cache_root)) = find_cached_model_scope(paths, default_scope)?
+    {
+        if cached_scope != default_scope {
+            println!(
+                "Neural model '{}' is already cached in {} scope at {}.",
+                EMBEDDING_MODEL_ID,
+                cached_scope.label(),
+                model_cache_dir_from_root(&cached_cache_root).display()
+            );
+        }
         return Ok(ModelStartupPromptOutcome::AlreadyCached);
     }
+
+    let default_cache_root = resolve_scope_cache_root(paths, Some(default_scope))?;
 
     if !interactive && response_override.is_none() {
         println!(
@@ -103,7 +279,7 @@ where
         );
         println!(
             "To enable neural features later, rerun in interactive mode or pre-populate {}",
-            model_cache_dir(paths).display()
+            model_cache_dir_from_root(&default_cache_root).display()
         );
         return Ok(ModelStartupPromptOutcome::NonInteractiveSkip);
     }
@@ -129,12 +305,27 @@ where
         return Ok(ModelStartupPromptOutcome::Declined);
     }
 
+    let selected_scope =
+        choose_download_scope(paths, interactive, scope_prompt_override, default_scope)?;
+    let selected_cache_root = resolve_scope_cache_root(paths, Some(selected_scope))?;
+
+    if is_model_cached_in_root(&selected_cache_root)? {
+        println!(
+            "Neural model '{}' is already cached in {} scope at {}.",
+            EMBEDDING_MODEL_ID,
+            selected_scope.label(),
+            model_cache_dir_from_root(&selected_cache_root).display()
+        );
+        return Ok(ModelStartupPromptOutcome::AlreadyCached);
+    }
+
     println!(
-        "Downloading neural model '{}' into {} ...",
+        "Downloading neural model '{}' into {} scope at {} ...",
         EMBEDDING_MODEL_ID,
-        model_cache_root(paths).display()
+        selected_scope.label(),
+        selected_cache_root.display()
     );
-    match downloader(paths) {
+    match downloader(paths, selected_scope) {
         Ok(()) => {
             println!("Model download complete.");
             Ok(ModelStartupPromptOutcome::Downloaded)
@@ -154,9 +345,21 @@ fn is_affirmative(input: &str) -> bool {
 }
 
 pub fn ensure_model_cached(paths: &FlashgrepPaths) -> FlashgrepResult<()> {
-    let cache_dir = model_cache_dir(paths);
-    let manifest_path = manifest_path(paths);
-    if is_model_cached(paths)? {
+    let scope = resolve_default_scope(paths)?;
+    if find_cached_model_scope(paths, scope)?.is_some() {
+        return Ok(());
+    }
+    ensure_model_cached_for_scope(paths, scope)
+}
+
+fn ensure_model_cached_for_scope(
+    paths: &FlashgrepPaths,
+    scope: ModelStorageScope,
+) -> FlashgrepResult<()> {
+    let cache_root = resolve_scope_cache_root(paths, Some(scope))?;
+    let cache_dir = model_cache_dir_from_root(&cache_root);
+    let manifest_path = manifest_path_from_root(&cache_root);
+    if is_model_cached_in_root(&cache_root)? {
         return Ok(());
     }
 
@@ -201,7 +404,10 @@ fn initialize_embedder(cache_dir: &PathBuf) -> FlashgrepResult<()> {
         .unwrap_or(false)
     {
         return Err(FlashgrepError::Config(
-            "Offline mode is enabled and model cache is missing. Disable FLASHGREP_OFFLINE or pre-populate .flashgrep/model-cache/BAAI__bge-small-en-v1.5".to_string(),
+            format!(
+                "Offline mode is enabled and model cache is missing. Disable FLASHGREP_OFFLINE or pre-populate {}",
+                model_cache_dir_from_root(cache_dir).display()
+            ),
         ));
     }
 
@@ -224,7 +430,8 @@ fn initialize_embedder(cache_dir: &PathBuf) -> FlashgrepResult<()> {
 #[cfg(feature = "neural")]
 fn embedding_model(paths: &FlashgrepPaths) -> FlashgrepResult<&'static Mutex<TextEmbedding>> {
     if EMBEDDER.get().is_none() {
-        initialize_embedder(&model_cache_root(paths))?;
+        let cache_dir = resolve_embedding_cache_dir(paths)?;
+        initialize_embedder(&cache_dir)?;
     }
     EMBEDDER.get().ok_or_else(|| {
         FlashgrepError::Config("Embedding model was not initialized correctly".to_string())
@@ -260,6 +467,35 @@ pub fn embed_text(paths: &FlashgrepPaths, text: &str) -> FlashgrepResult<Vec<f32
     }
 }
 
+pub fn embed_texts(paths: &FlashgrepPaths, texts: &[String]) -> FlashgrepResult<Vec<Vec<f32>>> {
+    #[cfg(feature = "neural")]
+    {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let model = embedding_model(paths)?;
+        let guard = model
+            .lock()
+            .map_err(|_| FlashgrepError::Config("Embedding model lock poisoned".to_string()))?;
+        let results = guard
+            .embed(texts.to_vec(), None)
+            .map_err(|e| FlashgrepError::Search(format!("Embedding failed: {e}")))?;
+
+        return Ok(results);
+    }
+
+    #[cfg(not(feature = "neural"))]
+    {
+        let _ = paths;
+        let _ = texts;
+        Err(FlashgrepError::Config(
+            "Neural retrieval is disabled in this build. Rebuild with --features neural"
+                .to_string(),
+        ))
+    }
+}
+
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() || b.is_empty() || a.len() != b.len() {
         return 0.0;
@@ -282,6 +518,22 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn write_manifest(cache_root: &std::path::Path) -> FlashgrepResult<()> {
+        let cache_dir = model_cache_dir_from_root(cache_root);
+        std::fs::create_dir_all(&cache_dir)?;
+        let manifest = ModelCacheManifest {
+            model_id: EMBEDDING_MODEL_ID.to_string(),
+            created_at: 0,
+            source_url: "https://huggingface.co/BAAI/bge-small-en-v1.5".to_string(),
+            files: vec!["manifest.json".to_string(), "model.onnx".to_string()],
+        };
+        std::fs::write(
+            manifest_path_from_root(cache_root),
+            serde_json::to_string_pretty(&manifest)?,
+        )?;
+        Ok(())
+    }
 
     #[test]
     fn embeddings_are_deterministic() {
@@ -311,7 +563,8 @@ mod tests {
             "index startup",
             true,
             Some("n".to_string()),
-            |_| {
+            None,
+            |_, _| {
                 downloader_called = true;
                 Ok(())
             },
@@ -335,7 +588,8 @@ mod tests {
             "index startup",
             true,
             Some("y".to_string()),
-            |_| {
+            Some("local".to_string()),
+            |_, _| {
                 downloader_called = true;
                 Ok(())
             },
@@ -354,14 +608,163 @@ mod tests {
         paths.create()?;
 
         let mut downloader_called = false;
-        let outcome =
-            ensure_model_for_startup_prompt_with(&paths, "watcher startup", false, None, |_| {
+        let outcome = ensure_model_for_startup_prompt_with(
+            &paths,
+            "watcher startup",
+            false,
+            None,
+            None,
+            |_, _| {
                 downloader_called = true;
                 Ok(())
-            })?;
+            },
+        )?;
 
         assert_eq!(outcome, ModelStartupPromptOutcome::NonInteractiveSkip);
         assert!(!downloader_called);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_prompt_accepts_scope_override() -> FlashgrepResult<()> {
+        let temp = TempDir::new()?;
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+
+        let mut config = crate::config::Config::default();
+        config.global_model_cache_path = Some(temp.path().join("shared-model-cache"));
+        config.to_file(&paths.config_file())?;
+
+        let mut selected_scope = None;
+        let outcome = ensure_model_for_startup_prompt_with(
+            &paths,
+            "index startup",
+            true,
+            Some("y".to_string()),
+            Some("global".to_string()),
+            |_, scope| {
+                selected_scope = Some(scope);
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(outcome, ModelStartupPromptOutcome::Downloaded);
+        assert_eq!(selected_scope, Some(ModelStorageScope::Global));
+        Ok(())
+    }
+
+    #[test]
+    fn global_scope_without_config_falls_back_to_default_path() -> FlashgrepResult<()> {
+        let temp = TempDir::new()?;
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+
+        let mut selected_scope = None;
+        let result = ensure_model_for_startup_prompt_with(
+            &paths,
+            "index startup",
+            true,
+            Some("y".to_string()),
+            Some("global".to_string()),
+            |_, scope| {
+                selected_scope = Some(scope);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(selected_scope, Some(ModelStorageScope::Global));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_prompt_skips_when_model_is_cached_in_other_scope() -> FlashgrepResult<()> {
+        let temp = TempDir::new()?;
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+
+        let global_cache_root = temp.path().join("shared-model-cache");
+        write_manifest(&global_cache_root)?;
+
+        let mut config = crate::config::Config::default();
+        config.global_model_cache_path = Some(global_cache_root);
+        config.to_file(&paths.config_file())?;
+
+        let mut downloader_called = false;
+        let outcome = ensure_model_for_startup_prompt_with(
+            &paths,
+            "index startup",
+            true,
+            None,
+            None,
+            |_, _| {
+                downloader_called = true;
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(outcome, ModelStartupPromptOutcome::AlreadyCached);
+        assert!(!downloader_called);
+        Ok(())
+    }
+
+    #[test]
+    fn is_model_cached_checks_non_default_scope() -> FlashgrepResult<()> {
+        let temp = TempDir::new()?;
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+
+        let global_cache_root = temp.path().join("shared-model-cache");
+        write_manifest(&global_cache_root)?;
+
+        let mut config = crate::config::Config::default();
+        config.global_model_cache_path = Some(global_cache_root);
+        config.to_file(&paths.config_file())?;
+
+        assert!(is_model_cached(&paths)?);
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_cache_root_prefers_cached_non_default_scope() -> FlashgrepResult<()> {
+        let temp = TempDir::new()?;
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+
+        let global_cache_root = temp.path().join("shared-model-cache");
+        write_manifest(&global_cache_root)?;
+
+        let mut config = crate::config::Config::default();
+        config.global_model_cache_path = Some(global_cache_root.clone());
+        config.to_file(&paths.config_file())?;
+
+        assert_eq!(resolve_embedding_cache_root(&paths)?, global_cache_root);
+        Ok(())
+    }
+
+    #[test]
+    fn embedding_cache_dir_uses_model_subdir_for_non_default_scope() -> FlashgrepResult<()> {
+        let temp = TempDir::new()?;
+        let repo_root = temp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+
+        let global_cache_root = temp.path().join("shared-model-cache");
+        write_manifest(&global_cache_root)?;
+
+        let mut config = crate::config::Config::default();
+        config.global_model_cache_path = Some(global_cache_root.clone());
+        config.to_file(&paths.config_file())?;
+
+        assert_eq!(
+            resolve_embedding_cache_dir(&paths)?,
+            global_cache_root.join("BAAI__bge-small-en-v1.5")
+        );
         Ok(())
     }
 }

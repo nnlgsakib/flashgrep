@@ -69,7 +69,7 @@ Features:
 - **Incremental indexing**: Only re-indexes changed files
 - **Fast**: Indexes 1,500+ files in under 3 seconds
 - **Smart filtering**: Ignores `target/`, `node_modules/`, `.git/`, etc.
-- **Model onboarding prompt**: If neural model cache is missing, startup asks whether to download `BAAI/bge-small-en-v1.5`
+- **Model onboarding prompt**: If neural model cache is missing, startup asks whether to download `BAAI/bge-small-en-v1.5` and where to store it (`local` or `global`)
 
 #### `flashgrep start [PATH]`
 
@@ -87,7 +87,7 @@ The daemon:
 - Watches files for changes and auto-updates index
 - Runs MCP server on `localhost:7777`
 - Supports graceful shutdown (Ctrl+C)
-- Prompts for optional neural model download before initial indexing when cache is missing
+- Prompts for optional neural model download before initial indexing when cache is missing (with `local`/`global` storage scope selection)
 
 #### `flashgrep query <TEXT> [PATH]`
 
@@ -113,9 +113,11 @@ flashgrep query "find authentication middleware" --retrieval-mode semantic --lim
 flashgrep query "jwt validation" --retrieval-mode hybrid --output json
 ```
 
-Neural retrieval uses model `BAAI/bge-small-en-v1.5` and caches assets in
-`.flashgrep/model-cache/BAAI__bge-small-en-v1.5` on first semantic/hybrid query
-or during indexing.
+Neural retrieval uses model `BAAI/bge-small-en-v1.5` and caches assets in either:
+- Local cache: `.flashgrep/model-cache/BAAI__bge-small-en-v1.5`
+- Global cache: `global_model_cache_path/BAAI__bge-small-en-v1.5` (defaults to OS user app-data location; configurable in `.flashgrep/config.json`)
+
+On first download prompt, choose whether to store the model locally (per repository) or globally (shared across repositories).
 
 #### `flashgrep files [PATH]`
 
@@ -561,13 +563,23 @@ The config is stored in `.flashgrep/config.json`:
   "version": "0.1.0",
   "mcp_port": 7777,
   "use_unix_socket": false,
+  "socket_path": ".flashgrep/mcp.sock",
   "max_file_size": 2097152,
   "max_chunk_lines": 300,
   "extensions": ["rs", "js", "ts", "py", "go", "json", "md", "yaml", "toml"],
   "ignored_dirs": [".git", "node_modules", "target", "dist", "build", "vendor"],
-  "debounce_ms": 500
+  "debounce_ms": 500,
+  "enable_initial_index": true,
+  "progress_interval": 1000,
+  "index_state_path": "index-state.json",
+  "model_cache_scope": "local",
+  "global_model_cache_path": "C:/Users/<you>/.flashgrep/model-cache"
 }
 ```
+
+Notes:
+- `model_cache_scope` accepts `local` or `global`.
+- `global_model_cache_path` is optional; if omitted, Flashgrep uses an OS-appropriate user app-data path.
 
 ## Architecture
 

@@ -1,16 +1,32 @@
 use crate::chunking::Chunker;
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
-use crate::db::models::{Chunk, ChunkVector, FileMetadata};
+use crate::db::models::{Chunk, ChunkVector, FileMetadata, Symbol};
 use crate::db::Database;
 use crate::index::scanner::{FileScanner, FlashgrepIgnore};
-use crate::neural::{embed_text, is_model_cached, EMBEDDING_MODEL_ID};
+use crate::neural::{embed_text, embed_texts, is_model_cached, EMBEDDING_MODEL_ID};
 use crate::symbols::SymbolDetector;
 use crate::FlashgrepResult;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tantivy::schema::*;
 use tantivy::{Index, IndexWriter, Term};
 use tracing::{debug, error, info};
+
+struct FileIndexPlan {
+    file_path: PathBuf,
+    metadata: FileMetadata,
+}
+
+struct PreparedFileIndex {
+    file_path: PathBuf,
+    metadata: FileMetadata,
+    chunks: Vec<Chunk>,
+    symbols: Vec<Symbol>,
+    vectors: Vec<ChunkVector>,
+}
 
 /// Main indexing engine
 pub struct Indexer {
@@ -236,23 +252,97 @@ impl Indexer {
 
         info!("Found {} files to check", total_files);
 
+        let progress = Self::create_progress_bar(total_files as u64);
         let mut indexed = 0;
         let mut skipped = 0;
         let mut failed = 0;
+        let mut plans = Vec::new();
 
-        for (i, file_path) in files.iter().enumerate() {
-            if i % 100 == 0 {
-                info!("Processed {}/{} files...", i, total_files);
+        for file_path in &files {
+            match FileMetadata::from_path(file_path) {
+                Ok(metadata) => match self.db.needs_reindex(file_path, metadata.last_modified) {
+                    Ok(true) => plans.push(FileIndexPlan {
+                        file_path: file_path.clone(),
+                        metadata,
+                    }),
+                    Ok(false) => {
+                        skipped += 1;
+                        if let Some(pb) = &progress {
+                            pb.inc(1);
+                        }
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        error!(
+                            "Failed to check {} for reindex eligibility: {}",
+                            file_path.display(),
+                            err
+                        );
+                        if let Some(pb) = &progress {
+                            pb.inc(1);
+                        }
+                    }
+                },
+                Err(err) => {
+                    failed += 1;
+                    error!(
+                        "Failed to read metadata for {}: {}",
+                        file_path.display(),
+                        err
+                    );
+                    if let Some(pb) = &progress {
+                        pb.inc(1);
+                    }
+                }
             }
+        }
 
-            match self.index_file(file_path) {
-                Ok(true) => indexed += 1,
-                Ok(false) => skipped += 1,
-                Err(e) => {
-                    error!("Failed to index {}: {}", file_path.display(), e);
+        let paths_for_workers = self.paths.clone();
+        let semantic_vectors_enabled = self.semantic_vectors_enabled;
+        let progress_for_workers = progress.clone();
+        let prepared_results: Vec<(PathBuf, FlashgrepResult<PreparedFileIndex>)> = plans
+            .into_par_iter()
+            .map_init(
+                || (Chunker::new(), SymbolDetector::new()),
+                |(chunker, symbol_detector), plan| {
+                    let path = plan.file_path.clone();
+                    let result = Self::prepare_file_for_indexing(
+                        &paths_for_workers,
+                        semantic_vectors_enabled,
+                        chunker,
+                        symbol_detector,
+                        plan,
+                    );
+                    if let Some(pb) = &progress_for_workers {
+                        pb.inc(1);
+                    }
+                    (path, result)
+                },
+            )
+            .collect();
+
+        for (file_path, prepared_result) in prepared_results {
+            match prepared_result {
+                Ok(prepared) => {
+                    if let Err(err) = self.persist_prepared_file(prepared) {
+                        error!("Failed to index {}: {}", file_path.display(), err);
+                        failed += 1;
+                    } else {
+                        indexed += 1;
+                    }
+                }
+                Err(err) => {
+                    error!("Failed to index {}: {}", file_path.display(), err);
                     failed += 1;
                 }
             }
+        }
+
+        if let Some(pb) = &progress {
+            pb.finish_with_message(format!(
+                "Indexed {}/{} files ({} skipped, {} failed)",
+                indexed, total_files, skipped, failed
+            ));
         }
 
         // Commit the Tantivy writer
@@ -264,6 +354,115 @@ impl Indexer {
         );
 
         self.get_stats()
+    }
+
+    fn create_progress_bar(total_files: u64) -> Option<ProgressBar> {
+        if !std::io::stdout().is_terminal() {
+            return None;
+        }
+
+        let progress_bar = ProgressBar::new(total_files);
+        progress_bar.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({percent}%) ETA {eta_precise}",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+        );
+        progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+        Some(progress_bar)
+    }
+
+    fn prepare_file_for_indexing(
+        paths: &FlashgrepPaths,
+        semantic_vectors_enabled: bool,
+        chunker: &Chunker,
+        symbol_detector: &SymbolDetector,
+        plan: FileIndexPlan,
+    ) -> FlashgrepResult<PreparedFileIndex> {
+        let content = std::fs::read_to_string(&plan.file_path)?;
+        let chunks = chunker.chunk_file(
+            plan.file_path.clone(),
+            &content,
+            plan.metadata.last_modified,
+        );
+
+        let mut symbols = Vec::new();
+        for chunk in &chunks {
+            symbols.extend(symbol_detector.detect_in_chunk(
+                &chunk.content,
+                plan.file_path.clone(),
+                chunk.start_line,
+            ));
+        }
+
+        let mut vectors = Vec::new();
+        if semantic_vectors_enabled && !chunks.is_empty() {
+            let chunk_contents: Vec<String> =
+                chunks.iter().map(|chunk| chunk.content.clone()).collect();
+            let embeddings = match embed_texts(paths, &chunk_contents) {
+                Ok(embeddings) => embeddings,
+                Err(err) => {
+                    error!(
+                        "Failed to embed chunks for {}: {}",
+                        plan.file_path.display(),
+                        err
+                    );
+                    Vec::new()
+                }
+            };
+
+            vectors.reserve(chunks.len());
+            for (chunk, embedding) in chunks.iter().zip(embeddings.into_iter()) {
+                if embedding.is_empty() {
+                    continue;
+                }
+
+                vectors.push(ChunkVector {
+                    id: None,
+                    file_path: chunk.file_path.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    content_hash: chunk.content_hash.clone(),
+                    embedding,
+                    model_id: EMBEDDING_MODEL_ID.to_string(),
+                    last_modified: chunk.last_modified,
+                });
+            }
+        }
+
+        Ok(PreparedFileIndex {
+            file_path: plan.file_path,
+            metadata: plan.metadata,
+            chunks,
+            symbols,
+            vectors,
+        })
+    }
+
+    fn persist_prepared_file(&mut self, prepared: PreparedFileIndex) -> FlashgrepResult<()> {
+        self.db.delete_file_chunks(&prepared.file_path)?;
+        self.db.delete_file_symbols(&prepared.file_path)?;
+        self.db.delete_file_vectors(&prepared.file_path)?;
+        self.db.insert_file(&prepared.metadata)?;
+
+        for chunk in &prepared.chunks {
+            self.add_chunk_to_tantivy(chunk)?;
+        }
+
+        if !prepared.chunks.is_empty() {
+            self.db.insert_chunks_batch(&prepared.chunks)?;
+        }
+
+        if !prepared.vectors.is_empty() {
+            self.db.upsert_chunk_vectors_batch(&prepared.vectors)?;
+        }
+
+        if !prepared.symbols.is_empty() {
+            self.db.insert_symbols_batch(&prepared.symbols)?;
+        }
+
+        Ok(())
     }
 
     /// Get index statistics
