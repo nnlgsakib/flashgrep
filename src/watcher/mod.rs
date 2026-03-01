@@ -423,7 +423,8 @@ Thumbs.db
             content_hash,
         };
 
-        self.index_state.update_file(rel_path.to_path_buf(), file_metadata)?;
+        self.index_state
+            .update_file(rel_path.to_path_buf(), file_metadata)?;
 
         // Periodically save index state (every 100 changes)
         // In production, this should be debounced

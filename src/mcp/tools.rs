@@ -14,11 +14,159 @@ pub struct ToolDefinition {
 pub fn create_tools() -> Vec<ToolDefinition> {
     vec![
         create_glob_tool(),
+        create_fs_create_tool(),
+        create_fs_read_tool(),
+        create_fs_write_tool(),
+        create_fs_list_tool(),
+        create_fs_stat_tool(),
+        create_fs_copy_tool(),
+        create_fs_move_tool(),
+        create_fs_remove_tool(),
         create_search_tool(),
         create_search_in_directory_tool(),
         create_search_with_context_tool(),
         create_search_by_regex_tool(),
     ]
+}
+
+fn create_fs_create_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_create".to_string(),
+        description: "Create file or directory with deterministic semantics".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "dir": {"type": "boolean"},
+                "parents": {"type": "boolean"},
+                "overwrite": {"type": "boolean"},
+                "dry_run": {"type": "boolean"}
+            },
+            "required": ["path"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn create_fs_read_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_read".to_string(),
+        description: "Read full file content with typed errors".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn create_fs_write_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_write".to_string(),
+        description: "Write or append file content".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "append": {"type": "boolean"},
+                "parents": {"type": "boolean"},
+                "overwrite": {"type": "boolean"},
+                "dry_run": {"type": "boolean"}
+            },
+            "required": ["path", "content"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn create_fs_list_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_list".to_string(),
+        description: "List directory entries with deterministic sort/pagination".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "include_hidden": {"type": "boolean"},
+                "sort_by": {"type": "string", "enum": ["path", "name", "modified", "size"]},
+                "sort_order": {"type": "string", "enum": ["asc", "desc"]},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1}
+            },
+            "required": ["path"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn create_fs_stat_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_stat".to_string(),
+        description: "Return file or directory metadata".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn create_fs_copy_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_copy".to_string(),
+        description: "Copy files/directories with overwrite and dry-run controls".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "src": {"type": "string"},
+                "dst": {"type": "string"},
+                "recursive": {"type": "boolean"},
+                "overwrite": {"type": "boolean"},
+                "dry_run": {"type": "boolean"}
+            },
+            "required": ["src", "dst"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn create_fs_move_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_move".to_string(),
+        description: "Move files/directories with overwrite and dry-run controls".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "src": {"type": "string"},
+                "dst": {"type": "string"},
+                "overwrite": {"type": "boolean"},
+                "dry_run": {"type": "boolean"}
+            },
+            "required": ["src", "dst"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
+}
+
+fn create_fs_remove_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "fs_remove".to_string(),
+        description: "Remove files/directories with recursive/force/dry-run controls".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "recursive": {"type": "boolean"},
+                "force": {"type": "boolean"},
+                "dry_run": {"type": "boolean"}
+            },
+            "required": ["path"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
 }
 
 fn create_glob_tool() -> ToolDefinition {
@@ -85,6 +233,14 @@ fn create_bootstrap_alias_tool(name: &str) -> ToolDefinition {
                 "force": {
                     "type": "boolean",
                     "description": "Force reinjection even if already injected in this session"
+                },
+                "allow_repo_override": {
+                    "type": "boolean",
+                    "description": "Opt-in gate to load repository-local skills/SKILL.md; default uses embedded payload"
+                },
+                "repo_override_path": {
+                    "type": "string",
+                    "description": "Optional custom path to repository skill markdown when allow_repo_override is true"
                 }
             }
         }),
@@ -93,6 +249,9 @@ fn create_bootstrap_alias_tool(name: &str) -> ToolDefinition {
             "properties": {
                 "status": { "type": "string" },
                 "canonical_trigger": { "type": "string" },
+                "payload_source": { "type": "string" },
+                "fallback_gate": { "type": ["string", "null"] },
+                "fallback_reason_code": { "type": ["string", "null"] },
                 "skill_hash": { "type": "string" },
                 "skill_version": { "type": "string" },
                 "policy": { "type": "array", "items": { "type": "string" } },

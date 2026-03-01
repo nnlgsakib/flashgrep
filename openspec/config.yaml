@@ -1,20 +1,30 @@
-schema: spec-driven
+context: |
+  Project: Flashgrep
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+  Flashgrep is written in Rust.
+  It is a fast and efficient replacement for fgrep and glob.
+  It focuses on raw speed, low memory use, and clean CLI behavior.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Core goals:
+  - Extremely fast file scanning
+  - Smart pattern matching
+  - Simple and predictable output
+  - Minimal overhead
+  - Works well on very large codebases
+
+  Philosophy:
+  - Zero bloat
+  - Clear logic
+  - Safe and reliable behavior
+  - Deterministic results
+  - Built for power users and automation
+
+  Design principles:
+  - Spec-driven development
+  - Clear and strict behavior rules
+  - No hidden magic
+  - CLI-first mindset
+  - Consistent pattern handling
+
+  Flashgrep is built to feel simple like fgrep,
+  but powerful like modern search tools.

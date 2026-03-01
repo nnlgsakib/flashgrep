@@ -264,10 +264,27 @@ pub fn get_skill_documentation() -> SkillDocumentation {
                             .to_string(),
                         required: false,
                     },
+                    ParameterDocumentation {
+                        name: "allow_repo_override".to_string(),
+                        type_: "boolean".to_string(),
+                        description:
+                            "Optional opt-in to load skills/SKILL.md from repository; default is embedded payload"
+                                .to_string(),
+                        required: false,
+                    },
+                    ParameterDocumentation {
+                        name: "repo_override_path".to_string(),
+                        type_: "string".to_string(),
+                        description:
+                            "Optional custom path for repo skill override when allow_repo_override is true"
+                                .to_string(),
+                        required: false,
+                    },
                 ],
                 examples: vec![
                     r#"{"trigger": "flashgrep-init", "compact": true}"#.to_string(),
                     r#"{"force": true}"#.to_string(),
+                    r#"{"allow_repo_override": true}"#.to_string(),
                 ],
             }
         } else {
@@ -288,14 +305,16 @@ pub fn get_skill_documentation() -> SkillDocumentation {
     }
 
     SkillDocumentation {
-        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Use flashgrep-init/fgrep-boot to inject Flashgrep-first guidance and prefer indexed tools (query/files/symbol/read_code/write_code) over generic grep/glob flows.".to_string(),
+        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Bootstrap now uses embedded skill guidance by default at init, and policy metadata enforces Flashgrep-first routing (query/files/symbol/read_code/write_code) before gated fallback tools.".to_string(),
         commands,
     }
 }
 
 pub fn bootstrap_policy() -> Vec<String> {
     vec![
-        "Prefer Flashgrep tools before generic grep/glob when searching code.".to_string(),
+        "Always use Flashgrep-native tools first; treat them as primary routing.".to_string(),
+        "Do not use native grep/glob/read/write tools unless a declared fallback gate is active."
+            .to_string(),
         "Use query/files/symbol for indexed discovery and navigation.".to_string(),
         "Use read_code with budgets for token-efficient reads.".to_string(),
         "Use write_code for targeted, precondition-safe edits.".to_string(),
@@ -306,11 +325,25 @@ pub fn bootstrap_policy_metadata() -> Value {
     json!({
         "policy_version": "1.0",
         "policy_strength": "strict",
-        "preferred_tools": {
-            "search": ["query", "glob", "files", "get_symbol"],
+        "enforcement_mode": "strict",
+        "preferred_tool_families": {
+            "query": ["query"],
+            "files_glob": ["files", "glob"],
+            "symbol": ["symbol", "get_symbol"],
             "read": ["read_code", "get_slice"],
             "write": ["write_code"]
         },
+        "preferred_tools": {
+            "search": ["query", "files", "glob", "symbol", "get_symbol"],
+            "read": ["read_code", "get_slice"],
+            "write": ["write_code"]
+        },
+        "fallback_gate_ids": [
+            "index_unavailable",
+            "unsupported_operation",
+            "tool_runtime_failure",
+            "repo_override_read_failed"
+        ],
         "fallback_rules": [
             {
                 "gate_id": "index_unavailable",
@@ -329,12 +362,24 @@ pub fn bootstrap_policy_metadata() -> Value {
                 "condition": "flashgrep_tool_returns_error_after_valid_retry",
                 "allowed_tools": ["search", "search-in-directory", "search-with-context", "search-by-regex"],
                 "reason_code": "flashgrep_tool_runtime_failure"
+            },
+            {
+                "gate_id": "repo_override_read_failed",
+                "condition": "repository_skill_override_requested_but_not_readable",
+                "allowed_tools": ["bootstrap_skill", "flashgrep-init", "fgrep-boot", "flashgrep_init", "fgrep_boot"],
+                "reason_code": "repo_override_unavailable"
             }
         ],
         "compliance_checks": {
             "requires_bootstrap_injected": true,
             "requires_gated_fallback_reason": true,
+            "requires_payload_source_metadata": true,
             "recommended_preferred_tool_hit_rate": ">=0.9"
+        },
+        "prohibited_native_tools": {
+            "search": ["grep", "rg", "find", "Grep"],
+            "discovery": ["Glob", "shell_glob_expansion"],
+            "file_io": ["Read", "Write", "cat", "sed", "awk"]
         }
     })
 }

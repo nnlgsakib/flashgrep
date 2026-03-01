@@ -100,7 +100,8 @@ impl InitialScanner {
 
         // Load previous index for comparison
         let previous_paths = self.index_state.get_all_paths()?;
-        let previous_paths_set: std::collections::HashSet<_> = previous_paths.iter().cloned().collect();
+        let previous_paths_set: std::collections::HashSet<_> =
+            previous_paths.iter().cloned().collect();
         let mut current_paths = std::collections::HashSet::new();
 
         // Scan all files
@@ -271,12 +272,12 @@ impl InitialScanner {
 
     /// Extract metadata from a file
     async fn extract_file_metadata(&self, path: &Path) -> FlashgrepResult<FileMetadata> {
-        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
-            crate::FlashgrepError::Io(e)
-        })?;
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| crate::FlashgrepError::Io(e))?;
 
         let size = metadata.len();
-        
+
         let mtime = metadata
             .modified()
             .ok()
@@ -296,9 +297,9 @@ impl InitialScanner {
 
     /// Compute SHA-256 hash of file content (first 8KB only)
     async fn compute_content_hash(&self, path: &Path) -> FlashgrepResult<String> {
-        let content = tokio::fs::read(path).await.map_err(|e| {
-            crate::FlashgrepError::Io(e)
-        })?;
+        let content = tokio::fs::read(path)
+            .await
+            .map_err(|e| crate::FlashgrepError::Io(e))?;
 
         let hash_input = if content.len() > MAX_HASH_BYTES {
             &content[..MAX_HASH_BYTES]
@@ -312,9 +313,7 @@ impl InitialScanner {
 
     /// Get the relative path from the repository root
     fn relative_path(&self, path: &Path) -> PathBuf {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_path_buf()
+        path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
     }
 }
 
@@ -435,7 +434,12 @@ mod tests {
         let index_state = ThreadSafeIndexState::new();
 
         // First scan
-        let scanner = InitialScanner::new(root.clone(), config.clone(), ignore_patterns.clone(), index_state.clone());
+        let scanner = InitialScanner::new(
+            root.clone(),
+            config.clone(),
+            ignore_patterns.clone(),
+            index_state.clone(),
+        );
         let result = scanner.scan().await?;
         assert_eq!(result.files_added, 1);
 

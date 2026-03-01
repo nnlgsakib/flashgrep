@@ -1,8 +1,11 @@
+mod fs;
+
 use crate::config::paths::{get_repo_root, FlashgrepPaths};
 use crate::config::Config;
 use crate::db::Database;
 use crate::index::engine::Indexer;
 use crate::mcp::stdio::McpStdioServer;
+use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::search::{QueryMode, QueryOptions, Searcher};
 use crate::watcher::registry::{is_process_alive, kill_process, WatcherRegistry};
 use crate::watcher::FileWatcher;
@@ -13,6 +16,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::info;
+
+use self::fs::{handle_fs_command, FsCommands};
 
 /// Flashgrep CLI
 #[derive(Parser)]
@@ -59,6 +64,21 @@ pub enum FileSortOrder {
     Desc,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum RunOutcome {
+    Success,
+    NoMatch,
+}
+
+impl RunOutcome {
+    pub fn exit_code(self) -> u8 {
+        match self {
+            RunOutcome::Success => 0,
+            RunOutcome::NoMatch => 1,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct CliResult {
     file_path: String,
@@ -72,6 +92,8 @@ struct CliResult {
     relevance_score: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
 }
@@ -108,6 +130,9 @@ pub enum Commands {
     Query {
         /// Search text/query
         text: String,
+        /// Fixed-string pattern (repeatable, grep -F style)
+        #[arg(short = 'F', long = "fixed-string")]
+        fixed_strings: Vec<String>,
         /// Path to the repository (defaults to current directory)
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
@@ -135,6 +160,14 @@ pub enum Commands {
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputMode::Text)]
         output: OutputMode,
+    },
+    /// Filesystem operations (create/list/stat/copy/move/remove)
+    Fs {
+        #[command(subcommand)]
+        command: FsCommands,
+        /// Path to the repository (used for resolving relative paths)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
     },
     /// List indexed files (glob-like)
     Files {
@@ -240,7 +273,7 @@ pub enum Commands {
 }
 
 /// Run the CLI
-pub async fn run() -> FlashgrepResult<()> {
+pub async fn run() -> FlashgrepResult<RunOutcome> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -262,7 +295,7 @@ pub async fn run() -> FlashgrepResult<()> {
             println!("  Chunks created: {}", stats.total_chunks);
             println!("  Symbols detected: {}", stats.total_symbols);
 
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Start { path, background } => {
             let repo_root = get_repo_root(path.as_ref())?;
@@ -272,7 +305,7 @@ pub async fn run() -> FlashgrepResult<()> {
             // Check if index exists
             if !FlashgrepPaths::new(&canonical_repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
-                return Ok(());
+                return Ok(RunOutcome::Success);
             }
 
             let mut registry = WatcherRegistry::load_default()?;
@@ -286,7 +319,7 @@ pub async fn run() -> FlashgrepResult<()> {
                         existing.pid
                     );
                     print_active_watchers(&registry);
-                    return Ok(());
+                    return Ok(RunOutcome::Success);
                 }
             }
 
@@ -304,7 +337,7 @@ pub async fn run() -> FlashgrepResult<()> {
                         return Err(e);
                     }
                 }
-                return Ok(());
+                return Ok(RunOutcome::Success);
             }
 
             registry.upsert(&canonical_repo_root, std::process::id())?;
@@ -322,11 +355,11 @@ pub async fn run() -> FlashgrepResult<()> {
             };
 
             println!("File watcher starting...");
-            
+
             // Run the watcher with initial scan
             watcher.watch_with_initial_scan().await?;
 
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Stop { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
@@ -366,16 +399,17 @@ pub async fn run() -> FlashgrepResult<()> {
 
             print_active_watchers(&registry);
 
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Watchers => {
             let mut registry = WatcherRegistry::load_default()?;
             let _ = registry.cleanup_stale()?;
             print_active_watchers(&registry);
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Query {
             text,
+            fixed_strings,
             path,
             limit,
             mode,
@@ -389,6 +423,10 @@ pub async fn run() -> FlashgrepResult<()> {
             let (repo_root, searcher) = create_searcher(path.as_ref())?;
             let mut options = QueryOptions::new(text.clone(), limit.max(1));
             options.mode = mode.into();
+            options.fixed_patterns = fixed_strings;
+            if !options.fixed_patterns.is_empty() {
+                options.mode = QueryMode::Literal;
+            }
             options.case_sensitive = !ignore_case;
             options.include = include;
             options.exclude = exclude;
@@ -414,7 +452,8 @@ pub async fn run() -> FlashgrepResult<()> {
                     end_line: Some(r.end_line),
                     symbol_name: r.symbol_name,
                     relevance_score: Some(r.relevance_score),
-                    preview: Some(r.preview),
+                    preview: Some(r.preview.clone()),
+                    match_text: r.preview.lines().next().map(|s| s.to_string()),
                     content: r.content,
                 })
                 .collect();
@@ -429,7 +468,11 @@ pub async fn run() -> FlashgrepResult<()> {
                     query_response.scanned_files
                 ),
             )?;
-            Ok(())
+            if rendered.is_empty() {
+                Ok(RunOutcome::NoMatch)
+            } else {
+                Ok(RunOutcome::Success)
+            }
         }
         Commands::Files {
             filter,
@@ -462,11 +505,8 @@ pub async fn run() -> FlashgrepResult<()> {
                 .collect();
 
             files.retain(|path| {
-                let relative = path
-                    .strip_prefix(&repo_root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+                let relative = path.strip_prefix(&repo_root).unwrap_or(path).to_path_buf();
+                let relative = normalize_path_for_matching(&relative);
 
                 if !include_hidden && relative.split('/').any(|part| part.starts_with('.')) {
                     return false;
@@ -533,6 +573,7 @@ pub async fn run() -> FlashgrepResult<()> {
                     symbol_name: None,
                     relevance_score: None,
                     preview: None,
+                    match_text: None,
                     content: None,
                 })
                 .collect();
@@ -542,7 +583,12 @@ pub async fn run() -> FlashgrepResult<()> {
                 output,
                 &format!("files in {}", repo_root.display()),
             )?;
-            Ok(())
+            Ok(RunOutcome::Success)
+        }
+        Commands::Fs { command, path } => {
+            let repo_root = get_repo_root(path.as_ref())?;
+            handle_fs_command(&repo_root, command)?;
+            Ok(RunOutcome::Success)
         }
         Commands::Symbol {
             symbol_name,
@@ -569,6 +615,7 @@ pub async fn run() -> FlashgrepResult<()> {
                     symbol_name: Some(s.symbol_name),
                     relevance_score: None,
                     preview: Some(format!("type={}", s.symbol_type)),
+                    match_text: None,
                     content: None,
                 })
                 .collect();
@@ -578,7 +625,7 @@ pub async fn run() -> FlashgrepResult<()> {
                 output,
                 &format!("symbol {} in {}", symbol_name, repo_root.display()),
             )?;
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Slice {
             file_path,
@@ -618,17 +665,18 @@ pub async fn run() -> FlashgrepResult<()> {
                 symbol_name: None,
                 relevance_score: None,
                 preview: None,
+                match_text: None,
                 content: Some(content),
             }];
             render_results(&rendered, output, "slice")?;
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Stats { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
 
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
-                return Ok(());
+                return Ok(RunOutcome::Success);
             }
 
             let paths = FlashgrepPaths::new(&repo_root);
@@ -648,7 +696,7 @@ pub async fn run() -> FlashgrepResult<()> {
                 }
             }
 
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Mcp {
             path,
@@ -661,7 +709,7 @@ pub async fn run() -> FlashgrepResult<()> {
             // Check if index exists
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
-                return Ok(());
+                return Ok(RunOutcome::Success);
             }
 
             // Create config with optional overrides
@@ -691,7 +739,7 @@ pub async fn run() -> FlashgrepResult<()> {
             // Run server and wait for shutdown
             server.start().await?;
 
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::McpStdio { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
@@ -700,7 +748,7 @@ pub async fn run() -> FlashgrepResult<()> {
             // Check if index exists
             if !FlashgrepPaths::new(&repo_root).exists() {
                 eprintln!("⚠ No index found. Run 'flashgrep index' first.");
-                return Ok(());
+                return Ok(RunOutcome::Success);
             }
 
             // Create and start stdio MCP server
@@ -709,14 +757,14 @@ pub async fn run() -> FlashgrepResult<()> {
             // Run server (this blocks on stdin)
             server.start()?;
 
-            Ok(())
+            Ok(RunOutcome::Success)
         }
         Commands::Clear { path } => {
             let repo_root = get_repo_root(path.as_ref())?;
 
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found.");
-                return Ok(());
+                return Ok(RunOutcome::Success);
             }
 
             print!("Are you sure you want to clear the index? [y/N]: ");
@@ -734,7 +782,7 @@ pub async fn run() -> FlashgrepResult<()> {
                 println!("Cancelled");
             }
 
-            Ok(())
+            Ok(RunOutcome::Success)
         }
     }
 }
@@ -742,16 +790,10 @@ pub async fn run() -> FlashgrepResult<()> {
 fn compile_cli_globs(patterns: &[String]) -> FlashgrepResult<Vec<glob::Pattern>> {
     patterns
         .iter()
-        .filter_map(|p| {
-            let trimmed = p.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        })
+        .map(|p| normalize_glob_pattern(p))
+        .filter_map(|p| if p.is_empty() { None } else { Some(p) })
         .map(|p| {
-            glob::Pattern::new(p).map_err(|e| {
+            glob::Pattern::new(&p).map_err(|e| {
                 crate::FlashgrepError::Config(format!("Invalid glob pattern '{}': {}", p, e))
             })
         })
@@ -955,6 +997,7 @@ mod tests {
             symbol_name: Some("main".to_string()),
             relevance_score: Some(1.0),
             preview: Some("fn main".to_string()),
+            match_text: Some("fn main".to_string()),
             content: None,
         }];
 

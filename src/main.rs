@@ -6,10 +6,11 @@ async fn main() -> ExitCode {
     init_logging();
 
     match flashgrep::cli::run().await {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(outcome) => ExitCode::from(outcome.exit_code()),
         Err(e) => {
             eprintln!("Error: {}", e);
-            ExitCode::from(1)
+            let code = e.exit_code().clamp(1, 255) as u8;
+            ExitCode::from(code)
         }
     }
 }

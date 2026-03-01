@@ -1,0 +1,27 @@
+# Flashgrep ignore file
+# Add patterns to exclude files/directories from indexing
+# Uses gitignore-style syntax
+
+# Build directories
+target/
+build/
+dist/
+node_modules/
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

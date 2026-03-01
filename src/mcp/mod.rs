@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod code_io;
+pub mod fs_tools;
 pub mod glob_tool;
 pub mod safety;
 pub mod skill;
@@ -11,14 +12,19 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::mcp::bootstrap::{build_bootstrap_payload, is_bootstrap_tool};
 use crate::mcp::code_io::{read_code, write_code};
+use crate::mcp::fs_tools::{
+    fs_copy, fs_create, fs_list, fs_move, fs_read, fs_remove, fs_stat, fs_write,
+};
 use crate::mcp::glob_tool::run_glob;
 use crate::mcp::safety::{
-    check_arguments_size, chunking_guidance, invalid_params_error, payload_too_large_error,
-    MAX_MCP_GET_SLICE_BYTES, MAX_MCP_REQUEST_BYTES, MAX_MCP_RESPONSE_BYTES,
+    check_arguments_size, chunking_guidance, invalid_params_error, map_error_with_not_found,
+    payload_too_large_error, MAX_MCP_GET_SLICE_BYTES, MAX_MCP_REQUEST_BYTES,
+    MAX_MCP_RESPONSE_BYTES,
 };
 use crate::search::{QueryOptions, Searcher};
 use crate::FlashgrepResult;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -277,6 +283,8 @@ async fn handle_request(
 
             if file_path.is_empty() {
                 Some(serde_json::json!({"error": "Missing file_path parameter"}))
+            } else if !std::path::Path::new(file_path).exists() {
+                Some(crate::mcp::safety::not_found_error(file_path, "file"))
             } else {
                 let mut args = serde_json::json!({
                     "file_path": file_path,
@@ -303,7 +311,7 @@ async fn handle_request(
                         "continuation": payload["continuation"],
                         "applied_limits": payload["applied_limits"],
                     })),
-                    Err(e) => Some(invalid_params_error(&e.to_string())),
+                    Err(e) => Some(map_error_with_not_found(&e, Some(file_path), Some("file"))),
                 }
             }
         }
@@ -311,9 +319,19 @@ async fn handle_request(
             if let Err(e) = check_arguments_size(&request.params, MAX_MCP_REQUEST_BYTES) {
                 Some(invalid_params_error(&e.to_string()))
             } else {
+                if let Some(fp) = request.params.get("file_path").and_then(Value::as_str) {
+                    if !std::path::Path::new(fp).exists() {
+                        return Ok(JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id: request.id,
+                            result: Some(crate::mcp::safety::not_found_error(fp, "file")),
+                            error: None,
+                        });
+                    }
+                }
                 match read_code(paths, &request.params) {
                     Ok(payload) => Some(payload),
-                    Err(e) => Some(invalid_params_error(&e.to_string())),
+                    Err(e) => Some(map_error_with_not_found(&e, None, None)),
                 }
             }
         }
@@ -323,18 +341,37 @@ async fn handle_request(
             } else {
                 match write_code(&request.params) {
                     Ok(payload) => Some(payload),
-                    Err(e) => Some(invalid_params_error(&e.to_string())),
+                    Err(e) => Some(map_error_with_not_found(
+                        &e,
+                        request.params.get("file_path").and_then(Value::as_str),
+                        Some("file"),
+                    )),
                 }
             }
         }
         "glob" => match run_glob(&request.params) {
             Ok(payload) => Some(payload),
-            Err(e) => Some(serde_json::json!({
-                "results": [],
-                "error": "invalid_params",
-                "message": e.to_string(),
-            })),
+            Err(e) => {
+                if let Some(path) = request.params.get("path").and_then(Value::as_str) {
+                    let p = std::path::Path::new(path);
+                    if !p.exists() {
+                        Some(crate::mcp::safety::not_found_error(path, "directory"))
+                    } else {
+                        Some(invalid_params_error(&e.to_string()))
+                    }
+                } else {
+                    Some(invalid_params_error(&e.to_string()))
+                }
+            }
         },
+        "fs_create" => Some(fs_create(&request.params)?),
+        "fs_read" => Some(fs_read(&request.params)?),
+        "fs_write" => Some(fs_write(&request.params)?),
+        "fs_list" => Some(fs_list(&request.params)?),
+        "fs_stat" => Some(fs_stat(&request.params)?),
+        "fs_copy" => Some(fs_copy(&request.params)?),
+        "fs_move" => Some(fs_move(&request.params)?),
+        "fs_remove" => Some(fs_remove(&request.params)?),
         method if is_bootstrap_tool(method) => Some(handle_skill_bootstrap_payload(
             paths,
             request.method.as_str(),
@@ -825,6 +862,89 @@ mod tests {
             .await
             .expect("follow response");
         assert!(follow_resp.result.is_some());
+    }
+
+    #[tokio::test]
+    async fn tcp_read_code_missing_file_returns_typed_not_found() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&root);
+
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "read_code".to_string(),
+            params: serde_json::json!({
+                "file_path": root.join("missing.txt").to_string_lossy()
+            }),
+            id: Some(1),
+        };
+
+        let response = handle_request(req, &paths, None).await.expect("response");
+        let payload = response.result.expect("payload");
+        assert_eq!(
+            payload["error"],
+            serde_json::Value::String("not_found".to_string())
+        );
+        assert_eq!(
+            payload["reason_code"],
+            serde_json::Value::String("file_not_found".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_fs_tools_cover_lifecycle_paths() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&root);
+
+        let create_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "fs_create".to_string(),
+            params: serde_json::json!({
+                "path": root.join("tmp/a.txt").to_string_lossy(),
+                "parents": true
+            }),
+            id: Some(1),
+        };
+        let create_res = handle_request(create_req, &paths, None)
+            .await
+            .expect("create response")
+            .result
+            .expect("create payload");
+        assert_eq!(create_res["ok"], serde_json::Value::Bool(true));
+
+        let list_missing_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "fs_list".to_string(),
+            params: serde_json::json!({"path": root.join("missing").to_string_lossy()}),
+            id: Some(2),
+        };
+        let list_missing = handle_request(list_missing_req, &paths, None)
+            .await
+            .expect("list missing response")
+            .result
+            .expect("list missing payload");
+        assert_eq!(
+            list_missing["error"],
+            serde_json::Value::String("not_found".to_string())
+        );
+
+        let remove_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "fs_remove".to_string(),
+            params: serde_json::json!({
+                "path": root.join("tmp").to_string_lossy(),
+                "recursive": true,
+                "force": true
+            }),
+            id: Some(3),
+        };
+        let remove_res = handle_request(remove_req, &paths, None)
+            .await
+            .expect("remove response")
+            .result
+            .expect("remove payload");
+        assert_eq!(remove_res["ok"], serde_json::Value::Bool(true));
     }
 
     #[tokio::test]

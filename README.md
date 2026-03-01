@@ -122,6 +122,25 @@ flashgrep files --pattern "src/**/*.rs" --exclude "**/target/**" --sort-by path 
 flashgrep files --pattern "**/*" --offset 200 --limit 100
 ```
 
+#### `flashgrep fs <SUBCOMMAND> [PATH]`
+
+Run filesystem operations with deterministic behavior for automation scripts.
+
+```bash
+# Create file and directory
+flashgrep fs create notes/todo.txt --parents
+flashgrep fs create build/output --dir --parents
+
+# List and stat with machine-readable JSON
+flashgrep fs list src --sort-by path --sort-order asc --offset 0 --limit 50 --output json
+flashgrep fs stat src/main.rs --output json
+
+# Copy/move/remove with safety controls
+flashgrep fs copy src/main.rs backup/main.rs --overwrite
+flashgrep fs move backup/main.rs archive/main.rs --dry-run
+flashgrep fs remove archive --recursive --force
+```
+
 #### `flashgrep symbol <SYMBOL_NAME> [PATH]`
 
 Find symbol entries from indexed metadata.
@@ -174,6 +193,9 @@ Flashgrep is designed to replace repeated `grep` + filesystem `glob` workflows w
 - Fresh index: run `flashgrep index` first; run watcher (`flashgrep start -b`) for incremental freshness.
 - Validation errors: invalid parameter combinations return structured errors (CLI config error or MCP `invalid_params`).
 - Large MCP reads/writes: prefer chunked workflows and continuation fields over single oversized payloads.
+- Missing paths: path-aware MCP tools return typed not-found diagnostics with `error=not_found`, `reason_code`, `target_kind`, and `target_path`.
+- Cross-platform behavior: path filters normalize `/` and `\` separators for deterministic include/exclude matching.
+- Filesystem safety: mutating `flashgrep fs` operations support `--dry-run`, and overwrite/delete paths require explicit flags.
 
 ### MCP Setup (Stdio)
 
@@ -182,8 +204,9 @@ Use stdio transport for MCP clients that launch local tools as child processes.
 1. Build and install `flashgrep`.
 2. Index the repository you want to search: `flashgrep index`.
 3. Configure your MCP client with the Flashgrep server entry.
-4. Start your client and verify Flashgrep tools are available (`query`, `glob`, `get_slice`, `read_code`, `write_code`, `get_symbol`, `list_files`, `stats`, `bootstrap_skill`, `flashgrep-init`, `fgrep-boot`).
-5. Run bootstrap from your agent via MCP tool call (`bootstrap_skill` or `flashgrep_init`) so the session gets Flashgrep-first guidance without manual skill setup.
+4. Start your client and verify Flashgrep tools are available (`query`, `glob`, `get_slice`, `read_code`, `write_code`, `fs_create`, `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_copy`, `fs_move`, `fs_remove`, `get_symbol`, `list_files`, `stats`, `bootstrap_skill`, `flashgrep-init`, `fgrep-boot`).
+5. Bootstrap is injected automatically during `initialize` using embedded policy guidance.
+6. Optionally call `bootstrap_skill` (or alias) to inspect/refresh session policy metadata.
 
 Example MCP config:
 
@@ -205,6 +228,7 @@ Example MCP config:
 Notes:
 - `RUST_LOG=info` is optional and mainly useful for troubleshooting.
 - If your client cannot connect, run `flashgrep index` again and verify `flashgrep stats` works in the same repository.
+- For policy routing/debug issues, see `docs/bootstrap-policy-troubleshooting.md`.
 
 Bootstrap example (`tools/call`):
 
@@ -225,19 +249,30 @@ Bootstrap example (`tools/call`):
 Bootstrap behavior:
 - First call returns `status: injected`
 - Repeated call in same server session returns `status: already_injected`
-- Errors return typed codes such as `invalid_trigger`, `skill_not_found`, or `skill_unreadable`
+- Embedded payload is default (`payload_source: embedded`) and does not require local skill files
+- Optional repository override is opt-in (`allow_repo_override: true`) and falls back deterministically when unreadable
 - Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
 
 Bootstrap policy metadata:
 - `policy_metadata.policy_strength`: enforcement mode (default: `strict`)
+- `policy_metadata.enforcement_mode`: strict policy mode for clients
+- `policy_metadata.payload_source`: payload origin (`embedded` or `repo_override`)
+- `policy_metadata.bootstrap_state`: current session state (`injected` or `already_injected`)
+- `policy_metadata.preferred_tool_families`: explicit native Flashgrep routing families
 - `policy_metadata.preferred_tools`: Flashgrep-first tool routing groups
 - `policy_metadata.fallback_rules`: allowed fallback gates with typed `reason_code`
 - `policy_metadata.compliance_checks`: client-side compliance expectations
+- `policy_metadata.prohibited_native_tools`: native/host tools to avoid unless fallback gate is active
 
 Fallback gate defaults:
 - `flashgrep_index_unavailable`
 - `flashgrep_operation_not_supported`
 - `flashgrep_tool_runtime_failure`
+- `repo_override_unavailable`
+
+Native-tool routing expectations:
+- Agents should avoid host-native `Read`/`Write`/`Glob`/`Grep` and shell `grep`/`cat`/ad-hoc globbing unless a declared fallback gate is active.
+- Preferred Flashgrep routes remain `query`, `files`/`glob`, `symbol`/`get_symbol`, `read_code`, `write_code`.
 
 Compatibility and rollback notes:
 - Legacy bootstrap fields (`status`, `canonical_trigger`, `skill_hash`, `skill_version`, `policy`) remain available.
@@ -247,10 +282,11 @@ Compatibility and rollback notes:
 
 Flashgrep provides skill documentation that can be used by any coding agent:
 
-- Primary (agent-agnostic): `skills/SKILL.md`
+- Primary runtime source: embedded `skills/SKILL.md` payload compiled into the binary
+- Canonical editable source: `skills/SKILL.md`
 - Optional OpenCode-managed path: `.opencode/skills/flashgrep-mcp/SKILL.md`
 
-Use `skills/SKILL.md` as the default generic guide. Use the `.opencode/` path only when your workflow explicitly uses OpenCode-managed skills.
+Use `skills/SKILL.md` as the canonical authoring source. Runtime bootstrap guidance is embedded at build time, so missing local skill files do not block injection.
 
 ### MCP Server API
 
@@ -258,7 +294,7 @@ The MCP server exposes JSON-RPC methods for coding agents. See [MCP Setup (Stdio
 
 **Available Methods:**
 
-#### `bootstrap_skill(trigger?, compact?, force?)`
+#### `bootstrap_skill(trigger?, compact?, force?, allow_repo_override?, repo_override_path?)`
 
 Bootstrap Flashgrep skill guidance into the current MCP session.
 
@@ -312,6 +348,27 @@ Supported options include:
   "id": 8
 }
 ```
+
+If the provided root `path` does not exist, glob returns typed not-found diagnostics:
+
+```json
+{
+  "error": "not_found",
+  "reason_code": "directory_not_found",
+  "target_kind": "directory",
+  "target_path": "..."
+}
+```
+
+#### `fs_create`, `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_copy`, `fs_move`, `fs_remove`
+
+MCP filesystem lifecycle tools for deterministic automation-safe operations.
+
+- Mutations (`fs_write`, `fs_copy`, `fs_move`, `fs_remove`) support `dry_run`.
+- Conflict-sensitive operations support `overwrite`.
+- Directory removal supports `recursive` and `force`.
+- List/stat responses include stable metadata fields (`path`, `file_type`, `size`, `modified_unix`, `readonly`).
+- Missing paths use typed not-found diagnostics (`file_not_found`, `directory_not_found`, `path_not_found`).
 
 #### `query(text, limit)`
 

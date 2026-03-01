@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Budget-constrained code reads
-The system MUST provide code read operations that enforce caller-provided `max_tokens`, `max_bytes`, and `max_lines` limits with deterministic truncation behavior and MUST support continuation loops to complete arbitrarily large logical reads.
+The system MUST provide code read operations that enforce caller-provided `max_tokens`, `max_bytes`, and `max_lines` limits with deterministic truncation behavior and MUST support continuation loops to complete arbitrarily large logical reads. When a requested file path is missing, the read operation MUST return a typed machine-readable not-found payload rather than ambiguous generic errors.
 
 #### Scenario: Read respects explicit limits
 - **WHEN** a caller requests a file read with one or more explicit budget limits
@@ -14,6 +14,10 @@ The system MUST provide code read operations that enforce caller-provided `max_t
 #### Scenario: Full logical read completed via continuation
 - **WHEN** requested content is larger than one bounded response
 - **THEN** the system MUST allow repeated continuation requests until the full requested scope is retrieved exactly
+
+#### Scenario: Missing file read target returns typed not-found
+- **WHEN** a caller requests `read_code` or `get_slice` for a non-existent file path
+- **THEN** the system MUST return a deterministic not-found error payload including target path and reason code
 
 ### Requirement: Minimal-diff writes with precondition safety
 The system MUST provide write operations that apply replacements only within explicit line ranges, validate optional preconditions before mutating files, and support chunked replacement workflows for very large content.

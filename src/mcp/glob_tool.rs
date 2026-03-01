@@ -1,3 +1,4 @@
+use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::{FlashgrepError, FlashgrepResult};
 use glob::{MatchOptions, Pattern};
 use serde_json::{json, Value};
@@ -333,8 +334,10 @@ fn normalize_extensions(exts: Vec<String>) -> Vec<String> {
 fn compile_patterns(patterns: &[String]) -> FlashgrepResult<Vec<Pattern>> {
     patterns
         .iter()
+        .map(|p| normalize_glob_pattern(p))
+        .filter(|p| !p.is_empty())
         .map(|p| {
-            Pattern::new(p)
+            Pattern::new(&p)
                 .map_err(|e| FlashgrepError::Config(format!("Invalid glob pattern '{}': {}", p, e)))
         })
         .collect()
@@ -357,7 +360,7 @@ fn entry_allowed(path: &Path, root: &Path, include_hidden: bool) -> bool {
 
 fn relative_unix_path(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
+    normalize_path_for_matching(rel)
 }
 
 fn matches_any(path: &str, patterns: &[Pattern], case_sensitive: bool) -> bool {
@@ -586,5 +589,62 @@ mod tests {
         for p in &first_paths {
             assert!(!second_paths.contains(p));
         }
+    }
+
+    #[test]
+    fn supports_character_class_pattern() {
+        let (_tmp, root) = setup();
+        let result = run_glob(&json!({
+            "path": root,
+            "pattern": "src/*.[rl][si]"
+        }))
+        .expect("glob result");
+
+        let paths = result["results"].as_array().expect("results array");
+        assert!(paths.iter().any(|p| {
+            p["relative_path"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("main.rs")
+        }));
+    }
+
+    #[test]
+    fn hidden_paths_respected_by_include_hidden_flag() {
+        let (_tmp, root) = setup();
+        let hidden_excluded = run_glob(&json!({
+            "path": root,
+            "pattern": "**/*.rs",
+            "include_hidden": false
+        }))
+        .expect("glob result without hidden");
+        let hidden_included = run_glob(&json!({
+            "path": root,
+            "pattern": "**/*.rs",
+            "include_hidden": true
+        }))
+        .expect("glob result with hidden");
+
+        let excluded_empty: Vec<Value> = Vec::new();
+        let excluded_paths: Vec<String> = hidden_excluded["results"]
+            .as_array()
+            .unwrap_or(&excluded_empty)
+            .iter()
+            .filter_map(|v| v["relative_path"].as_str().map(|s| s.to_string()))
+            .collect();
+        let included_empty: Vec<Value> = Vec::new();
+        let included_paths: Vec<String> = hidden_included["results"]
+            .as_array()
+            .unwrap_or(&included_empty)
+            .iter()
+            .filter_map(|v| v["relative_path"].as_str().map(|s| s.to_string()))
+            .collect();
+
+        assert!(!excluded_paths
+            .iter()
+            .any(|p| p.contains(".hidden/secret.rs")));
+        assert!(included_paths
+            .iter()
+            .any(|p| p.contains(".hidden/secret.rs")));
     }
 }

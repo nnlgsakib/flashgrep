@@ -1,5 +1,6 @@
 use crate::db::models::{SearchResult, Symbol};
 use crate::db::Database;
+use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::FlashgrepError;
 use crate::FlashgrepResult;
 use glob::{MatchOptions, Pattern};
@@ -20,6 +21,7 @@ pub enum QueryMode {
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
     pub text: String,
+    pub fixed_patterns: Vec<String>,
     pub limit: usize,
     pub mode: QueryMode,
     pub case_sensitive: bool,
@@ -33,6 +35,7 @@ impl QueryOptions {
     pub fn new(text: String, limit: usize) -> Self {
         Self {
             text,
+            fixed_patterns: Vec::new(),
             limit: limit.max(1),
             mode: QueryMode::Smart,
             case_sensitive: true,
@@ -50,8 +53,9 @@ impl QueryOptions {
             .unwrap_or("")
             .trim()
             .to_string();
+        let fixed_patterns = vec_from_str_array(args.get("fixed_strings"))?;
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let mode = match args.get("mode").and_then(Value::as_str).unwrap_or("smart") {
+        let mut mode = match args.get("mode").and_then(Value::as_str).unwrap_or("smart") {
             "smart" => QueryMode::Smart,
             "literal" => QueryMode::Literal,
             "regex" => QueryMode::Regex,
@@ -62,6 +66,10 @@ impl QueryOptions {
                 )))
             }
         };
+
+        if !fixed_patterns.is_empty() {
+            mode = QueryMode::Literal;
+        }
 
         let flags = args
             .get("regex_flags")
@@ -88,6 +96,7 @@ impl QueryOptions {
 
         Ok(Self {
             text,
+            fixed_patterns,
             limit: limit.max(1),
             mode,
             case_sensitive,
@@ -171,7 +180,21 @@ impl Searcher {
 
         let query_text = match options.mode {
             QueryMode::Smart => options.text.clone(),
-            QueryMode::Literal => format!("\"{}\"", options.text.replace('"', "\\\"")),
+            QueryMode::Literal => {
+                let mut fixed = options.fixed_patterns.clone();
+                if fixed.is_empty() && !options.text.is_empty() {
+                    fixed.push(options.text.clone());
+                }
+                if fixed.is_empty() {
+                    options.text.clone()
+                } else {
+                    fixed
+                        .into_iter()
+                        .map(|v| format!("\"{}\"", v.replace('"', "\\\"")))
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                }
+            }
             QueryMode::Regex => options
                 .text
                 .split(|c: char| !c.is_alphanumeric())
@@ -222,6 +245,7 @@ impl Searcher {
             if !matches_query(
                 &content,
                 &options.text,
+                &options.fixed_patterns,
                 options.case_sensitive,
                 regex.as_ref(),
             ) {
@@ -337,8 +361,10 @@ fn vec_from_str_array(value: Option<&Value>) -> FlashgrepResult<Vec<String>> {
 fn compile_patterns(patterns: &[String]) -> FlashgrepResult<Vec<Pattern>> {
     patterns
         .iter()
+        .map(|p| normalize_glob_pattern(p))
+        .filter(|p| !p.is_empty())
         .map(|p| {
-            Pattern::new(p)
+            Pattern::new(&p)
                 .map_err(|e| FlashgrepError::Config(format!("Invalid glob pattern '{}': {}", p, e)))
         })
         .collect()
@@ -350,7 +376,7 @@ fn path_matches(
     exclude: &[Pattern],
     case_sensitive: bool,
 ) -> bool {
-    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = normalize_path_for_matching(path);
     let opts = MatchOptions {
         case_sensitive,
         require_literal_separator: false,
@@ -387,9 +413,27 @@ fn compile_query_regex(options: &QueryOptions) -> FlashgrepResult<Option<Regex>>
     }
 }
 
-fn matches_query(content: &str, text: &str, case_sensitive: bool, regex: Option<&Regex>) -> bool {
+fn matches_query(
+    content: &str,
+    text: &str,
+    fixed_patterns: &[String],
+    case_sensitive: bool,
+    regex: Option<&Regex>,
+) -> bool {
     if let Some(re) = regex {
         return re.is_match(content);
+    }
+
+    if !fixed_patterns.is_empty() {
+        if case_sensitive {
+            return fixed_patterns.iter().any(|p| content.contains(p));
+        }
+
+        let content_lower = content.to_lowercase();
+        return fixed_patterns
+            .iter()
+            .map(|p| p.to_lowercase())
+            .any(|p| content_lower.contains(&p));
     }
 
     if case_sensitive {
@@ -430,9 +474,22 @@ mod tests {
     fn query_options_parse_defaults() {
         let opts = QueryOptions::from_mcp_args(&json!({"text": "main"})).expect("options");
         assert_eq!(opts.text, "main");
+        assert!(opts.fixed_patterns.is_empty());
         assert_eq!(opts.limit, 10);
         assert_eq!(opts.mode, QueryMode::Smart);
         assert!(opts.case_sensitive);
+    }
+
+    #[test]
+    fn query_options_fixed_strings_force_literal_mode() {
+        let opts = QueryOptions::from_mcp_args(&json!({
+            "text": "main",
+            "mode": "smart",
+            "fixed_strings": ["foo", "bar"]
+        }))
+        .expect("options");
+        assert_eq!(opts.mode, QueryMode::Literal);
+        assert_eq!(opts.fixed_patterns.len(), 2);
     }
 
     #[test]
@@ -466,5 +523,18 @@ mod tests {
         }))
         .expect("options");
         assert_eq!(opts.offset, 25);
+    }
+
+    #[test]
+    fn matches_query_supports_multi_fixed_patterns_case_insensitive() {
+        let fixed = vec!["HELLO".to_string(), "missing".to_string()];
+        assert!(matches_query("say hello world", "", &fixed, false, None));
+    }
+
+    #[test]
+    fn compile_patterns_normalizes_windows_style_separator() {
+        let compiled = compile_patterns(&["src\\**\\*.rs".to_string()]).expect("patterns");
+        assert_eq!(compiled.len(), 1);
+        assert!(compiled[0].matches("src/main.rs"));
     }
 }

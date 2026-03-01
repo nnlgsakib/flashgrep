@@ -5,12 +5,18 @@
 
 use crate::config::paths::FlashgrepPaths;
 use crate::db::Database;
-use crate::mcp::bootstrap::{build_bootstrap_payload, is_bootstrap_tool};
+use crate::mcp::bootstrap::{
+    build_bootstrap_payload, is_bootstrap_tool, CANONICAL_BOOTSTRAP_TRIGGER,
+};
 use crate::mcp::code_io::{read_code, read_code_input_schema, write_code, write_code_input_schema};
+use crate::mcp::fs_tools::{
+    fs_copy, fs_create, fs_list, fs_move, fs_read, fs_remove, fs_stat, fs_write,
+};
 use crate::mcp::glob_tool::{glob_input_schema, run_glob};
 use crate::mcp::safety::{
-    check_arguments_size, chunking_guidance, payload_too_large_error, MAX_MCP_GET_SLICE_BYTES,
-    MAX_MCP_REQUEST_BYTES, MAX_MCP_RESPONSE_BYTES,
+    check_arguments_size, chunking_guidance, map_error_with_not_found, not_found_error,
+    payload_too_large_error, MAX_MCP_GET_SLICE_BYTES, MAX_MCP_REQUEST_BYTES,
+    MAX_MCP_RESPONSE_BYTES,
 };
 use crate::mcp::tools::{create_bootstrap_tools, create_tools};
 use crate::search::{QueryOptions, Searcher};
@@ -137,6 +143,13 @@ impl McpStdioServer {
                     request.params.get("clientInfo")
                 );
 
+                let init_bootstrap = build_bootstrap_payload(
+                    &self.paths,
+                    CANONICAL_BOOTSTRAP_TRIGGER,
+                    &json!({"compact": true}),
+                    &self.skill_injected,
+                )?;
+
                 Some(serde_json::json!({
                     "protocolVersion": "2024-11-05",
                     "serverInfo": {
@@ -152,6 +165,7 @@ impl McpStdioServer {
                             "listChanged": false,
                         },
                     },
+                    "bootstrap": init_bootstrap,
                 }))
             }
             "tools/list" => {
@@ -265,6 +279,14 @@ impl McpStdioServer {
                     "search-in-directory" => self.handle_search_in_directory_tool(&arguments)?,
                     "search-with-context" => self.handle_search_with_context_tool(&arguments)?,
                     "search-by-regex" => self.handle_search_by_regex_tool(&arguments)?,
+                    "fs_create" => self.handle_fs_create_tool(&arguments)?,
+                    "fs_read" => self.handle_fs_read_tool(&arguments)?,
+                    "fs_write" => self.handle_fs_write_tool(&arguments)?,
+                    "fs_list" => self.handle_fs_list_tool(&arguments)?,
+                    "fs_stat" => self.handle_fs_stat_tool(&arguments)?,
+                    "fs_copy" => self.handle_fs_copy_tool(&arguments)?,
+                    "fs_move" => self.handle_fs_move_tool(&arguments)?,
+                    "fs_remove" => self.handle_fs_remove_tool(&arguments)?,
                     tool if is_bootstrap_tool(tool) => {
                         self.handle_skill_bootstrap_tool(tool_name, &arguments)?
                     }
@@ -372,6 +394,19 @@ impl McpStdioServer {
         }
     }
 
+    fn as_tool_envelope(payload: Value) -> FlashgrepResult<Option<Value>> {
+        let is_error = payload
+            .get("ok")
+            .and_then(Value::as_bool)
+            .map(|ok| !ok)
+            .unwrap_or(false)
+            || payload.get("error").and_then(Value::as_str).is_some();
+        Ok(Some(json!({
+            "content": [{"type": "text", "text": serde_json::to_string(&payload)?}],
+            "isError": is_error
+        })))
+    }
+
     fn handle_get_slice_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
         if let Err(e) = check_arguments_size(arguments, MAX_MCP_REQUEST_BYTES) {
             return Ok(Some(json!({
@@ -394,10 +429,14 @@ impl McpStdioServer {
             .unwrap_or(1);
 
         if file_path.is_empty() {
-            return Ok(Some(serde_json::json!({
-                "content": [{"type": "text", "text": "Error: Missing file_path"}],
-                "isError": true
-            })));
+            return Self::as_tool_envelope(json!({
+                "ok": false,
+                "error": "invalid_params",
+                "message": "Missing file_path"
+            }));
+        }
+        if !std::path::Path::new(file_path).exists() {
+            return Self::as_tool_envelope(not_found_error(file_path, "file"));
         }
 
         let mut args = json!({
@@ -415,22 +454,19 @@ impl McpStdioServer {
         }
 
         match read_code(&self.paths, &args) {
-            Ok(payload) => Ok(Some(serde_json::json!({
-                "content": [{"type": "text", "text": serde_json::to_string(&json!({
-                    "file_path": payload["file_path"],
-                    "start_line": payload["start_line"],
-                    "end_line": payload["end_line"],
-                    "content": payload["content"],
-                    "truncated": payload["truncated"],
-                    "continuation_start_line": payload["continuation_start_line"],
-                    "continuation": payload["continuation"],
-                    "applied_limits": payload["applied_limits"]
-                }))?}]
-            }))),
-            Err(e) => Ok(Some(serde_json::json!({
-                "content": [{"type": "text", "text": format!("Error: {}", e)}],
-                "isError": true
-            }))),
+            Ok(payload) => Self::as_tool_envelope(json!({
+                "file_path": payload["file_path"],
+                "start_line": payload["start_line"],
+                "end_line": payload["end_line"],
+                "content": payload["content"],
+                "truncated": payload["truncated"],
+                "continuation_start_line": payload["continuation_start_line"],
+                "continuation": payload["continuation"],
+                "applied_limits": payload["applied_limits"]
+            })),
+            Err(e) => {
+                Self::as_tool_envelope(map_error_with_not_found(&e, Some(file_path), Some("file")))
+            }
         }
     }
 
@@ -479,15 +515,17 @@ impl McpStdioServer {
         let payload = match run_glob(arguments) {
             Ok(payload) => payload,
             Err(e) => {
-                return Ok(Some(json!({
-                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
-                    "isError": true
-                })))
+                if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                    if !std::path::Path::new(path).exists() {
+                        return Self::as_tool_envelope(not_found_error(path, "directory"));
+                    }
+                }
+                return Self::as_tool_envelope(
+                    json!({"error": "invalid_params", "message": e.to_string()}),
+                );
             }
         };
-        Ok(Some(json!({
-            "content": [{"type": "text", "text": serde_json::to_string(&payload)?}]
-        })))
+        Self::as_tool_envelope(payload)
     }
 
     fn handle_read_code_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
@@ -501,15 +539,11 @@ impl McpStdioServer {
         let payload = match read_code(&self.paths, arguments) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(Some(json!({
-                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
-                    "isError": true
-                })));
+                let target = arguments.get("file_path").and_then(Value::as_str);
+                return Self::as_tool_envelope(map_error_with_not_found(&e, target, Some("file")));
             }
         };
-        Ok(Some(serde_json::json!({
-            "content": [{"type": "text", "text": serde_json::to_string(&payload)?}]
-        })))
+        Self::as_tool_envelope(payload)
     }
 
     fn handle_write_code_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
@@ -523,22 +557,43 @@ impl McpStdioServer {
         let payload = match write_code(arguments) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(Some(json!({
-                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
-                    "isError": true
-                })));
+                let target = arguments.get("file_path").and_then(Value::as_str);
+                return Self::as_tool_envelope(map_error_with_not_found(&e, target, Some("file")));
             }
         };
-        let is_error = payload
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .map(|ok| !ok)
-            .unwrap_or(false);
+        Self::as_tool_envelope(payload)
+    }
 
-        Ok(Some(serde_json::json!({
-            "content": [{"type": "text", "text": serde_json::to_string(&payload)?}],
-            "isError": is_error
-        })))
+    fn handle_fs_create_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_create(arguments)?)
+    }
+
+    fn handle_fs_read_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_read(arguments)?)
+    }
+
+    fn handle_fs_write_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_write(arguments)?)
+    }
+
+    fn handle_fs_list_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_list(arguments)?)
+    }
+
+    fn handle_fs_stat_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_stat(arguments)?)
+    }
+
+    fn handle_fs_copy_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_copy(arguments)?)
+    }
+
+    fn handle_fs_move_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_move(arguments)?)
+    }
+
+    fn handle_fs_remove_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        Self::as_tool_envelope(fs_remove(arguments)?)
     }
 
     fn handle_search_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
@@ -942,7 +997,7 @@ mod tests {
 
     #[test]
     fn bootstrap_success_includes_metadata_and_policy() {
-        let (_temp, server) = setup_server_with_skill(Some("# skill"));
+        let (_temp, server) = setup_server_with_skill(None);
         let payload = payload_text(
             server
                 .handle_skill_bootstrap_tool("flashgrep_init", &json!({"compact": true}))
@@ -955,6 +1010,10 @@ mod tests {
             payload["canonical_trigger"],
             Value::String("flashgrep-init".to_string())
         );
+        assert_eq!(
+            payload["payload_source"],
+            Value::String("embedded".to_string())
+        );
         assert!(payload["skill_hash"].as_str().is_some());
         assert!(payload["skill_version"].as_str().is_some());
         assert!(payload["policy"].is_array());
@@ -962,7 +1021,7 @@ mod tests {
 
     #[test]
     fn bootstrap_aliases_and_invalid_trigger_behavior() {
-        let (_temp, server) = setup_server_with_skill(Some("# skill"));
+        let (_temp, server) = setup_server_with_skill(None);
 
         let alias_payload = payload_text(
             server
@@ -1003,7 +1062,7 @@ mod tests {
 
     #[test]
     fn bootstrap_repeated_call_returns_already_injected() {
-        let (_temp, server) = setup_server_with_skill(Some("# skill"));
+        let (_temp, server) = setup_server_with_skill(None);
 
         let _ = server
             .handle_skill_bootstrap_tool("flashgrep-init", &json!({"compact": true}))
@@ -1021,34 +1080,43 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_missing_or_unreadable_skill_errors() {
+    fn bootstrap_defaults_to_embedded_without_skill_file() {
         let temp_missing = TempDir::new().expect("temp dir");
         let server_missing =
             McpStdioServer::new(temp_missing.path().to_path_buf()).expect("create server");
-        let missing = payload_text(
+        let payload = payload_text(
             server_missing
                 .handle_skill_bootstrap_tool("flashgrep-init", &json!({"compact": true}))
-                .expect("missing skill response"),
+                .expect("bootstrap response"),
         );
+        assert_eq!(payload["ok"], Value::Bool(true));
         assert_eq!(
-            missing["error"],
-            Value::String("skill_not_found".to_string())
+            payload["payload_source"],
+            Value::String("embedded".to_string())
         );
+    }
 
-        let temp_unreadable = TempDir::new().expect("temp dir");
-        let skills_dir = temp_unreadable.path().join("skills");
-        fs::create_dir_all(skills_dir.join("SKILL.md"))
-            .expect("create directory in place of skill");
-        let server_unreadable =
-            McpStdioServer::new(temp_unreadable.path().to_path_buf()).expect("create server");
-        let unreadable = payload_text(
-            server_unreadable
-                .handle_skill_bootstrap_tool("flashgrep-init", &json!({"compact": true}))
-                .expect("unreadable skill response"),
+    #[test]
+    fn initialize_includes_bootstrap_payload() {
+        let (_temp, server) = setup_server_with_skill(None);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "initialize".to_string(),
+            params: json!({"clientInfo": {"name":"test","version":"1.0"}}),
+            id: Some(1),
+        };
+
+        let response = server
+            .handle_request(req, None)
+            .expect("initialize response");
+        let result = response.result.expect("initialize result");
+        assert_eq!(
+            result["bootstrap"]["status"],
+            Value::String("injected".to_string())
         );
         assert_eq!(
-            unreadable["error"],
-            Value::String("skill_unreadable".to_string())
+            result["bootstrap"]["payload_source"],
+            Value::String("embedded".to_string())
         );
     }
 
@@ -1073,6 +1141,103 @@ mod tests {
             .expect("content text");
         let payload: Value = serde_json::from_str(payload_text).expect("payload json");
         assert!(payload["total"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn read_code_missing_file_returns_typed_not_found() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().to_path_buf();
+        let server = McpStdioServer::new(root.clone()).expect("server");
+
+        let envelope = server
+            .handle_read_code_tool(&json!({
+                "file_path": root.join("missing.txt").to_string_lossy()
+            }))
+            .expect("read response")
+            .expect("read envelope");
+
+        let payload: Value = serde_json::from_str(
+            envelope["content"][0]["text"]
+                .as_str()
+                .expect("payload text"),
+        )
+        .expect("payload");
+
+        assert_eq!(payload["error"], Value::String("not_found".to_string()));
+        assert_eq!(
+            payload["reason_code"],
+            Value::String("file_not_found".to_string())
+        );
+        assert_eq!(envelope["isError"], Value::Bool(true));
+    }
+
+    #[test]
+    fn fs_tools_lifecycle_and_safety_edges() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().to_path_buf();
+        let server = McpStdioServer::new(root.clone()).expect("server");
+
+        let create_env = server
+            .handle_fs_create_tool(&json!({
+                "path": root.join("tmp/a.txt").to_string_lossy(),
+                "parents": true
+            }))
+            .expect("create")
+            .expect("create env");
+        let create_payload: Value = serde_json::from_str(
+            create_env["content"][0]["text"]
+                .as_str()
+                .expect("create text"),
+        )
+        .expect("create payload");
+        assert_eq!(create_payload["ok"], Value::Bool(true));
+
+        let write_env = server
+            .handle_fs_write_tool(&json!({
+                "path": root.join("tmp/a.txt").to_string_lossy(),
+                "content": "hello"
+            }))
+            .expect("write")
+            .expect("write env");
+        let write_payload: Value = serde_json::from_str(
+            write_env["content"][0]["text"]
+                .as_str()
+                .expect("write text"),
+        )
+        .expect("write payload");
+        assert_eq!(write_payload["ok"], Value::Bool(true));
+
+        let copy_conflict_env = server
+            .handle_fs_copy_tool(&json!({
+                "src": root.join("tmp/a.txt").to_string_lossy(),
+                "dst": root.join("tmp/a.txt").to_string_lossy(),
+                "overwrite": false
+            }))
+            .expect("copy conflict")
+            .expect("copy env");
+        let copy_payload: Value = serde_json::from_str(
+            copy_conflict_env["content"][0]["text"]
+                .as_str()
+                .expect("copy text"),
+        )
+        .expect("copy payload");
+        assert_eq!(copy_payload["error"], Value::String("conflict".to_string()));
+
+        let remove_env = server
+            .handle_fs_remove_tool(&json!({
+                "path": root.join("tmp").to_string_lossy(),
+                "recursive": true,
+                "force": true
+            }))
+            .expect("remove")
+            .expect("remove env");
+        let remove_payload: Value = serde_json::from_str(
+            remove_env["content"][0]["text"]
+                .as_str()
+                .expect("remove text"),
+        )
+        .expect("remove payload");
+        assert_eq!(remove_payload["ok"], Value::Bool(true));
     }
 
     #[test]
