@@ -316,6 +316,15 @@ mod tests {
             payload["policy_metadata"]["policy_strength"],
             Value::String("strict".to_string())
         );
+        assert_eq!(
+            payload["policy_metadata"]["search_routing"]["default_strategy"],
+            Value::String("neural_first".to_string())
+        );
+        assert_eq!(
+            payload["policy_metadata"]["search_routing"]["programmatic_priority"],
+            Value::String("secondary".to_string())
+        );
+        assert!(payload["policy_metadata"]["search_routing"]["fallback_reason_codes"].is_array());
         assert!(payload["policy_metadata"]["prohibited_native_tools"].is_object());
         assert!(payload["status"].as_str().is_some());
         assert!(payload["canonical_trigger"].as_str().is_some());
@@ -392,5 +401,27 @@ mod tests {
             .contains("repo skill override"));
 
         drop(temp);
+    }
+
+    #[test]
+    fn neural_fallback_reason_codes_are_typed_and_present() {
+        let (_temp, paths, injected) = setup_paths_with_skill(None);
+        let payload = build_bootstrap_payload(
+            &paths,
+            "flashgrep-init",
+            &json!({"compact": true, "force": true}),
+            &injected,
+        )
+        .expect("payload");
+
+        let reasons = payload["policy_metadata"]["search_routing"]["fallback_reason_codes"]
+            .as_array()
+            .expect("reason codes");
+        let as_strings: Vec<&str> = reasons.iter().filter_map(Value::as_str).collect();
+
+        assert!(as_strings.contains(&"neural_model_unavailable"));
+        assert!(as_strings.contains(&"neural_low_confidence"));
+        assert!(as_strings.contains(&"exact_match_required"));
+        assert!(as_strings.contains(&"query_parse_constraints"));
     }
 }

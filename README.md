@@ -1,16 +1,17 @@
 # Flashgrep
 
-A high-performance, local code indexing engine designed for LLM coding agents. Flashgrep provides blazing fast text and structural search across any codebase with minimal memory footprint.
+A high-performance, local code indexing engine designed for LLM coding agents. Flashgrep provides index-first text and structural search for fast repeated queries, deterministic outputs, and automation-friendly workflows.
 
 ## Features
 
 - **Language Agnostic**: Works with any programming language using regex-based heuristics
-- **Blazing Fast**: Sub-50ms query responses, incremental indexing in <1 second
-- **Minimal Memory**: Under 500MB memory usage for large repositories
+- **Index-First Performance**: Fast repeated queries after indexing, with incremental updates for changed files
+- **Resource Efficient**: Built for low-overhead local operation on medium and large repositories
 - **Fully Local**: No cloud dependencies, all data stays on your machine
 - **Token Efficient**: Returns exact code slices, not full files
-- **Single Binary**: Distributed as one static binary, no runtime dependencies
+- **Single Binary CLI**: Distributed as a single executable with local index data in `.flashgrep/`
 - **MCP Compatible**: JSON-RPC server for integration with coding agents
+- **Neural + Lexical Retrieval**: Semantic discovery with deterministic lexical fallback when exact matching is needed
 
 ## Installation
 
@@ -68,6 +69,7 @@ Features:
 - **Incremental indexing**: Only re-indexes changed files
 - **Fast**: Indexes 1,500+ files in under 3 seconds
 - **Smart filtering**: Ignores `target/`, `node_modules/`, `.git/`, etc.
+- **Model onboarding prompt**: If neural model cache is missing, startup asks whether to download `BAAI/bge-small-en-v1.5`
 
 #### `flashgrep start [PATH]`
 
@@ -85,10 +87,11 @@ The daemon:
 - Watches files for changes and auto-updates index
 - Runs MCP server on `localhost:7777`
 - Supports graceful shutdown (Ctrl+C)
+- Prompts for optional neural model download before initial indexing when cache is missing
 
 #### `flashgrep query <TEXT> [PATH]`
 
-Run indexed full-text search (grep-like) using the existing Flashgrep index.
+Run indexed search using lexical, semantic, or hybrid retrieval modes.
 
 ```bash
 # Find top matches
@@ -102,7 +105,17 @@ flashgrep query "fn\\s+main" --mode regex --include "src/**/*.rs" --context 2
 
 # Literal mode + case-insensitive
 flashgrep query "a+b" --mode literal --ignore-case
+
+# Semantic mode for intent-style search
+flashgrep query "find authentication middleware" --retrieval-mode semantic --limit 20
+
+# Hybrid mode blends lexical and semantic ranking
+flashgrep query "jwt validation" --retrieval-mode hybrid --output json
 ```
+
+Neural retrieval uses model `BAAI/bge-small-en-v1.5` and caches assets in
+`.flashgrep/model-cache/BAAI__bge-small-en-v1.5` on first semantic/hybrid query
+or during indexing.
 
 #### `flashgrep files [PATH]`
 
@@ -252,6 +265,7 @@ Bootstrap behavior:
 - Embedded payload is default (`payload_source: embedded`) and does not require local skill files
 - Optional repository override is opt-in (`allow_repo_override: true`) and falls back deterministically when unreadable
 - Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
+- Search routing defaults to neural-first for discovery intent (`query` with `retrieval_mode=semantic` or `hybrid`), with gated lexical/programmatic fallback
 
 Bootstrap policy metadata:
 - `policy_metadata.policy_strength`: enforcement mode (default: `strict`)
@@ -260,11 +274,16 @@ Bootstrap policy metadata:
 - `policy_metadata.bootstrap_state`: current session state (`injected` or `already_injected`)
 - `policy_metadata.preferred_tool_families`: explicit native Flashgrep routing families
 - `policy_metadata.preferred_tools`: Flashgrep-first tool routing groups
+- `policy_metadata.search_routing`: neural-first search order and fallback reason contracts
 - `policy_metadata.fallback_rules`: allowed fallback gates with typed `reason_code`
 - `policy_metadata.compliance_checks`: client-side compliance expectations
 - `policy_metadata.prohibited_native_tools`: native/host tools to avoid unless fallback gate is active
 
 Fallback gate defaults:
+- `neural_model_unavailable`
+- `neural_low_confidence`
+- `exact_match_required`
+- `query_parse_constraints`
 - `flashgrep_index_unavailable`
 - `flashgrep_operation_not_supported`
 - `flashgrep_tool_runtime_failure`
@@ -559,20 +578,22 @@ The config is stored in `.flashgrep/config.json`:
 - **Symbol Detector**: Regex-based detection of functions, classes, imports, etc.
 - **Tantivy Index**: Full-text search engine with custom ranking
 - **SQLite Store**: Metadata storage with connection pooling and batch inserts
+- **Neural Embedding Layer**: Local semantic embeddings (`BAAI/bge-small-en-v1.5`) for intent-style retrieval
 - **File Watcher**: Incremental re-indexing with debouncing
 - **MCP Server**: JSON-RPC over TCP for agent integration
 
-### Why It Is Faster Than Grep/Glob
+### Why It Is Faster Than Traditional Grep/Glob Workflows
 
-Flashgrep is usually faster than traditional `grep`/`glob` workflows on repeated queries because it is index-first:
+Flashgrep is often faster than traditional `grep`/`glob` workflows for active development sessions because it is index-first:
 
 - **One-time indexing, many fast reads**: Flashgrep scans/chunks once, then serves queries from Tantivy + SQLite metadata.
 - **No full tree scan per query**: traditional grep often re-walks directories and re-reads files every run.
 - **Structured metadata paths**: symbol lookup and file listing use indexed tables instead of regex over raw files.
 - **Watcher-assisted freshness**: background watcher updates changed files incrementally, avoiding full rebuilds.
+- **Semantic retrieval option**: neural search helps agents find intent-based matches before exact lexical narrowing.
 - **Deterministic bounded output**: command limits are enforced before render for stable, script-friendly responses.
 
-Use `grep` for tiny one-off folders; use Flashgrep for active development on medium/large repos where you run many searches per session.
+Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when you run many searches per session and want index-backed speed, structure, and deterministic pagination.
 
 ### End-to-End Query Flow
 
@@ -590,12 +611,13 @@ Use `grep` for tiny one-off folders; use Flashgrep for active development on med
 ├── text_index/        # Tantivy full-text index
 ├── metadata.db        # SQLite database (chunks, symbols, file metadata)
 ├── config.json        # Configuration
-└── vectors/           # Reserved for future use
+├── vectors/           # Runtime vector/index auxiliary artifacts
+└── model-cache/       # Cached neural model assets (downloaded on demand)
 ```
 
 ## Performance
 
-Benchmarks on a typical codebase (1,576 files, ~50k lines):
+Example measurements on a typical codebase (1,576 files, ~50k lines). Actual numbers vary by hardware, storage, and repository shape:
 
 - **Initial indexing**: ~2.6 seconds
 - **Incremental indexing**: ~0.35 seconds (only changed files)
@@ -682,6 +704,7 @@ src/
 ├── chunking/         # File chunking logic
 ├── symbols/          # Symbol detection
 ├── search/           # Search engine
+├── neural/           # Semantic embedding/model integration
 ├── watcher/          # File system watcher
 └── mcp/              # MCP server
 ```
@@ -713,6 +736,32 @@ rm -rf .flashgrep
 flashgrep index
 ```
 
+### Semantic model download fails
+
+- Ensure internet access on first semantic/hybrid run.
+- Verify cache path is writable: `.flashgrep/model-cache/BAAI__bge-small-en-v1.5`.
+- If you intentionally run offline, pre-populate model cache first and keep `FLASHGREP_OFFLINE=1`.
+
+If cache metadata is corrupted, remove cache and retry:
+
+```bash
+rm -rf .flashgrep/model-cache/BAAI__bge-small-en-v1.5
+flashgrep query "find auth code" --retrieval-mode semantic
+```
+
+For non-interactive scripts/CI, startup skips prompts and continues lexical indexing.
+You can force this behavior with:
+
+```bash
+FLASHGREP_NONINTERACTIVE=1 flashgrep index
+```
+
+To script prompt answers explicitly:
+
+```bash
+FLASHGREP_MODEL_PROMPT_RESPONSE=y flashgrep start
+```
+
 ## License
 
 Apache License 2.0 - See LICENSE file for details
@@ -727,5 +776,5 @@ Contributions are welcome! Please read CONTRIBUTING.md for guidelines.
 - [ ] Team shared index
 - [ ] Visual graph UI
 - [ ] Call graph engine
-- [ ] Semantic embeddings
+- [x] Semantic embeddings
 - [ ] Refactor impact analysis

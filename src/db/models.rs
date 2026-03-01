@@ -26,6 +26,46 @@ pub struct Chunk {
     pub last_modified: i64,
 }
 
+/// Vector representation for a chunk used in semantic retrieval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChunkVector {
+    /// Unique identifier for the vector row
+    pub id: Option<i64>,
+
+    /// Path to the source file
+    pub file_path: PathBuf,
+
+    /// Starting line number (1-indexed)
+    pub start_line: usize,
+
+    /// Ending line number (1-indexed, inclusive)
+    pub end_line: usize,
+
+    /// SHA256 hash of chunk content used for update detection
+    pub content_hash: String,
+
+    /// Embedding vector values
+    pub embedding: Vec<f32>,
+
+    /// Embedding model identifier
+    pub model_id: String,
+
+    /// Last modified timestamp of the source file
+    pub last_modified: i64,
+}
+
+/// Semantic retrieval candidate with chunk payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SemanticChunk {
+    pub file_path: PathBuf,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub content: String,
+    pub embedding: Vec<f32>,
+    pub last_modified: i64,
+    pub content_hash: String,
+}
+
 impl Chunk {
     /// Create a new chunk
     pub fn new(

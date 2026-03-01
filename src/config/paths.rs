@@ -45,6 +45,11 @@ impl FlashgrepPaths {
         self.root.join("vectors")
     }
 
+    /// Get the path to cached model assets.
+    pub fn model_cache_dir(&self) -> PathBuf {
+        self.root.join("model-cache")
+    }
+
     /// Get the path to the Unix socket (if using Unix sockets)
     pub fn socket_path(&self) -> PathBuf {
         self.root.join("mcp.sock")
@@ -61,6 +66,7 @@ impl FlashgrepPaths {
         std::fs::create_dir_all(self.text_index_dir())?;
         std::fs::create_dir_all(self.logs_dir())?;
         std::fs::create_dir_all(self.vectors_dir())?;
+        std::fs::create_dir_all(self.model_cache_dir())?;
         Ok(())
     }
 
@@ -164,6 +170,7 @@ mod tests {
         assert!(paths.exists());
         assert!(paths.text_index_dir().exists());
         assert!(paths.logs_dir().exists());
+        assert!(paths.model_cache_dir().exists());
 
         paths.remove()?;
         assert!(!paths.exists());

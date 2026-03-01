@@ -260,7 +260,9 @@ fn create_bootstrap_alias_tool(name: &str) -> ToolDefinition {
                     "properties": {
                         "policy_version": { "type": "string" },
                         "policy_strength": { "type": "string" },
+                        "search_routing": { "type": "object" },
                         "preferred_tools": { "type": "object" },
+                        "fallback_gate_ids": { "type": "array", "items": { "type": "string" } },
                         "fallback_rules": { "type": "array" },
                         "compliance_checks": { "type": "object" }
                     }

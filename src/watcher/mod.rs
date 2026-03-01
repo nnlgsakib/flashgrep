@@ -8,6 +8,7 @@ use crate::index::scanner::{
     is_binary_file, is_oversized_file, should_ignore_directory, should_index_file, FlashgrepIgnore,
 };
 use crate::index::state::ThreadSafeIndexState;
+use crate::neural::ensure_model_for_startup_prompt;
 use crate::FlashgrepResult;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -174,6 +175,8 @@ Thumbs.db
 
         // Perform initial scan if enabled
         if self.config.enable_initial_index {
+            let paths = FlashgrepPaths::new(&self.repo_root);
+            let _ = ensure_model_for_startup_prompt(&paths, "watcher initial indexing")?;
             info!("Starting initial scan in background...");
             let scan_result = self.perform_initial_scan().await?;
 

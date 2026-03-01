@@ -1,19 +1,20 @@
 ## MODIFIED Requirements
 
 ### Requirement: Skill guidance is token-efficient and action-oriented
-Agent guidance MUST be optimized for low-token operation while enforcing strict Flashgrep-first tool routing with deterministic fallback gates, documentation MUST define embedded-bootstrap behavior as the default source of policy, and `skills/SKILL.md` MUST direct agents to MCP filesystem tools for file lifecycle operations before native host read/write/glob fallbacks.
+Agent guidance MUST be optimized for low-token operation while enforcing strict Flashgrep-first tool routing with deterministic fallback gates, documentation MUST define embedded-bootstrap behavior as the default source of policy, and `skills/SKILL.md` MUST direct agents to neural interface usage first for discovery search intents and programmatic search as explicit second-priority fallback.
 
 #### Scenario: Skill guidance describes embedded init source
 - **WHEN** users or agents review skill/bootstrap guidance
 - **THEN** documentation MUST state that canonical policy guidance is injected from embedded payload at initialization
 
-#### Scenario: Skill doc enforces primary tool ordering
-- **WHEN** an agent chooses search or read/write tools
-- **THEN** the guidance MUST direct the agent to Flashgrep-native tools first and require explicit gated reasons before native fallback tools are used
+#### Scenario: Skill doc enforces neural-first search ordering
+- **WHEN** an agent chooses a search approach for discovery tasks
+- **THEN** the guidance MUST direct the agent to semantic/neural query behavior first
+- **AND** it MUST define the allowed fallback reasons before programmatic search is used
 
 #### Scenario: Skill doc includes compliance troubleshooting guidance
-- **WHEN** an agent deviates from Flashgrep-first behavior
-- **THEN** documentation MUST include concise remediation steps and metadata fields to inspect for restoring policy-compliant routing
+- **WHEN** an agent deviates from policy-compliant search order
+- **THEN** documentation MUST include concise remediation steps and metadata fields to inspect for restoring compliant routing
 
 #### Scenario: Skill guidance routes filesystem actions to MCP tools
 - **WHEN** an agent needs file or directory create/read/write/list/stat/copy/move/remove actions

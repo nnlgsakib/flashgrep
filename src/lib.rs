@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod index;
 pub mod mcp;
+pub mod neural;
 pub mod path_utils;
 pub mod search;
 pub mod symbols;

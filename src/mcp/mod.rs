@@ -231,6 +231,7 @@ async fn handle_request(
                                 "scanned_files": response.scanned_files,
                                 "next_offset": response.next_offset,
                                 "mode": format!("{:?}", options.mode).to_lowercase(),
+                                "retrieval_mode": format!("{:?}", options.retrieval_mode).to_lowercase(),
                                 "case_sensitive": options.case_sensitive,
                             })
                         }
@@ -982,6 +983,10 @@ mod tests {
         assert_eq!(
             canonical["policy_metadata"]["policy_strength"],
             serde_json::Value::String("strict".to_string())
+        );
+        assert_eq!(
+            canonical["policy_metadata"]["search_routing"]["default_strategy"],
+            serde_json::Value::String("neural_first".to_string())
         );
         assert_eq!(canonical["policy_metadata"], alias["policy_metadata"]);
     }

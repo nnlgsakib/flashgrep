@@ -1,9 +1,10 @@
 use crate::chunking::Chunker;
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
-use crate::db::models::{Chunk, FileMetadata};
+use crate::db::models::{Chunk, ChunkVector, FileMetadata};
 use crate::db::Database;
 use crate::index::scanner::{FileScanner, FlashgrepIgnore};
+use crate::neural::{embed_text, is_model_cached, EMBEDDING_MODEL_ID};
 use crate::symbols::SymbolDetector;
 use crate::FlashgrepResult;
 use std::path::PathBuf;
@@ -13,6 +14,8 @@ use tracing::{debug, error, info};
 
 /// Main indexing engine
 pub struct Indexer {
+    paths: FlashgrepPaths,
+    semantic_vectors_enabled: bool,
     db: Database,
     index: Index,
     writer: IndexWriter,
@@ -48,6 +51,8 @@ impl Indexer {
         let writer = index.writer(50_000_000)?; // 50MB buffer
 
         Ok(Self {
+            semantic_vectors_enabled: is_model_cached(&paths).unwrap_or(false),
+            paths,
             db,
             index,
             writer,
@@ -99,6 +104,10 @@ impl Indexer {
     pub fn index_file(&mut self, file_path: &PathBuf) -> FlashgrepResult<bool> {
         debug!("Checking file: {}", file_path.display());
 
+        if !self.semantic_vectors_enabled {
+            self.semantic_vectors_enabled = is_model_cached(&self.paths).unwrap_or(false);
+        }
+
         // Get file metadata first to check modification time
         let metadata = FileMetadata::from_path(file_path)?;
         let last_modified = metadata.last_modified;
@@ -117,6 +126,7 @@ impl Indexer {
         // Delete existing chunks and symbols for this file
         self.db.delete_file_chunks(file_path)?;
         self.db.delete_file_symbols(file_path)?;
+        self.db.delete_file_vectors(file_path)?;
 
         // Insert/update file record
         self.db.insert_file(&metadata)?;
@@ -146,6 +156,42 @@ impl Indexer {
         // Batch insert chunks (much faster than individual inserts)
         if !chunks.is_empty() {
             self.db.insert_chunks_batch(&chunks)?;
+        }
+
+        // Build and persist semantic vectors for each chunk.
+        if !chunks.is_empty() && self.semantic_vectors_enabled {
+            let mut vectors = Vec::with_capacity(chunks.len());
+            for chunk in &chunks {
+                let embedding = match embed_text(&self.paths, &chunk.content) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        error!(
+                            "Failed to embed chunk for {}:{}-{}: {}",
+                            chunk.file_path.display(),
+                            chunk.start_line,
+                            chunk.end_line,
+                            err
+                        );
+                        self.semantic_vectors_enabled = false;
+                        vectors.clear();
+                        break;
+                    }
+                };
+                if embedding.is_empty() {
+                    continue;
+                }
+                vectors.push(ChunkVector {
+                    id: None,
+                    file_path: chunk.file_path.clone(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    content_hash: chunk.content_hash.clone(),
+                    embedding,
+                    model_id: EMBEDDING_MODEL_ID.to_string(),
+                    last_modified: chunk.last_modified,
+                });
+            }
+            self.db.upsert_chunk_vectors_batch(&vectors)?;
         }
 
         // Batch insert symbols (much faster than individual inserts)
@@ -243,6 +289,12 @@ impl Indexer {
         // Clear metadata database (file records, chunks, symbols)
         self.db.clear_all()?;
         info!("Metadata database cleared");
+
+        let vectors_dir = self.paths.vectors_dir();
+        if vectors_dir.exists() {
+            let _ = std::fs::remove_dir_all(&vectors_dir);
+        }
+        std::fs::create_dir_all(&vectors_dir)?;
 
         info!("Index cleared successfully");
         Ok(())

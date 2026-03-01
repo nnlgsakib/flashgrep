@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Index command
-The CLI SHALL provide an index command for initial repository indexing.
+The CLI SHALL provide an index command for initial repository indexing and SHALL prompt for neural model download when required assets are missing.
 
 #### Scenario: Run index command
 - **WHEN** the user runs `flashgrep index`
@@ -15,6 +15,11 @@ The CLI SHALL provide an index command for initial repository indexing.
 - **WHEN** the index command runs
 - **THEN** it SHALL display real-time progress to stdout
 
+#### Scenario: Prompt for missing neural model on index start
+- **WHEN** model assets are missing at index startup
+- **THEN** the CLI SHALL prompt user to download `BAAI/bge-small-en-v1.5`
+- **AND** if the user declines, it SHALL continue indexing normally without download
+
 #### Scenario: Success exit code
 - **WHEN** indexing completes successfully
 - **THEN** it SHALL exit with code 0
@@ -24,11 +29,16 @@ The CLI SHALL provide an index command for initial repository indexing.
 - **THEN** it SHALL exit with a non-zero code and print the error
 
 ### Requirement: Start command
-The CLI SHALL provide a start command to run the daemon.
+The CLI SHALL provide a start command to run the daemon and SHALL handle model prompt behavior before initial indexing begins.
 
 #### Scenario: Run start command
 - **WHEN** the user runs `flashgrep start`
 - **THEN** it SHALL start the file watcher and MCP server
+
+#### Scenario: Prompt for missing neural model on start
+- **WHEN** watcher startup begins initial indexing and model assets are missing
+- **THEN** the CLI SHALL prompt user to download `BAAI/bge-small-en-v1.5`
+- **AND** if the user declines, daemon startup SHALL continue with normal non-neural indexing behavior
 
 #### Scenario: Print server address
 - **WHEN** the daemon starts

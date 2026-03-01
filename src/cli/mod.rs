@@ -5,8 +5,9 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::index::engine::Indexer;
 use crate::mcp::stdio::McpStdioServer;
+use crate::neural::ensure_model_for_startup_prompt;
 use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
-use crate::search::{QueryMode, QueryOptions, Searcher};
+use crate::search::{QueryMode, QueryOptions, QueryRetrievalMode, Searcher};
 use crate::watcher::registry::{is_process_alive, kill_process, WatcherRegistry};
 use crate::watcher::FileWatcher;
 use crate::FlashgrepResult;
@@ -40,6 +41,23 @@ pub enum QueryModeArg {
     Smart,
     Literal,
     Regex,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RetrievalModeArg {
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
+impl From<RetrievalModeArg> for QueryRetrievalMode {
+    fn from(value: RetrievalModeArg) -> Self {
+        match value {
+            RetrievalModeArg::Lexical => QueryRetrievalMode::Lexical,
+            RetrievalModeArg::Semantic => QueryRetrievalMode::Semantic,
+            RetrievalModeArg::Hybrid => QueryRetrievalMode::Hybrid,
+        }
+    }
 }
 
 impl From<QueryModeArg> for QueryMode {
@@ -142,6 +160,9 @@ pub enum Commands {
         /// Query mode
         #[arg(long, value_enum, default_value_t = QueryModeArg::Smart)]
         mode: QueryModeArg,
+        /// Retrieval mode (lexical, semantic, hybrid)
+        #[arg(long = "retrieval-mode", value_enum, default_value_t = RetrievalModeArg::Lexical)]
+        retrieval_mode: RetrievalModeArg,
         /// Ignore case during matching
         #[arg(short = 'i', long = "ignore-case")]
         ignore_case: bool,
@@ -280,6 +301,8 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
         Commands::Index { path, force } => {
             let repo_root = get_repo_root(path.as_ref())?;
             info!("Indexing repository: {}", repo_root.display());
+            let paths = FlashgrepPaths::new(&repo_root);
+            let _ = ensure_model_for_startup_prompt(&paths, "index startup")?;
 
             let mut indexer = Indexer::new(repo_root.clone())?;
 
@@ -413,6 +436,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             path,
             limit,
             mode,
+            retrieval_mode,
             ignore_case,
             include,
             exclude,
@@ -423,6 +447,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             let (repo_root, searcher) = create_searcher(path.as_ref())?;
             let mut options = QueryOptions::new(text.clone(), limit.max(1));
             options.mode = mode.into();
+            options.retrieval_mode = retrieval_mode.into();
             options.fixed_patterns = fixed_strings;
             if !options.fixed_patterns.is_empty() {
                 options.mode = QueryMode::Literal;
@@ -965,6 +990,23 @@ mod tests {
             Commands::Query { text, output, .. } => {
                 assert_eq!(text, "main");
                 assert_eq!(output, OutputMode::Json);
+            }
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
+    fn parse_query_with_semantic_mode() {
+        let cli = Cli::parse_from([
+            "flashgrep",
+            "query",
+            "find auth code",
+            "--retrieval-mode",
+            "semantic",
+        ]);
+        match cli.command {
+            Commands::Query { retrieval_mode, .. } => {
+                assert_eq!(retrieval_mode, RetrievalModeArg::Semantic)
             }
             _ => panic!("expected query command"),
         }

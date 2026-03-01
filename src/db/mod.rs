@@ -1,7 +1,7 @@
 pub mod models;
 
 use crate::FlashgrepResult;
-use models::{Chunk, FileMetadata, IndexStats, Symbol};
+use models::{Chunk, ChunkVector, FileMetadata, IndexStats, SemanticChunk, Symbol};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::path::PathBuf;
@@ -90,6 +90,33 @@ impl Database {
             [],
         )?;
 
+        // Create chunk_vectors table for semantic search
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chunk_vectors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                embedding TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                last_modified INTEGER NOT NULL,
+                UNIQUE(file_path, start_line, end_line, content_hash),
+                FOREIGN KEY (file_path) REFERENCES files(file_path) ON DELETE CASCADE
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunk_vectors_file_path ON chunk_vectors(file_path)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunk_vectors_model_id ON chunk_vectors(model_id)",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -152,6 +179,47 @@ impl Database {
                     chunk.content_hash.clone(),
                     chunk.content.clone(),
                     chunk.last_modified.to_string(),
+                ])?;
+                count += 1;
+            }
+        }
+
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Batch upsert semantic vectors for chunks.
+    pub fn upsert_chunk_vectors_batch(&self, vectors: &[ChunkVector]) -> FlashgrepResult<usize> {
+        if vectors.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        let mut count = 0usize;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO chunk_vectors (
+                    file_path, start_line, end_line, content_hash, embedding, model_id, last_modified
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(file_path, start_line, end_line, content_hash)
+                 DO UPDATE SET
+                    embedding = excluded.embedding,
+                    model_id = excluded.model_id,
+                    last_modified = excluded.last_modified",
+            )?;
+
+            for vector in vectors {
+                let embedding_json = serde_json::to_string(&vector.embedding)?;
+                stmt.execute([
+                    vector.file_path.to_string_lossy().to_string(),
+                    vector.start_line.to_string(),
+                    vector.end_line.to_string(),
+                    vector.content_hash.clone(),
+                    embedding_json,
+                    vector.model_id.clone(),
+                    vector.last_modified.to_string(),
                 ])?;
                 count += 1;
             }
@@ -236,6 +304,16 @@ impl Database {
         let conn = self.pool.get()?;
         let count = conn.execute(
             "DELETE FROM symbols WHERE file_path = ?1",
+            [file_path.to_string_lossy().to_string()],
+        )?;
+        Ok(count)
+    }
+
+    /// Delete all semantic vectors for a file.
+    pub fn delete_file_vectors(&self, file_path: &PathBuf) -> FlashgrepResult<usize> {
+        let conn = self.pool.get()?;
+        let count = conn.execute(
+            "DELETE FROM chunk_vectors WHERE file_path = ?1",
             [file_path.to_string_lossy().to_string()],
         )?;
         Ok(count)
@@ -366,6 +444,64 @@ impl Database {
         Ok(files)
     }
 
+    /// Load semantic chunks for a given model id.
+    pub fn get_semantic_chunks(&self, model_id: &str) -> FlashgrepResult<Vec<SemanticChunk>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                cv.file_path,
+                cv.start_line,
+                cv.end_line,
+                c.content,
+                cv.embedding,
+                cv.last_modified,
+                cv.content_hash
+             FROM chunk_vectors cv
+             INNER JOIN chunks c
+                 ON c.file_path = cv.file_path
+                AND c.start_line = cv.start_line
+                AND c.end_line = cv.end_line
+                AND c.content_hash = cv.content_hash
+             WHERE cv.model_id = ?1",
+        )?;
+
+        let rows = stmt
+            .query_map([model_id], |row| {
+                let embedding_json: String = row.get(4)?;
+                let embedding: Vec<f32> = serde_json::from_str(&embedding_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+
+                Ok(SemanticChunk {
+                    file_path: PathBuf::from(row.get::<_, String>(0)?),
+                    start_line: row.get::<_, i64>(1)? as usize,
+                    end_line: row.get::<_, i64>(2)? as usize,
+                    content: row.get(3)?,
+                    embedding,
+                    last_modified: row.get(5)?,
+                    content_hash: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    /// Count vectors stored for a model.
+    pub fn count_vectors_for_model(&self, model_id: &str) -> FlashgrepResult<usize> {
+        let conn = self.pool.get()?;
+        let total: usize = conn.query_row(
+            "SELECT COUNT(*) FROM chunk_vectors WHERE model_id = ?1",
+            [model_id],
+            |row| row.get(0),
+        )?;
+        Ok(total)
+    }
+
     /// Run VACUUM to optimize database file size
     pub fn vacuum(&self) -> FlashgrepResult<()> {
         let conn = self.pool.get()?;
@@ -389,6 +525,7 @@ impl Database {
 
         // Delete from child tables first (though CASCADE should handle this)
         conn.execute("DELETE FROM symbols", [])?;
+        conn.execute("DELETE FROM chunk_vectors", [])?;
         conn.execute("DELETE FROM chunks", [])?;
         conn.execute("DELETE FROM files", [])?;
 
@@ -504,6 +641,53 @@ mod tests {
         let deleted_second =
             db.delete_files_bulk(&[PathBuf::from("a.rs"), PathBuf::from("b.rs")])?;
         assert_eq!(deleted_second, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_and_read_chunk_vectors() -> FlashgrepResult<()> {
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("test.db");
+        let db = Database::open(&db_path)?;
+
+        let file = FileMetadata {
+            id: None,
+            file_path: PathBuf::from("auth.rs"),
+            file_size: 10,
+            last_modified: 1000,
+            language: Some("rust".to_string()),
+        };
+        db.insert_file(&file)?;
+
+        let chunk = Chunk::new(
+            PathBuf::from("auth.rs"),
+            1,
+            5,
+            "fn auth_handler() {}".to_string(),
+            1000,
+        );
+        db.insert_chunks_batch(&[chunk.clone()])?;
+
+        let vector = ChunkVector {
+            id: None,
+            file_path: PathBuf::from("auth.rs"),
+            start_line: 1,
+            end_line: 5,
+            content_hash: chunk.content_hash.clone(),
+            embedding: vec![0.1, 0.2, 0.3],
+            model_id: "BAAI/bge-small-en-v1.5".to_string(),
+            last_modified: 1000,
+        };
+        db.upsert_chunk_vectors_batch(&[vector])?;
+
+        let count = db.count_vectors_for_model("BAAI/bge-small-en-v1.5")?;
+        assert_eq!(count, 1);
+
+        let rows = db.get_semantic_chunks("BAAI/bge-small-en-v1.5")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, PathBuf::from("auth.rs"));
+        assert_eq!(rows[0].start_line, 1);
 
         Ok(())
     }

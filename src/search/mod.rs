@@ -1,5 +1,6 @@
 use crate::db::models::{SearchResult, Symbol};
 use crate::db::Database;
+use crate::neural::{cosine_similarity, embed_text, ensure_model_cached, EMBEDDING_MODEL_ID};
 use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::FlashgrepError;
 use crate::FlashgrepResult;
@@ -18,6 +19,13 @@ pub enum QueryMode {
     Regex,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryRetrievalMode {
+    Lexical,
+    Semantic,
+    Hybrid,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
     pub text: String,
@@ -29,6 +37,7 @@ pub struct QueryOptions {
     pub exclude: Vec<String>,
     pub context: usize,
     pub offset: usize,
+    pub retrieval_mode: QueryRetrievalMode,
 }
 
 impl QueryOptions {
@@ -43,6 +52,7 @@ impl QueryOptions {
             exclude: Vec::new(),
             context: 0,
             offset: 0,
+            retrieval_mode: QueryRetrievalMode::Lexical,
         }
     }
 
@@ -86,6 +96,22 @@ impl QueryOptions {
         let context = args.get("context").and_then(Value::as_u64).unwrap_or(0) as usize;
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
+        let retrieval_mode = match args
+            .get("retrieval_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("lexical")
+        {
+            "lexical" => QueryRetrievalMode::Lexical,
+            "semantic" => QueryRetrievalMode::Semantic,
+            "hybrid" => QueryRetrievalMode::Hybrid,
+            other => {
+                return Err(FlashgrepError::Config(format!(
+                    "Invalid retrieval_mode '{}'. Expected one of: lexical, semantic, hybrid",
+                    other
+                )))
+            }
+        };
+
         let case_sensitive = if mode == QueryMode::Regex {
             !flags.contains('i')
         } else {
@@ -104,6 +130,7 @@ impl QueryOptions {
             exclude,
             context,
             offset,
+            retrieval_mode,
         })
     }
 }
@@ -121,6 +148,7 @@ pub struct Searcher {
     reader: IndexReader,
     query_parser: QueryParser,
     db: Database,
+    flashgrep_paths: crate::config::paths::FlashgrepPaths,
 }
 
 impl Searcher {
@@ -138,10 +166,22 @@ impl Searcher {
 
         let db = Database::open(db_path)?;
 
+        let repo_root = db_path
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| {
+                FlashgrepError::Config(format!(
+                    "Cannot infer repository root from metadata DB path {}",
+                    db_path.display()
+                ))
+            })?;
+
         Ok(Self {
             reader,
             query_parser,
             db,
+            flashgrep_paths: crate::config::paths::FlashgrepPaths::new(&repo_root),
         })
     }
 
@@ -154,8 +194,8 @@ impl Searcher {
 
     pub fn query_with_options(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
         debug!(
-            "Searching for: {} (limit: {}, mode={:?})",
-            options.text, options.limit, options.mode
+            "Searching for: {} (limit: {}, mode={:?}, retrieval_mode={:?})",
+            options.text, options.limit, options.mode, options.retrieval_mode
         );
 
         if options.text.is_empty() {
@@ -167,6 +207,14 @@ impl Searcher {
             });
         }
 
+        match options.retrieval_mode {
+            QueryRetrievalMode::Lexical => self.query_lexical(options),
+            QueryRetrievalMode::Semantic => self.query_semantic(options),
+            QueryRetrievalMode::Hybrid => self.query_hybrid(options),
+        }
+    }
+
+    fn query_lexical(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
         let searcher = self.reader.searcher();
         let schema = searcher.schema();
         let file_path_field = schema.get_field("file_path").unwrap();
@@ -306,6 +354,170 @@ impl Searcher {
         })
     }
 
+    fn query_semantic(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
+        ensure_model_cached(&self.flashgrep_paths)?;
+
+        let query_embedding = embed_text(&self.flashgrep_paths, &options.text)?;
+        let include_patterns = compile_patterns(&options.include)?;
+        let exclude_patterns = compile_patterns(&options.exclude)?;
+
+        let mut candidates = self.db.get_semantic_chunks(EMBEDDING_MODEL_ID)?;
+        candidates.retain(|chunk| {
+            path_matches(
+                &chunk.file_path,
+                &include_patterns,
+                &exclude_patterns,
+                options.case_sensitive,
+            )
+        });
+
+        let max_mtime = candidates
+            .iter()
+            .map(|c| c.last_modified)
+            .max()
+            .unwrap_or(0);
+
+        let mut ranked: Vec<SearchResult> = candidates
+            .iter()
+            .map(|chunk| {
+                let similarity = cosine_similarity(&query_embedding, &chunk.embedding);
+                let path_depth = chunk.file_path.components().count() as f32;
+                let depth_boost = 1.0 / (1.0 + path_depth.max(1.0));
+                let recency_boost = if max_mtime > 0 {
+                    ((chunk.last_modified as f32 / max_mtime as f32).clamp(0.0, 1.0)) * 0.05
+                } else {
+                    0.0
+                };
+                let score = similarity + (depth_boost * 0.05) + recency_boost;
+
+                let pinpoint = pinpoint_best_line(&chunk.content, &options.text);
+                let (start_line, end_line, preview, pinpoint_boost) =
+                    if let Some((offset, line)) = pinpoint {
+                        let exact_line = chunk.start_line.saturating_add(offset);
+                        (
+                            exact_line, exact_line, line,
+                            0.03, // prefer chunks where we can pinpoint a concrete line
+                        )
+                    } else {
+                        (
+                            chunk.start_line,
+                            chunk.end_line,
+                            chunk.content.lines().take(3).collect::<Vec<_>>().join("\n"),
+                            0.0,
+                        )
+                    };
+
+                SearchResult {
+                    file_path: chunk.file_path.clone(),
+                    start_line,
+                    end_line,
+                    symbol_name: None,
+                    relevance_score: score + pinpoint_boost,
+                    preview,
+                    content: None,
+                }
+            })
+            .collect();
+
+        ranked.sort_by(|a, b| {
+            b.relevance_score
+                .total_cmp(&a.relevance_score)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+
+        let scanned_files = ranked.len();
+        let window: Vec<SearchResult> = ranked
+            .into_iter()
+            .skip(options.offset)
+            .take(options.limit)
+            .collect();
+        let truncated = scanned_files > options.offset.saturating_add(window.len());
+        let next_offset = if truncated {
+            Some(options.offset.saturating_add(window.len()))
+        } else {
+            None
+        };
+
+        Ok(QueryResponse {
+            results: window,
+            truncated,
+            scanned_files,
+            next_offset,
+        })
+    }
+
+    fn query_hybrid(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
+        let mut lexical_options = options.clone();
+        lexical_options.retrieval_mode = QueryRetrievalMode::Lexical;
+        lexical_options.limit = options.limit.saturating_mul(2).max(10);
+        lexical_options.offset = 0;
+
+        let mut semantic_options = options.clone();
+        semantic_options.retrieval_mode = QueryRetrievalMode::Semantic;
+        semantic_options.limit = options.limit.saturating_mul(2).max(10);
+        semantic_options.offset = 0;
+
+        let lexical = match self.query_lexical(&lexical_options) {
+            Ok(result) => result,
+            Err(FlashgrepError::Search(msg))
+                if lexical_options.mode == QueryMode::Smart && msg.contains("Syntax Error") =>
+            {
+                let mut fallback = lexical_options.clone();
+                fallback.mode = QueryMode::Literal;
+                self.query_lexical(&fallback)?
+            }
+            Err(err) => return Err(err),
+        };
+        let semantic = self.query_semantic(&semantic_options)?;
+
+        let mut merged: Vec<SearchResult> = Vec::new();
+        for r in lexical.results {
+            merged.push(SearchResult {
+                relevance_score: r.relevance_score + 0.15,
+                ..r
+            });
+        }
+        for r in semantic.results {
+            if let Some(existing) = merged.iter_mut().find(|m| {
+                m.file_path == r.file_path
+                    && m.start_line == r.start_line
+                    && m.end_line == r.end_line
+            }) {
+                existing.relevance_score = existing.relevance_score.max(r.relevance_score + 0.2);
+            } else {
+                merged.push(r);
+            }
+        }
+
+        merged.sort_by(|a, b| {
+            b.relevance_score
+                .total_cmp(&a.relevance_score)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+
+        let scanned_files = merged.len();
+        let window: Vec<SearchResult> = merged
+            .into_iter()
+            .skip(options.offset)
+            .take(options.limit)
+            .collect();
+        let truncated = scanned_files > options.offset.saturating_add(window.len());
+        let next_offset = if truncated {
+            Some(options.offset.saturating_add(window.len()))
+        } else {
+            None
+        };
+
+        Ok(QueryResponse {
+            results: window,
+            truncated,
+            scanned_files,
+            next_offset,
+        })
+    }
+
     /// Get a specific slice of a file by line range
     pub fn get_slice(
         &self,
@@ -399,6 +611,47 @@ fn path_matches(
         .any(|p| p.matches_with(&normalized, opts) || p.matches_path_with(path, opts))
 }
 
+fn pinpoint_best_line(content: &str, query: &str) -> Option<(usize, String)> {
+    let query_norm = query.trim().to_ascii_lowercase();
+    if query_norm.is_empty() {
+        return None;
+    }
+
+    let query_terms: Vec<&str> = query_norm
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut best: Option<(usize, i32, String)> = None;
+    for (idx, line) in content.lines().enumerate() {
+        let line_norm = line.to_ascii_lowercase();
+        let mut score = 0i32;
+
+        if line_norm.contains(&query_norm) {
+            score += 6;
+        }
+
+        for term in &query_terms {
+            if term.len() >= 3 && line_norm.contains(term) {
+                score += 1;
+            }
+        }
+
+        if score <= 0 {
+            continue;
+        }
+
+        match &best {
+            Some((_, best_score, _)) if score <= *best_score => {}
+            _ => {
+                best = Some((idx, score, line.trim().to_string()));
+            }
+        }
+    }
+
+    best.map(|(idx, _, line)| (idx, line))
+}
+
 fn compile_query_regex(options: &QueryOptions) -> FlashgrepResult<Option<Regex>> {
     match options.mode {
         QueryMode::Regex => {
@@ -477,7 +730,18 @@ mod tests {
         assert!(opts.fixed_patterns.is_empty());
         assert_eq!(opts.limit, 10);
         assert_eq!(opts.mode, QueryMode::Smart);
+        assert_eq!(opts.retrieval_mode, QueryRetrievalMode::Lexical);
         assert!(opts.case_sensitive);
+    }
+
+    #[test]
+    fn query_options_accept_semantic_retrieval_mode() {
+        let opts = QueryOptions::from_mcp_args(&json!({
+            "text": "find auth middleware",
+            "retrieval_mode": "semantic"
+        }))
+        .expect("options");
+        assert_eq!(opts.retrieval_mode, QueryRetrievalMode::Semantic);
     }
 
     #[test]
@@ -536,5 +800,14 @@ mod tests {
         let compiled = compile_patterns(&["src\\**\\*.rs".to_string()]).expect("patterns");
         assert_eq!(compiled.len(), 1);
         assert!(compiled[0].matches("src/main.rs"));
+    }
+
+    #[test]
+    fn pinpoint_best_line_prefers_line_with_query_terms() {
+        let content =
+            "package main\nfn unrelated() {}\nflag.Int(\"dim\", 32, \"vector dimension\")\n";
+        let pinpoint = pinpoint_best_line(content, "usage text2vec dim flag").expect("pinpoint");
+        assert_eq!(pinpoint.0, 2);
+        assert!(pinpoint.1.contains("flag.Int"));
     }
 }
