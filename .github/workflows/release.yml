@@ -39,24 +39,29 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cd target/${{ matrix.target }}/release
+          strip ${{ matrix.artifact_name }} || true
           tar -czf ${{ matrix.asset_name }} ${{ matrix.artifact_name }}
           mv ${{ matrix.asset_name }} ../../../
 
       - name: Package Windows
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           Compress-Archive `
             -Path target/${{ matrix.target }}/release/${{ matrix.artifact_name }} `
             -DestinationPath ${{ matrix.asset_name }}
 
-      - name: Generate SHA256
-        shell: bash
+      - name: Generate SHA256 (Linux)
+        if: runner.os == 'Linux'
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            certutil -hashfile ${{ matrix.asset_name }} SHA256 | findstr /v "hash" > ${{ matrix.asset_name }}.sha256
-          else
-            sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
-          fi
+          sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
+
+      - name: Generate SHA256 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash "${{ matrix.asset_name }}" -Algorithm SHA256
+          "$($hash.Hash)  ${{ matrix.asset_name }}" | Out-File "${{ matrix.asset_name }}.sha256" -Encoding ascii
 
       - name: Upload Release
         uses: softprops/action-gh-release@v2
