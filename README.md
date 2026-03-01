@@ -13,7 +13,13 @@ If you just want to get running fast:
 flashgrep index
 ```
 
-3. Configure your MCP client to launch Flashgrep over stdio:
+3. Start the indexer/watcher in the background so the index stays fresh:
+
+```bash
+flashgrep start -b
+```
+
+4. Configure your MCP client to launch Flashgrep over stdio:
 
 ```json
 {
@@ -27,7 +33,7 @@ flashgrep index
 }
 ```
 
-4. Run the MCP init/bootstrap command from your client (any alias works):
+5. Run the MCP init/bootstrap command from your client (any alias works):
    - `bootstrap_skill`
    - `flashgrep-init`
    - `flashgrep_init`
