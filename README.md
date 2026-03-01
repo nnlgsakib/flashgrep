@@ -2,6 +2,40 @@
 
 A high-performance, local code indexing engine designed for LLM coding agents. Flashgrep provides index-first text and structural search for fast repeated queries, deterministic outputs, and automation-friendly workflows.
 
+## Start Here (Install + MCP Init)
+
+If you just want to get running fast:
+
+1. Download the latest binary from the [latest release](https://github.com/nnlgsakib/flashgrep/releases/latest) (or build from source).
+2. Open your repository and initialize the local index:
+
+```bash
+flashgrep index
+```
+
+3. Configure your MCP client to launch Flashgrep over stdio:
+
+```json
+{
+  "mcpServers": {
+    "flashgrep": {
+      "type": "local",
+      "command": ["flashgrep", "mcp-stdio"],
+      "enabled": true
+    }
+  }
+}
+```
+
+4. Run the MCP init/bootstrap command from your client (any alias works):
+   - `bootstrap_skill`
+   - `flashgrep-init`
+   - `flashgrep_init`
+   - `fgrep-boot`
+   - `fgrep_boot`
+
+This injects policy/tool guidance for the session and prepares Flashgrep-first routing.
+
 ## Features
 
 - **Language Agnostic**: Works with any programming language using regex-based heuristics
@@ -31,7 +65,7 @@ cp target/release/flashgrep /usr/local/bin/
 
 ### Pre-built Binaries
 
-Download pre-built binaries from the [releases page](https://github.com/nnlgsakib/flashgrep/releases).
+Download pre-built binaries from the [latest release](https://github.com/nnlgsakib/flashgrep/releases/latest) (or browse all [releases](https://github.com/nnlgsakib/flashgrep/releases)).
 
 ## Quick Start
 
