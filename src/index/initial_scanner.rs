@@ -156,10 +156,7 @@ impl InitialScanner {
                             }
 
                             // Log progress
-                            if result
-                                .files_scanned
-                                .is_multiple_of(self.progress_interval)
-                            {
+                            if result.files_scanned.is_multiple_of(self.progress_interval) {
                                 info!(
                                     "Initial indexing progress: {} files scanned",
                                     result.files_scanned
