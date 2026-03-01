@@ -256,6 +256,15 @@ impl ThreadSafeIndexState {
             .map_err(|_| crate::FlashgrepError::Index("Failed to acquire read lock".to_string()))?;
         Ok(state.len())
     }
+
+    /// Check whether there are no tracked files
+    pub fn is_empty(&self) -> FlashgrepResult<bool> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| crate::FlashgrepError::Index("Failed to acquire read lock".to_string()))?;
+        Ok(state.is_empty())
+    }
 }
 
 impl Default for ThreadSafeIndexState {

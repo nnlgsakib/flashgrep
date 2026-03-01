@@ -10,7 +10,7 @@ use crate::FlashgrepResult;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tantivy::schema::*;
 use tantivy::{Index, IndexWriter, Term};
 use tracing::{debug, error, info};
@@ -102,7 +102,7 @@ impl Indexer {
     }
 
     /// Create or open the Tantivy index
-    fn create_or_open_index(index_dir: &PathBuf) -> FlashgrepResult<Index> {
+    fn create_or_open_index(index_dir: &Path) -> FlashgrepResult<Index> {
         let schema = Self::create_schema();
 
         if index_dir.exists() && index_dir.join("meta.json").exists() {
@@ -117,7 +117,7 @@ impl Indexer {
 
     /// Index a single file with batch inserts for better performance
     /// Skips files that haven't changed since last indexing
-    pub fn index_file(&mut self, file_path: &PathBuf) -> FlashgrepResult<bool> {
+    pub fn index_file(&mut self, file_path: &Path) -> FlashgrepResult<bool> {
         debug!("Checking file: {}", file_path.display());
 
         if !self.semantic_vectors_enabled {
@@ -150,7 +150,7 @@ impl Indexer {
         // Chunk the file
         let chunks = self
             .chunker
-            .chunk_file(file_path.clone(), &content, last_modified);
+            .chunk_file(file_path.to_path_buf(), &content, last_modified);
 
         // Collect all symbols from all chunks
         let mut all_symbols = Vec::new();
@@ -160,7 +160,7 @@ impl Indexer {
             // Detect symbols
             let symbols = self.symbol_detector.detect_in_chunk(
                 &chunk.content,
-                file_path.clone(),
+                file_path.to_path_buf(),
                 chunk.start_line,
             );
             all_symbols.extend(symbols);
@@ -243,10 +243,10 @@ impl Indexer {
 
     /// Index the entire repository
     /// Only reindexes files that have changed since last indexing
-    pub fn index_repository(&mut self, repo_root: &PathBuf) -> FlashgrepResult<IndexStats> {
+    pub fn index_repository(&mut self, repo_root: &Path) -> FlashgrepResult<IndexStats> {
         info!("Starting repository indexing: {}", repo_root.display());
 
-        let scanner = FileScanner::new(repo_root.clone(), self.config.clone());
+        let scanner = FileScanner::new(repo_root.to_path_buf(), self.config.clone());
         let files: Vec<_> = scanner.scan().collect();
         let total_files = files.len();
 
@@ -471,7 +471,7 @@ impl Indexer {
     }
 
     /// Check if an index exists at the given path
-    pub fn index_exists(repo_root: &PathBuf) -> bool {
+    pub fn index_exists(repo_root: &Path) -> bool {
         let paths = FlashgrepPaths::new(repo_root);
         paths.exists()
     }
@@ -500,7 +500,7 @@ impl Indexer {
     }
 
     /// Remove one file from both Tantivy and metadata store.
-    pub fn remove_file_from_index(&mut self, file_path: &PathBuf) -> FlashgrepResult<()> {
+    pub fn remove_file_from_index(&mut self, file_path: &Path) -> FlashgrepResult<()> {
         let schema = self.index.schema();
         let file_path_field = schema.get_field("file_path").unwrap();
         self.writer.delete_term(Term::from_field_text(
@@ -516,7 +516,7 @@ impl Indexer {
     /// Returns (removed, kept) counts.
     pub fn reconcile_ignored_files(
         &mut self,
-        repo_root: &PathBuf,
+        repo_root: &Path,
         ignore_patterns: &FlashgrepIgnore,
     ) -> FlashgrepResult<(usize, usize)> {
         let indexed_files = self.db.get_all_files()?;

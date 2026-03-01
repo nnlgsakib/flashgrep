@@ -7,7 +7,7 @@ use crate::FlashgrepResult;
 use glob::{MatchOptions, Pattern};
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tantivy::query::QueryParser;
 use tantivy::{Index, IndexReader, ReloadPolicy};
 use tracing::debug;
@@ -153,7 +153,7 @@ pub struct Searcher {
 
 impl Searcher {
     /// Create a new searcher
-    pub fn new(index: &Index, db_path: &PathBuf) -> FlashgrepResult<Self> {
+    pub fn new(index: &Index, db_path: &Path) -> FlashgrepResult<Self> {
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommit)
@@ -521,7 +521,7 @@ impl Searcher {
     /// Get a specific slice of a file by line range
     pub fn get_slice(
         &self,
-        file_path: &PathBuf,
+        file_path: &Path,
         start_line: usize,
         end_line: usize,
     ) -> FlashgrepResult<Option<String>> {
@@ -583,7 +583,7 @@ fn compile_patterns(patterns: &[String]) -> FlashgrepResult<Vec<Pattern>> {
 }
 
 fn path_matches(
-    path: &PathBuf,
+    path: &Path,
     include: &[Pattern],
     exclude: &[Pattern],
     case_sensitive: bool,
@@ -697,7 +697,7 @@ fn matches_query(
 }
 
 fn render_context_preview(
-    file_path: &PathBuf,
+    file_path: &Path,
     start_line: usize,
     end_line: usize,
     context: usize,

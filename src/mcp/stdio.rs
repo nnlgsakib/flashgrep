@@ -77,13 +77,13 @@ impl McpStdioServer {
                 continue;
             }
 
-            if trimmed_line.as_bytes().len() > MAX_MCP_REQUEST_BYTES {
+            if trimmed_line.len() > MAX_MCP_REQUEST_BYTES {
                 let error_response = JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: None,
                     result: Some(payload_too_large_error(
                         "request",
-                        trimmed_line.as_bytes().len(),
+                        trimmed_line.len(),
                         MAX_MCP_REQUEST_BYTES,
                         &chunking_guidance(MAX_MCP_REQUEST_BYTES),
                     )),
@@ -921,13 +921,13 @@ fn write_response_line<W: Write>(
     response: &JsonRpcResponse,
 ) -> FlashgrepResult<()> {
     let mut response_json = serde_json::to_string(response)?;
-    if response_json.as_bytes().len() > MAX_MCP_RESPONSE_BYTES {
+    if response_json.len() > MAX_MCP_RESPONSE_BYTES {
         let fallback = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: response.id,
             result: Some(payload_too_large_error(
                 "response",
-                response_json.as_bytes().len(),
+                response_json.len(),
                 MAX_MCP_RESPONSE_BYTES,
                 &chunking_guidance(MAX_MCP_RESPONSE_BYTES),
             )),

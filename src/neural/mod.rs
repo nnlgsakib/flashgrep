@@ -9,7 +9,7 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "neural")]
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -241,7 +241,7 @@ pub fn ensure_model_for_startup_prompt(
         interactive,
         response_override,
         scope_prompt_override,
-        |p, scope| ensure_model_cached_for_scope(p, scope),
+        ensure_model_cached_for_scope,
     )
 }
 
@@ -398,7 +398,7 @@ fn ensure_model_cached_for_scope(
 }
 
 #[cfg(feature = "neural")]
-fn initialize_embedder(cache_dir: &PathBuf) -> FlashgrepResult<()> {
+fn initialize_embedder(cache_dir: &Path) -> FlashgrepResult<()> {
     if std::env::var("FLASHGREP_OFFLINE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -417,7 +417,7 @@ fn initialize_embedder(cache_dir: &PathBuf) -> FlashgrepResult<()> {
 
     let options = InitOptions::new(EmbeddingModel::BGESmallENV15)
         .with_show_download_progress(true)
-        .with_cache_dir(cache_dir.clone());
+        .with_cache_dir(cache_dir.to_path_buf());
 
     let embedding = TextEmbedding::try_new(options).map_err(|e| {
         FlashgrepError::Config(format!("Failed to initialize embedding model: {e}"))
@@ -453,7 +453,7 @@ pub fn embed_text(paths: &FlashgrepPaths, text: &str) -> FlashgrepResult<Vec<f32
             .embed(vec![text.to_string()], None)
             .map_err(|e| FlashgrepError::Search(format!("Embedding failed: {e}")))?;
 
-        return Ok(results.into_iter().next().unwrap_or_default());
+        Ok(results.into_iter().next().unwrap_or_default())
     }
 
     #[cfg(not(feature = "neural"))]
@@ -482,7 +482,7 @@ pub fn embed_texts(paths: &FlashgrepPaths, texts: &[String]) -> FlashgrepResult<
             .embed(texts.to_vec(), None)
             .map_err(|e| FlashgrepError::Search(format!("Embedding failed: {e}")))?;
 
-        return Ok(results);
+        Ok(results)
     }
 
     #[cfg(not(feature = "neural"))]
@@ -557,6 +557,12 @@ mod tests {
         let paths = FlashgrepPaths::new(&repo_root);
         paths.create()?;
 
+        let config = crate::config::Config {
+            global_model_cache_path: Some(temp.path().join("isolated-global-model-cache")),
+            ..Default::default()
+        };
+        config.to_file(&paths.config_file())?;
+
         let mut downloader_called = false;
         let outcome = ensure_model_for_startup_prompt_with(
             &paths,
@@ -581,6 +587,12 @@ mod tests {
         let repo_root = temp.path().to_path_buf();
         let paths = FlashgrepPaths::new(&repo_root);
         paths.create()?;
+
+        let config = crate::config::Config {
+            global_model_cache_path: Some(temp.path().join("isolated-global-model-cache")),
+            ..Default::default()
+        };
+        config.to_file(&paths.config_file())?;
 
         let mut downloader_called = false;
         let outcome = ensure_model_for_startup_prompt_with(
@@ -607,6 +619,12 @@ mod tests {
         let paths = FlashgrepPaths::new(&repo_root);
         paths.create()?;
 
+        let config = crate::config::Config {
+            global_model_cache_path: Some(temp.path().join("isolated-global-model-cache")),
+            ..Default::default()
+        };
+        config.to_file(&paths.config_file())?;
+
         let mut downloader_called = false;
         let outcome = ensure_model_for_startup_prompt_with(
             &paths,
@@ -632,8 +650,10 @@ mod tests {
         let paths = FlashgrepPaths::new(&repo_root);
         paths.create()?;
 
-        let mut config = crate::config::Config::default();
-        config.global_model_cache_path = Some(temp.path().join("shared-model-cache"));
+        let config = crate::config::Config {
+            global_model_cache_path: Some(temp.path().join("shared-model-cache")),
+            ..Default::default()
+        };
         config.to_file(&paths.config_file())?;
 
         let mut selected_scope = None;
@@ -662,7 +682,7 @@ mod tests {
         paths.create()?;
 
         let mut selected_scope = None;
-        let result = ensure_model_for_startup_prompt_with(
+        let outcome = ensure_model_for_startup_prompt_with(
             &paths,
             "index startup",
             true,
@@ -674,8 +694,13 @@ mod tests {
             },
         );
 
-        assert!(result.is_ok());
-        assert_eq!(selected_scope, Some(ModelStorageScope::Global));
+        let outcome = outcome?;
+        if selected_scope == Some(ModelStorageScope::Global) {
+            assert_eq!(outcome, ModelStartupPromptOutcome::Downloaded);
+        } else {
+            assert_eq!(outcome, ModelStartupPromptOutcome::AlreadyCached);
+            assert_eq!(selected_scope, None);
+        }
         Ok(())
     }
 
@@ -689,8 +714,10 @@ mod tests {
         let global_cache_root = temp.path().join("shared-model-cache");
         write_manifest(&global_cache_root)?;
 
-        let mut config = crate::config::Config::default();
-        config.global_model_cache_path = Some(global_cache_root);
+        let config = crate::config::Config {
+            global_model_cache_path: Some(global_cache_root),
+            ..Default::default()
+        };
         config.to_file(&paths.config_file())?;
 
         let mut downloader_called = false;
@@ -721,8 +748,10 @@ mod tests {
         let global_cache_root = temp.path().join("shared-model-cache");
         write_manifest(&global_cache_root)?;
 
-        let mut config = crate::config::Config::default();
-        config.global_model_cache_path = Some(global_cache_root);
+        let config = crate::config::Config {
+            global_model_cache_path: Some(global_cache_root),
+            ..Default::default()
+        };
         config.to_file(&paths.config_file())?;
 
         assert!(is_model_cached(&paths)?);
@@ -739,8 +768,10 @@ mod tests {
         let global_cache_root = temp.path().join("shared-model-cache");
         write_manifest(&global_cache_root)?;
 
-        let mut config = crate::config::Config::default();
-        config.global_model_cache_path = Some(global_cache_root.clone());
+        let config = crate::config::Config {
+            global_model_cache_path: Some(global_cache_root.clone()),
+            ..Default::default()
+        };
         config.to_file(&paths.config_file())?;
 
         assert_eq!(resolve_embedding_cache_root(&paths)?, global_cache_root);
@@ -757,8 +788,10 @@ mod tests {
         let global_cache_root = temp.path().join("shared-model-cache");
         write_manifest(&global_cache_root)?;
 
-        let mut config = crate::config::Config::default();
-        config.global_model_cache_path = Some(global_cache_root.clone());
+        let config = crate::config::Config {
+            global_model_cache_path: Some(global_cache_root.clone()),
+            ..Default::default()
+        };
         config.to_file(&paths.config_file())?;
 
         assert_eq!(

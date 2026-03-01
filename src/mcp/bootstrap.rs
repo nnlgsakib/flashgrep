@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn bootstrap_defaults_to_embedded_when_skill_file_missing() {
         let temp = TempDir::new().expect("temp dir");
-        let paths = FlashgrepPaths::new(&temp.path().to_path_buf());
+        let paths = FlashgrepPaths::new(temp.path());
         let state = AtomicBool::new(false);
         let payload =
             build_bootstrap_payload(&paths, "flashgrep-init", &json!({"compact": true}), &state)
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn repo_override_is_opt_in_and_reports_fallback_diagnostics() {
         let temp = TempDir::new().expect("temp dir");
-        let paths = FlashgrepPaths::new(&temp.path().to_path_buf());
+        let paths = FlashgrepPaths::new(temp.path());
         let state = AtomicBool::new(false);
         let payload = build_bootstrap_payload(
             &paths,

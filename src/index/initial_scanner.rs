@@ -156,7 +156,10 @@ impl InitialScanner {
                             }
 
                             // Log progress
-                            if result.files_scanned % self.progress_interval == 0 {
+                            if result
+                                .files_scanned
+                                .is_multiple_of(self.progress_interval)
+                            {
                                 info!(
                                     "Initial indexing progress: {} files scanned",
                                     result.files_scanned
@@ -274,7 +277,7 @@ impl InitialScanner {
     async fn extract_file_metadata(&self, path: &Path) -> FlashgrepResult<FileMetadata> {
         let metadata = tokio::fs::metadata(path)
             .await
-            .map_err(|e| crate::FlashgrepError::Io(e))?;
+            .map_err(crate::FlashgrepError::Io)?;
 
         let size = metadata.len();
 
@@ -299,7 +302,7 @@ impl InitialScanner {
     async fn compute_content_hash(&self, path: &Path) -> FlashgrepResult<String> {
         let content = tokio::fs::read(path)
             .await
-            .map_err(|e| crate::FlashgrepError::Io(e))?;
+            .map_err(crate::FlashgrepError::Io)?;
 
         let hash_input = if content.len() > MAX_HASH_BYTES {
             &content[..MAX_HASH_BYTES]

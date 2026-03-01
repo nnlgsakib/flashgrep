@@ -14,7 +14,7 @@ use crate::FlashgrepResult;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::info;
 
@@ -311,7 +311,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Index { path, force } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             info!("Indexing repository: {}", repo_root.display());
             let paths = FlashgrepPaths::new(&repo_root);
             let _ = ensure_model_for_startup_prompt(&paths, "index startup")?;
@@ -333,7 +333,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Start { path, background } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             let canonical_repo_root = WatcherRegistry::canonicalize_repo_path(&repo_root)?;
             info!("Starting file watcher for: {}", repo_root.display());
 
@@ -397,7 +397,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Stop { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             let canonical_repo_root = WatcherRegistry::canonicalize_repo_path(&repo_root)?;
             info!("Stopping file watcher for: {}", repo_root.display());
 
@@ -456,7 +456,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             offset,
             output,
         } => {
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let mut options = QueryOptions::new(text.clone(), limit.max(1));
             options.mode = mode.into();
             options.retrieval_mode = retrieval_mode.into();
@@ -526,7 +526,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             limit,
             output,
         } => {
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let mut files = searcher.list_files()?;
 
             let mut includes = include;
@@ -623,7 +623,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Fs { command, path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             handle_fs_command(&repo_root, command)?;
             Ok(RunOutcome::Success)
         }
@@ -633,7 +633,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             limit,
             output,
         } => {
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let mut symbols = searcher.get_symbol(&symbol_name)?;
             symbols.sort_by(|a, b| {
                 a.file_path
@@ -678,7 +678,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
                 ));
             }
 
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let normalized_path = if file_path.is_absolute() {
                 file_path
             } else {
@@ -709,7 +709,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Stats { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
 
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
@@ -740,7 +740,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             port,
             log_level,
         } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             info!("Starting MCP server for: {}", repo_root.display());
 
             // Check if index exists
@@ -779,7 +779,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::McpStdio { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             info!("Starting MCP stdio server for: {}", repo_root.display());
 
             // Check if index exists
@@ -797,7 +797,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Clear { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
 
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found.");
@@ -850,7 +850,7 @@ fn print_active_watchers(registry: &WatcherRegistry) {
     }
 }
 
-fn spawn_background_watcher(repo_root: &PathBuf) -> FlashgrepResult<u32> {
+fn spawn_background_watcher(repo_root: &Path) -> FlashgrepResult<u32> {
     let exe_path = std::env::current_exe()?;
     let args = vec![
         OsString::from("start"),
@@ -886,7 +886,7 @@ fn spawn_process_for_background(
     Ok(child.id())
 }
 
-fn create_searcher(path: Option<&PathBuf>) -> FlashgrepResult<(PathBuf, Searcher)> {
+fn create_searcher(path: Option<&Path>) -> FlashgrepResult<(PathBuf, Searcher)> {
     let repo_root = get_repo_root(path)?;
     let paths = FlashgrepPaths::new(&repo_root);
     if !paths.exists() {

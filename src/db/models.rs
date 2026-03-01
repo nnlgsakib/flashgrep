@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Represents a chunk of a file for indexing
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -168,7 +168,7 @@ pub struct FileMetadata {
 
 impl FileMetadata {
     /// Detect language from file extension
-    pub fn detect_language(path: &PathBuf) -> Option<String> {
+    pub fn detect_language(path: &Path) -> Option<String> {
         path.extension().and_then(|ext| ext.to_str()).map(|ext| {
             match ext.to_lowercase().as_str() {
                 "rs" => "rust",
@@ -188,7 +188,7 @@ impl FileMetadata {
     }
 
     /// Create metadata from a file path
-    pub fn from_path(path: &PathBuf) -> anyhow::Result<Self> {
+    pub fn from_path(path: &Path) -> anyhow::Result<Self> {
         let metadata = std::fs::metadata(path)?;
         let file_size = metadata.len();
         let last_modified = metadata
@@ -199,7 +199,7 @@ impl FileMetadata {
 
         Ok(Self {
             id: None,
-            file_path: path.clone(),
+            file_path: path.to_path_buf(),
             file_size,
             last_modified,
             language,
@@ -308,7 +308,7 @@ mod tests {
         let mut temp_file = NamedTempFile::new()?;
         writeln!(temp_file, "test content")?;
 
-        let metadata = FileMetadata::from_path(&temp_file.path().to_path_buf())?;
+        let metadata = FileMetadata::from_path(temp_file.path())?;
         assert!(metadata.file_size > 0);
         assert!(metadata.last_modified > 0);
 

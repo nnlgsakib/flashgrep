@@ -1,7 +1,7 @@
 pub mod paths;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -91,7 +91,7 @@ impl Default for Config {
 
 impl Config {
     /// Load configuration from a file
-    pub fn from_file(path: &PathBuf) -> anyhow::Result<Self> {
+    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
         config.normalize_model_paths(path)?;
@@ -99,18 +99,18 @@ impl Config {
     }
 
     /// Save configuration to a file
-    pub fn to_file(&self, path: &PathBuf) -> anyhow::Result<()> {
+    pub fn to_file(&self, path: &Path) -> anyhow::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
     /// Get the default configuration file path within a flashgrep directory
-    pub fn default_path(flashgrep_dir: &PathBuf) -> PathBuf {
+    pub fn default_path(flashgrep_dir: &Path) -> PathBuf {
         flashgrep_dir.join("config.json")
     }
 
-    fn normalize_model_paths(&mut self, config_path: &PathBuf) -> anyhow::Result<()> {
+    fn normalize_model_paths(&mut self, config_path: &Path) -> anyhow::Result<()> {
         if let Some(path) = self.global_model_cache_path.clone() {
             if path.as_os_str().is_empty() {
                 anyhow::bail!(

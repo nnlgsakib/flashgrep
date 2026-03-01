@@ -14,7 +14,7 @@ use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, W
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -76,7 +76,7 @@ impl FileWatcher {
     }
 
     /// Create a default .flashgrepignore file if it doesn't exist
-    fn create_default_ignore_file(repo_root: &PathBuf) -> FlashgrepResult<()> {
+    fn create_default_ignore_file(repo_root: &Path) -> FlashgrepResult<()> {
         let ignore_file = repo_root.join(".flashgrepignore");
 
         if !ignore_file.exists() {
@@ -284,7 +284,7 @@ Thumbs.db
     }
 
     /// Check if a path should be ignored by the file watcher
-    fn should_ignore_path(&self, path: &PathBuf) -> bool {
+    fn should_ignore_path(&self, path: &Path) -> bool {
         // Skip the .flashgrep directory
         if path.components().any(|c| {
             if let std::path::Component::Normal(name) = c {
@@ -328,7 +328,7 @@ Thumbs.db
         false
     }
 
-    fn is_ignore_file(path: &PathBuf) -> bool {
+    fn is_ignore_file(path: &Path) -> bool {
         path.file_name()
             .and_then(|s| s.to_str())
             .map(|n| n == ".flashgrepignore" || n == ".gitignore")
@@ -348,7 +348,7 @@ Thumbs.db
     }
 
     /// Handle a single file change
-    fn handle_change(&mut self, path: &PathBuf) -> FlashgrepResult<()> {
+    fn handle_change(&mut self, path: &Path) -> FlashgrepResult<()> {
         if self.ignore_patterns.is_ignored(path, &self.repo_root) {
             debug!(
                 "Path became ignored, pruning if indexed: {}",
@@ -395,7 +395,7 @@ Thumbs.db
     }
 
     /// Update index state for a single file
-    fn update_index_state_for_file(&mut self, path: &PathBuf) -> FlashgrepResult<()> {
+    fn update_index_state_for_file(&mut self, path: &Path) -> FlashgrepResult<()> {
         use crate::index::state::FileMetadata;
         use sha2::{Digest, Sha256};
         use std::time::SystemTime;
@@ -447,7 +447,7 @@ impl Drop for FileWatcher {
     }
 }
 
-fn acquire_watcher_lock(repo_root: &PathBuf) -> FlashgrepResult<PathBuf> {
+fn acquire_watcher_lock(repo_root: &Path) -> FlashgrepResult<PathBuf> {
     let paths = FlashgrepPaths::new(repo_root);
     std::fs::create_dir_all(paths.root())?;
     let lock_path = paths.root().join("watcher.lock");

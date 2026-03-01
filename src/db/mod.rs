@@ -4,7 +4,7 @@ use crate::FlashgrepResult;
 use models::{Chunk, ChunkVector, FileMetadata, IndexStats, SemanticChunk, Symbol};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Database wrapper with connection pooling
@@ -14,7 +14,7 @@ pub struct Database {
 
 impl Database {
     /// Open or create the database at the given path with optimizations
-    pub fn open(path: &PathBuf) -> FlashgrepResult<Self> {
+    pub fn open(path: &Path) -> FlashgrepResult<Self> {
         let manager = SqliteConnectionManager::file(path);
         let pool = Pool::builder()
             .max_size(10) // Max 10 connections in pool
@@ -290,7 +290,7 @@ impl Database {
     }
 
     /// Delete all chunks for a file
-    pub fn delete_file_chunks(&self, file_path: &PathBuf) -> FlashgrepResult<usize> {
+    pub fn delete_file_chunks(&self, file_path: &Path) -> FlashgrepResult<usize> {
         let conn = self.pool.get()?;
         let count = conn.execute(
             "DELETE FROM chunks WHERE file_path = ?1",
@@ -300,7 +300,7 @@ impl Database {
     }
 
     /// Delete all symbols for a file
-    pub fn delete_file_symbols(&self, file_path: &PathBuf) -> FlashgrepResult<usize> {
+    pub fn delete_file_symbols(&self, file_path: &Path) -> FlashgrepResult<usize> {
         let conn = self.pool.get()?;
         let count = conn.execute(
             "DELETE FROM symbols WHERE file_path = ?1",
@@ -310,7 +310,7 @@ impl Database {
     }
 
     /// Delete all semantic vectors for a file.
-    pub fn delete_file_vectors(&self, file_path: &PathBuf) -> FlashgrepResult<usize> {
+    pub fn delete_file_vectors(&self, file_path: &Path) -> FlashgrepResult<usize> {
         let conn = self.pool.get()?;
         let count = conn.execute(
             "DELETE FROM chunk_vectors WHERE file_path = ?1",
@@ -320,7 +320,7 @@ impl Database {
     }
 
     /// Delete a file and all its associated chunks and symbols
-    pub fn delete_file(&self, file_path: &PathBuf) -> FlashgrepResult<()> {
+    pub fn delete_file(&self, file_path: &Path) -> FlashgrepResult<()> {
         let conn = self.pool.get()?;
         conn.execute(
             "DELETE FROM files WHERE file_path = ?1",
@@ -351,11 +351,7 @@ impl Database {
     }
 
     /// Check if a file needs reindexing (returns true if file is new or modified)
-    pub fn needs_reindex(
-        &self,
-        file_path: &PathBuf,
-        current_modified: i64,
-    ) -> FlashgrepResult<bool> {
+    pub fn needs_reindex(&self, file_path: &Path, current_modified: i64) -> FlashgrepResult<bool> {
         let conn = self.pool.get()?;
         let path_str = file_path.to_string_lossy().to_string();
 
@@ -667,7 +663,7 @@ mod tests {
             "fn auth_handler() {}".to_string(),
             1000,
         );
-        db.insert_chunks_batch(&[chunk.clone()])?;
+        db.insert_chunks_batch(std::slice::from_ref(&chunk))?;
 
         let vector = ChunkVector {
             id: None,

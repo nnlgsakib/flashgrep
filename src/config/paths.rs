@@ -1,5 +1,5 @@
 use crate::FlashgrepResult;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Manages the .flashgrep directory structure
 #[derive(Debug, Clone)]
@@ -9,7 +9,7 @@ pub struct FlashgrepPaths {
 
 impl FlashgrepPaths {
     /// Create a new FlashgrepPaths instance for a given repository root
-    pub fn new(repo_root: &PathBuf) -> Self {
+    pub fn new(repo_root: &Path) -> Self {
         Self {
             root: repo_root.join(crate::FLASHGREP_DIR),
         }
@@ -101,8 +101,8 @@ impl FlashgrepPaths {
 }
 
 /// Find the repository root by looking for .flashgrep directory or .git
-pub fn find_repo_root(start_path: &PathBuf) -> Option<PathBuf> {
-    let mut current = start_path.clone();
+pub fn find_repo_root(start_path: &Path) -> Option<PathBuf> {
+    let mut current = start_path.to_path_buf();
 
     loop {
         // Check for .flashgrep directory
@@ -126,7 +126,7 @@ pub fn find_repo_root(start_path: &PathBuf) -> Option<PathBuf> {
 }
 
 /// Get the current working directory as repository root, or use the provided path
-pub fn get_repo_root(path: Option<&PathBuf>) -> FlashgrepResult<PathBuf> {
+pub fn get_repo_root(path: Option<&Path>) -> FlashgrepResult<PathBuf> {
     match path {
         Some(p) => {
             let canonical = p.canonicalize()?;
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn test_flashgrep_paths() {
         let temp_dir = TempDir::new().unwrap();
-        let paths = FlashgrepPaths::new(&temp_dir.path().to_path_buf());
+        let paths = FlashgrepPaths::new(temp_dir.path());
 
         assert!(paths.root().ends_with(".flashgrep"));
         assert!(paths.metadata_db().ends_with(".flashgrep/metadata.db"));
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn test_create_and_remove() -> FlashgrepResult<()> {
         let temp_dir = TempDir::new()?;
-        let paths = FlashgrepPaths::new(&temp_dir.path().to_path_buf());
+        let paths = FlashgrepPaths::new(temp_dir.path());
 
         assert!(!paths.exists());
 

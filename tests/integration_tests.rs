@@ -9,7 +9,7 @@ use flashgrep::neural::{ensure_model_for_startup_prompt, ModelStartupPromptOutco
 use flashgrep::search::Searcher;
 use flashgrep::symbols::SymbolDetector;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 struct EnvGuard {
@@ -41,7 +41,7 @@ impl Drop for EnvGuard {
 }
 
 /// Helper to create a test file with content
-fn create_test_file(dir: &PathBuf, name: &str, content: &str) {
+fn create_test_file(dir: &Path, name: &str, content: &str) {
     let path = dir.join(name);
     fs::write(&path, content).expect("Failed to write test file");
 }
@@ -220,7 +220,7 @@ fn test_database_batch_inserts() {
     assert_eq!(count, chunks.len());
 
     let stats = db.get_stats().expect("Failed to get stats");
-    assert_eq!(stats.total_chunks, chunks.len() as usize);
+    assert_eq!(stats.total_chunks, chunks.len());
 }
 
 #[test]
@@ -509,6 +509,12 @@ fn test_noninteractive_startup_uses_local_scope_without_prompt() {
     let paths = FlashgrepPaths::new(&repo_root);
     paths.create().unwrap();
 
+    let config = Config {
+        global_model_cache_path: Some(repo_root.join("isolated-global-model-cache")),
+        ..Default::default()
+    };
+    config.to_file(&paths.config_file()).unwrap();
+
     let _noninteractive = EnvGuard::set("FLASHGREP_NONINTERACTIVE", "1");
     let _prompt_response = EnvGuard::unset("FLASHGREP_MODEL_PROMPT_RESPONSE");
     let _scope_override = EnvGuard::unset("FLASHGREP_MODEL_CACHE_SCOPE");
@@ -524,8 +530,10 @@ fn test_global_scope_uses_configured_or_default_path_without_error() {
     let paths = FlashgrepPaths::new(&repo_root);
     paths.create().unwrap();
 
-    let mut config = Config::default();
-    config.global_model_cache_path = Some(repo_root.join("shared-global-model-cache"));
+    let config = Config {
+        global_model_cache_path: Some(repo_root.join("shared-global-model-cache")),
+        ..Default::default()
+    };
     config.to_file(&paths.config_file()).unwrap();
 
     let _scope_override = EnvGuard::set("FLASHGREP_MODEL_CACHE_SCOPE", "global");

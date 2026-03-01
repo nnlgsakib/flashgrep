@@ -45,8 +45,8 @@ impl Chunker {
         let mut bracket_depth = 0;
         let mut last_blank_line = None;
 
-        for i in start..max_end {
-            let line = lines[i].trim();
+        for (i, source_line) in lines.iter().enumerate().take(max_end).skip(start) {
+            let line = source_line.trim();
 
             // Track bracket depth
             for c in line.chars() {

@@ -97,10 +97,10 @@ async fn handle_connection(mut stream: TcpStream, paths: FlashgrepPaths) -> Flas
             continue;
         }
 
-        if trimmed_line.as_bytes().len() > MAX_MCP_REQUEST_BYTES {
+        if trimmed_line.len() > MAX_MCP_REQUEST_BYTES {
             let payload = payload_too_large_error(
                 "request",
-                trimmed_line.as_bytes().len(),
+                trimmed_line.len(),
                 MAX_MCP_REQUEST_BYTES,
                 &chunking_guidance(MAX_MCP_REQUEST_BYTES),
             );
@@ -151,13 +151,13 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut response_json = serde_json::to_string(&response)?;
-    if response_json.as_bytes().len() > MAX_MCP_RESPONSE_BYTES {
+    if response_json.len() > MAX_MCP_RESPONSE_BYTES {
         let fallback = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: response.id,
             result: Some(payload_too_large_error(
                 "response",
-                response_json.as_bytes().len(),
+                response_json.len(),
                 MAX_MCP_RESPONSE_BYTES,
                 &chunking_guidance(MAX_MCP_RESPONSE_BYTES),
             )),
@@ -532,7 +532,7 @@ async fn handle_request(
 
                 if let Ok(dir_entries) = std::fs::read_dir(directory) {
                     for entry in dir_entries.flatten() {
-                        if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                        if entry.file_type().is_ok_and(|ft| ft.is_file()) {
                             let file_path = entry.path();
                             let file_name = file_path.to_string_lossy().to_string();
 
@@ -542,7 +542,7 @@ async fn handle_request(
                             } else {
                                 extensions.iter().any(|ext| {
                                     if let Some(ext_str) = ext.as_str() {
-                                        file_path.extension().map_or(false, |e| e == ext_str)
+                                        file_path.extension().is_some_and(|e| e == ext_str)
                                     } else {
                                         false
                                     }
