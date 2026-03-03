@@ -166,7 +166,7 @@ pub fn fs_write(arguments: &Value) -> FlashgrepResult<Value> {
         "ok": true,
         "operation": "fs_write",
         "dry_run": dry_run,
-        "bytes": content.as_bytes().len(),
+        "bytes": content.len(),
         "entry": if dry_run {
             json!({"path": target.to_string_lossy(), "file_type": "file"})
         } else {

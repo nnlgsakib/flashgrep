@@ -1,21 +1,11 @@
 ## MODIFIED Requirements
 
 ### Requirement: Query command for indexed text search
-The CLI SHALL provide indexed search commands for both lexical and neural workflows, SHALL support continuation-aware execution for arbitrarily large logical result sets, and SHALL expose compatibility options required for production script replacement.
+The CLI SHALL provide indexed lexical search commands, SHALL support optional neural navigation mode for natural-language discovery, SHALL support continuation-aware execution for arbitrarily large logical result sets, and SHALL expose compatibility options required for production script replacement.
 
 #### Scenario: Run text query
 - **WHEN** a user runs the query command with search text
 - **THEN** the command SHALL return ranked matches from the existing index
-- **AND** each match SHALL include file path and line range
-
-#### Scenario: Run neural intent query
-- **WHEN** a user runs the query command in semantic mode with natural-language text
-- **THEN** the command SHALL return ranked semantic matches sourced from project vectors
-- **AND** each match SHALL include file path and line range
-
-#### Scenario: Run hybrid intent query
-- **WHEN** a user runs the query command in hybrid mode
-- **THEN** the command SHALL blend lexical and semantic ranking deterministically
 - **AND** each match SHALL include file path and line range
 
 #### Scenario: Limit query output
@@ -29,6 +19,14 @@ The CLI SHALL provide indexed search commands for both lexical and neural workfl
 #### Scenario: Use grep-compatibility flags
 - **WHEN** a user provides grep-compatibility options for case, context, or literal/fixed matching
 - **THEN** the query command SHALL apply those options with deterministic behavior and documented exit statuses
+
+#### Scenario: Run neural navigation query
+- **WHEN** a user runs query in neural mode with natural-language intent text
+- **THEN** the command SHALL use neural-assisted index-first retrieval and return ranked file and line matches
+
+#### Scenario: Neural mode requested but disabled
+- **WHEN** a user requests neural mode and neural navigation is not enabled/configured
+- **THEN** the command SHALL return a deterministic configuration guidance error
 
 ### Requirement: Files command for index-aware listing
 The CLI SHALL provide an index-backed file listing command for glob-like workflows, SHALL support deterministic continuation windows for very large match sets, and SHALL expose filter controls needed for production glob replacement.

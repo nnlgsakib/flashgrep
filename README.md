@@ -2,16 +2,58 @@
 
 A high-performance, local code indexing engine designed for LLM coding agents. Flashgrep provides index-first text and structural search for fast repeated queries, deterministic outputs, and automation-friendly workflows.
 
+## Start Here (Install + MCP Init)
+
+If you just want to get running fast:
+
+1. Download the latest binary from the [latest release](https://github.com/nnlgsakib/flashgrep/releases/latest) (or build from source).
+2. Open your repository and initialize the local index:
+
+```bash
+flashgrep index
+```
+
+3. Start the indexer/watcher in the background so the index stays fresh:
+
+```bash
+flashgrep start -b
+```
+
+4. Configure your MCP client to launch Flashgrep over stdio:
+
+```json
+{
+  "mcpServers": {
+    "flashgrep": {
+      "type": "local",
+      "command": ["flashgrep", "mcp-stdio"],
+      "enabled": true
+    }
+  }
+}
+```
+
+5. Run the MCP init/bootstrap command from your client (any alias works):
+   - `bootstrap_skill`
+   - `flashgrep-init`
+   - `flashgrep_init`
+   - `fgrep-boot`
+   - `fgrep_boot`
+
+This injects policy/tool guidance for the session and prepares Flashgrep-first routing.
+
 ## Features
 
 - **Language Agnostic**: Works with any programming language using regex-based heuristics
 - **Index-First Performance**: Fast repeated queries after indexing, with incremental updates for changed files
 - **Resource Efficient**: Built for low-overhead local operation on medium and large repositories
-- **Fully Local**: No cloud dependencies, all data stays on your machine
+- **Local Index, Optional Remote LLM**: Core indexing/search stays local; optional neural reranking uses your configured provider API key
 - **Token Efficient**: Returns exact code slices, not full files
 - **Single Binary CLI**: Distributed as a single executable with local index data in `.flashgrep/`
 - **MCP Compatible**: JSON-RPC server for integration with coding agents
-- **Neural + Lexical Retrieval**: Semantic discovery with deterministic lexical fallback when exact matching is needed
+- **Lexical Retrieval**: Deterministic indexed search with smart/literal/regex query modes
+- **Optional Neural Navigation**: Knowledge-graph-first natural-language navigation using bounded candidate context and provider-assisted reranking
+- **Neural-First Option**: For discovery intents, you can run neural retrieval first with deterministic lexical fallback behavior
 
 ## Installation
 
@@ -31,7 +73,7 @@ cp target/release/flashgrep /usr/local/bin/
 
 ### Pre-built Binaries
 
-Download pre-built binaries from the [releases page](https://github.com/nnlgsakib/flashgrep/releases).
+Download pre-built binaries from the [latest release](https://github.com/nnlgsakib/flashgrep/releases/latest) (or browse all [releases](https://github.com/nnlgsakib/flashgrep/releases)).
 
 ## Quick Start
 
@@ -69,7 +111,13 @@ Features:
 - **Incremental indexing**: Only re-indexes changed files
 - **Fast**: Indexes 1,500+ files in under 3 seconds
 - **Smart filtering**: Ignores `target/`, `node_modules/`, `.git/`, etc.
-- **Model onboarding prompt**: If neural model cache is missing, startup asks whether to download `BAAI/bge-small-en-v1.5` and where to store it (`local` or `global`)
+- **Neural setup prompt**: On first interactive index, prompts for:
+  - enable/disable neural navigation
+  - provider (`openrouter` / `openai` / `custom`)
+  - model
+  - base URL
+  - API key env var name
+  - API key (optional inline)
 
 #### `flashgrep start [PATH]`
 
@@ -87,11 +135,10 @@ The daemon:
 - Watches files for changes and auto-updates index
 - Runs MCP server on `localhost:7777`
 - Supports graceful shutdown (Ctrl+C)
-- Prompts for optional neural model download before initial indexing when cache is missing (with `local`/`global` storage scope selection)
 
 #### `flashgrep query <TEXT> [PATH]`
 
-Run indexed search using lexical, semantic, or hybrid retrieval modes.
+Run indexed search with neural-first intent routing when enabled, with deterministic lexical fallback.
 
 ```bash
 # Find top matches
@@ -106,18 +153,71 @@ flashgrep query "fn\\s+main" --mode regex --include "src/**/*.rs" --context 2
 # Literal mode + case-insensitive
 flashgrep query "a+b" --mode literal --ignore-case
 
-# Semantic mode for intent-style search
-flashgrep query "find authentication middleware" --retrieval-mode semantic --limit 20
+# Retrieval mode is lexical-only
+flashgrep query "find authentication middleware" --retrieval-mode lexical --limit 20
 
-# Hybrid mode blends lexical and semantic ranking
-flashgrep query "jwt validation" --retrieval-mode hybrid --output json
+# Optional neural-assisted mode (must be enabled/configured)
+flashgrep query "find code that sorts names" --retrieval-mode neural --limit 20
+
+# Natural-language function lookup (neural mode)
+flashgrep query "find this function \"tokenize\"" --retrieval-mode neural --limit 10
+
+# Force lexical mode explicitly
+flashgrep query "tokenize" --retrieval-mode lexical --limit 20
 ```
 
-Neural retrieval uses model `BAAI/bge-small-en-v1.5` and caches assets in either:
-- Local cache: `.flashgrep/model-cache/BAAI__bge-small-en-v1.5`
-- Global cache: `global_model_cache_path/BAAI__bge-small-en-v1.5` (defaults to OS user app-data location; configurable in `.flashgrep/config.json`)
+Neural query behavior:
+- Uses knowledge-graph/index-first candidate retrieval, then provider-assisted reranking on bounded snippets.
+- Recommended discovery order: neural first, then lexical fallback if neural is unavailable or returns no relevant matches.
+- Returns `0 result(s)` when no relevant intent match is found (instead of unrelated guesses).
+- If provider/API fails, falls back deterministically to lexical retrieval.
+- No local model download step is required.
 
-On first download prompt, choose whether to store the model locally (per repository) or globally (shared across repositories).
+### Neural Navigation Setup
+
+#### Quick setup (interactive)
+
+```bash
+flashgrep index --force
+```
+
+When prompted, choose provider/model/base URL and set key inline or via env var.
+
+#### Quick setup (environment variable)
+
+OpenRouter:
+
+```bash
+# PowerShell
+$env:OPENROUTER_API_KEY="your_key_here"
+flashgrep query "find vector encoding logic" --retrieval-mode neural --limit 10
+```
+
+OpenAI:
+
+```bash
+# PowerShell
+$env:OPENAI_API_KEY="your_key_here"
+flashgrep query "find auth middleware" --retrieval-mode neural --limit 10
+```
+
+#### Provider compatibility
+
+Flashgrep neural routing uses an OpenAI-compatible chat completions SDK/client path.
+Any provider with OpenAI-compatible endpoints can be configured via:
+
+- `neural.provider.base_url`
+- `neural.provider.model`
+- `neural.provider.api_key_env` or `neural.provider.api_key`
+
+Default profile:
+
+- provider: `openrouter`
+- base_url: `https://openrouter.ai/api/v1`
+- model: `arcee-ai/trinity-large-preview:free`
+- api_key_env: `OPENROUTER_API_KEY`
+
+You can switch to any free/low-cost OpenAI-compatible provider by changing provider/model/base URL and key settings.
 
 #### `flashgrep files [PATH]`
 
@@ -267,7 +367,7 @@ Bootstrap behavior:
 - Embedded payload is default (`payload_source: embedded`) and does not require local skill files
 - Optional repository override is opt-in (`allow_repo_override: true`) and falls back deterministically when unreadable
 - Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
-- Search routing defaults to neural-first for discovery intent (`query` with `retrieval_mode=semantic` or `hybrid`), with gated lexical/programmatic fallback
+- Search routing defaults to neural-first discovery when enabled, with deterministic lexical fallback when neural routing is unavailable or non-relevant
 
 Bootstrap policy metadata:
 - `policy_metadata.policy_strength`: enforcement mode (default: `strict`)
@@ -282,8 +382,9 @@ Bootstrap policy metadata:
 - `policy_metadata.prohibited_native_tools`: native/host tools to avoid unless fallback gate is active
 
 Fallback gate defaults:
-- `neural_model_unavailable`
-- `neural_low_confidence`
+- `neural_mode_disabled`
+- `neural_provider_failure`
+- `neural_no_relevant_matches`
 - `exact_match_required`
 - `query_parse_constraints`
 - `flashgrep_index_unavailable`
@@ -306,6 +407,17 @@ Flashgrep provides skill documentation that can be used by any coding agent:
 - Primary runtime source: embedded `skills/SKILL.md` payload compiled into the binary
 - Canonical editable source: `skills/SKILL.md`
 - Optional OpenCode-managed path: `.opencode/skills/flashgrep-mcp/SKILL.md`
+
+`skills/SKILL.md` now uses a compact structured directive language (DSL) to reduce token usage while preserving the same policy behavior.
+
+Example structured directives:
+
+```text
+TASK edit_file
+FILE src/auth.rs
+FIND fn login
+REPLACE add rate_limit check
+```
 
 Use `skills/SKILL.md` as the canonical authoring source. Runtime bootstrap guidance is embedded at build time, so missing local skill files do not block injection.
 
@@ -572,14 +684,38 @@ The config is stored in `.flashgrep/config.json`:
   "enable_initial_index": true,
   "progress_interval": 1000,
   "index_state_path": "index-state.json",
-  "model_cache_scope": "local",
-  "global_model_cache_path": "C:/Users/<you>/.flashgrep/model-cache"
+  "neural": {
+    "enabled": false,
+    "initialized": false,
+    "provider": {
+      "provider": "openrouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model": "arcee-ai/trinity-large-preview:free",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "api_key": null,
+      "timeout_ms": 5000,
+      "max_candidates": 24
+    }
+  }
 }
 ```
 
-Notes:
-- `model_cache_scope` accepts `local` or `global`.
-- `global_model_cache_path` is optional; if omitted, Flashgrep uses an OS-appropriate user app-data path.
+Neural mode efficiency rules:
+- candidate retrieval stays local knowledge-graph/index-first
+- provider calls receive bounded snippet context only
+- lexical fallback remains deterministic on provider failures/timeouts
+
+Neural config field notes:
+
+- `neural.enabled`: enable neural retrieval path
+- `neural.initialized`: whether setup prompt has already been completed
+- `neural.provider.provider`: provider id (`openrouter`, `openai`, or custom)
+- `neural.provider.base_url`: OpenAI-compatible API base URL (for OpenRouter use `https://openrouter.ai/api/v1`)
+- `neural.provider.model`: chat model id
+- `neural.provider.api_key_env`: env var name for key resolution
+- `neural.provider.api_key`: optional inline key in config (use carefully)
+- `neural.provider.timeout_ms`: provider request timeout
+- `neural.provider.max_candidates`: cap on candidate snippets sent for reranking
 
 ## Architecture
 
@@ -588,9 +724,9 @@ Notes:
 - **File Scanner**: Recursively finds indexable files, respects `.flashgrepignore`
 - **Chunker**: Splits files into logical chunks (max 300 lines, preserves bracket balance)
 - **Symbol Detector**: Regex-based detection of functions, classes, imports, etc.
+- **Knowledge Graph Builder**: Builds file/chunk/symbol relationship artifacts for neural candidate routing
 - **Tantivy Index**: Full-text search engine with custom ranking
 - **SQLite Store**: Metadata storage with connection pooling and batch inserts
-- **Neural Embedding Layer**: Local semantic embeddings (`BAAI/bge-small-en-v1.5`) for intent-style retrieval
 - **File Watcher**: Incremental re-indexing with debouncing
 - **MCP Server**: JSON-RPC over TCP for agent integration
 
@@ -602,7 +738,6 @@ Flashgrep is often faster than traditional `grep`/`glob` workflows for active de
 - **No full tree scan per query**: traditional grep often re-walks directories and re-reads files every run.
 - **Structured metadata paths**: symbol lookup and file listing use indexed tables instead of regex over raw files.
 - **Watcher-assisted freshness**: background watcher updates changed files incrementally, avoiding full rebuilds.
-- **Semantic retrieval option**: neural search helps agents find intent-based matches before exact lexical narrowing.
 - **Deterministic bounded output**: command limits are enforced before render for stable, script-friendly responses.
 
 Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when you run many searches per session and want index-backed speed, structure, and deterministic pagination.
@@ -612,9 +747,10 @@ Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when yo
 1. **Scanner** discovers indexable files and applies ignore rules.
 2. **Chunker** splits files into bounded line ranges and computes content hashes.
 3. **Symbol Detector** extracts structural entries (function/class/import/etc.).
-4. **Tantivy** stores searchable text chunks and ranking fields.
-5. **SQLite** stores files/chunks/symbol metadata for lookup/list/stat operations.
-6. **CLI/MCP layers** query these stores in read mode and render text/JSON outputs.
+4. **Knowledge Graph Builder** creates relationship artifacts used for neural candidate expansion.
+5. **Tantivy** stores searchable text chunks and ranking fields.
+6. **SQLite** stores files/chunks/symbol/graph metadata for lookup/list/stat operations.
+7. **CLI/MCP layers** query these stores in read mode and render text/JSON outputs.
 
 ### Index Structure
 
@@ -623,8 +759,7 @@ Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when yo
 ├── text_index/        # Tantivy full-text index
 ├── metadata.db        # SQLite database (chunks, symbols, file metadata)
 ├── config.json        # Configuration
-├── vectors/           # Runtime vector/index auxiliary artifacts
-└── model-cache/       # Cached neural model assets (downloaded on demand)
+└── vectors/           # Runtime neural/graph auxiliary artifacts
 ```
 
 ## Performance
@@ -690,8 +825,8 @@ rg "Grep/Glob Replacement Guide" README.md
 # Ensure query parity options are documented
 rg "--mode regex|--mode literal|--ignore-case|--context" README.md
 
-# Ensure skill stays compact and references Flashgrep-first ordering
-rg "Tool Order|query|glob|read_code|write_code" skills/SKILL.md
+# Ensure structured skill directives exist and reference primary routes
+rg "FORMAT|TOOL_ORDER|WORKFLOW|query|glob|read_code|write_code" skills/SKILL.md
 ```
 
 ### Release Sanity Criteria
@@ -716,7 +851,6 @@ src/
 ├── chunking/         # File chunking logic
 ├── symbols/          # Symbol detection
 ├── search/           # Search engine
-├── neural/           # Semantic embedding/model integration
 ├── watcher/          # File system watcher
 └── mcp/              # MCP server
 ```
@@ -748,31 +882,6 @@ rm -rf .flashgrep
 flashgrep index
 ```
 
-### Semantic model download fails
-
-- Ensure internet access on first semantic/hybrid run.
-- Verify cache path is writable: `.flashgrep/model-cache/BAAI__bge-small-en-v1.5`.
-- If you intentionally run offline, pre-populate model cache first and keep `FLASHGREP_OFFLINE=1`.
-
-If cache metadata is corrupted, remove cache and retry:
-
-```bash
-rm -rf .flashgrep/model-cache/BAAI__bge-small-en-v1.5
-flashgrep query "find auth code" --retrieval-mode semantic
-```
-
-For non-interactive scripts/CI, startup skips prompts and continues lexical indexing.
-You can force this behavior with:
-
-```bash
-FLASHGREP_NONINTERACTIVE=1 flashgrep index
-```
-
-To script prompt answers explicitly:
-
-```bash
-FLASHGREP_MODEL_PROMPT_RESPONSE=y flashgrep start
-```
 
 ## License
 
@@ -788,5 +897,4 @@ Contributions are welcome! Please read CONTRIBUTING.md for guidelines.
 - [ ] Team shared index
 - [ ] Visual graph UI
 - [ ] Call graph engine
-- [x] Semantic embeddings
 - [ ] Refactor impact analysis

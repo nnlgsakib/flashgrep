@@ -1,0 +1,1 @@
+$env:OPENROUTER_API_KEY="your_key_here"; flashgrep index; flashgrep query "find code that sorts names" --retrieval-mode neural --limit 10

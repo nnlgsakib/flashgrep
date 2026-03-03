@@ -77,13 +77,13 @@ impl McpStdioServer {
                 continue;
             }
 
-            if trimmed_line.as_bytes().len() > MAX_MCP_REQUEST_BYTES {
+            if trimmed_line.len() > MAX_MCP_REQUEST_BYTES {
                 let error_response = JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: None,
                     result: Some(payload_too_large_error(
                         "request",
-                        trimmed_line.as_bytes().len(),
+                        trimmed_line.len(),
                         MAX_MCP_REQUEST_BYTES,
                         &chunking_guidance(MAX_MCP_REQUEST_BYTES),
                     )),
@@ -179,7 +179,7 @@ impl McpStdioServer {
                                 "text": {"type": "string", "description": "Search text"},
                                 "limit": {"type": "integer", "description": "Maximum results", "default": 10},
                                 "mode": {"type": "string", "enum": ["smart", "literal", "regex"], "default": "smart"},
-                                "retrieval_mode": {"type": "string", "enum": ["lexical", "semantic", "hybrid"], "default": "lexical"},
+                                "retrieval_mode": {"type": "string", "enum": ["lexical", "neural"], "default": "lexical"},
                                 "case_sensitive": {"type": "boolean", "default": true},
                                 "regex_flags": {"type": "string", "description": "Regex flags (e.g. i for case-insensitive)"},
                                 "include": {"type": "array", "items": {"type": "string"}},
@@ -921,13 +921,13 @@ fn write_response_line<W: Write>(
     response: &JsonRpcResponse,
 ) -> FlashgrepResult<()> {
     let mut response_json = serde_json::to_string(response)?;
-    if response_json.as_bytes().len() > MAX_MCP_RESPONSE_BYTES {
+    if response_json.len() > MAX_MCP_RESPONSE_BYTES {
         let fallback = JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: response.id,
             result: Some(payload_too_large_error(
                 "response",
-                response_json.as_bytes().len(),
+                response_json.len(),
                 MAX_MCP_RESPONSE_BYTES,
                 &chunking_guidance(MAX_MCP_RESPONSE_BYTES),
             )),

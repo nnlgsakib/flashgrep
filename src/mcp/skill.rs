@@ -18,7 +18,7 @@ impl Default for SkillInfo {
     fn default() -> Self {
         Self {
             name: "flashgrep".to_string(),
-            version: "0.1.0".to_string(),
+            version: "1.1.0".to_string(),
             description: "High-performance local code indexing engine".to_string(),
             author: "Flashgrep Contributors".to_string(),
             repository: "https://github.com/nnlgsakib/flashgrep".to_string(),
@@ -305,21 +305,25 @@ pub fn get_skill_documentation() -> SkillDocumentation {
     }
 
     SkillDocumentation {
-        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Bootstrap uses embedded guidance by default at init and policy metadata enforces neural-first search routing for discovery intents, with deterministic gated fallback to programmatic tools when required.".to_string(),
+        overview: "Flashgrep MCP bootstrap injects HYBRID policy directives (compact DSL + strict guard rules) to enforce agent behavior. Discovery is neural-first, lexical fallback is deterministic, and native tools are blocked unless a typed fallback gate is active.".to_string(),
         commands,
     }
 }
 
 pub fn bootstrap_policy() -> Vec<String> {
     vec![
-        "Always use Flashgrep-native tools first; treat them as primary routing.".to_string(),
-        "For discovery-style search, prefer neural retrieval first (query with retrieval_mode=semantic or hybrid).".to_string(),
-        "Use programmatic/lexical search only as second-choice fallback under explicit typed gates.".to_string(),
-        "Do not use native grep/glob/read/write tools unless a declared fallback gate is active."
-            .to_string(),
-        "Use query/files/symbol for indexed discovery and navigation.".to_string(),
-        "Use read_code with budgets for token-efficient reads.".to_string(),
-        "Use write_code for targeted, precondition-safe edits.".to_string(),
+        "FORMAT v1 HYBRID_ENFORCED".to_string(),
+        "ENFORCE bootstrap_required=true reason_code_required=true".to_string(),
+        "ROUTE discovery primary=query(neural) fallback=query(lexical)".to_string(),
+        "ROUTE files primary=glob|files symbols=get_symbol reads=read_code writes=write_code".to_string(),
+        "RULE native_tools_banned=true unless=fallback_gate_active".to_string(),
+        "RULE no_guessing=true empty_results_valid=true".to_string(),
+        "FALLBACK neural_mode_disabled neural_provider_failure neural_no_relevant_matches".to_string(),
+        "FALLBACK exact_match_required query_parse_constraints flashgrep_index_unavailable".to_string(),
+        "FALLBACK flashgrep_operation_not_supported flashgrep_tool_runtime_failure repo_override_unavailable".to_string(),
+        "WORKFLOW discovery query(neural)->query(lexical_on_fail_or_no_match)->get_symbol->read_code".to_string(),
+        "WORKFLOW edit read_code->write_code(precondition)->read_code".to_string(),
+        "WORKFLOW recovery bootstrap(force=true,compact=true)->verify(policy_metadata)->resume(route_order)".to_string(),
     ]
 }
 
@@ -330,12 +334,14 @@ pub fn bootstrap_policy_metadata() -> Value {
         "enforcement_mode": "strict",
         "search_routing": {
             "default_strategy": "neural_first",
-            "discovery_order": ["semantic", "hybrid", "lexical"],
-            "programmatic_priority": "secondary",
+            "discovery_order": ["neural_assisted", "lexical"],
+            "programmatic_priority": "fallback",
+            "routing_mode": "hybrid_enforced",
             "fallback_required": true,
             "fallback_reason_codes": [
-                "neural_model_unavailable",
-                "neural_low_confidence",
+                "neural_mode_disabled",
+                "neural_provider_failure",
+                "neural_no_relevant_matches",
                 "exact_match_required",
                 "query_parse_constraints",
                 "flashgrep_index_unavailable",
@@ -357,8 +363,9 @@ pub fn bootstrap_policy_metadata() -> Value {
             "write": ["write_code"]
         },
         "fallback_gate_ids": [
-            "neural_model_unavailable",
-            "neural_low_confidence",
+            "neural_mode_disabled",
+            "neural_provider_failure",
+            "neural_no_relevant_matches",
             "exact_match_required",
             "query_parse_constraints",
             "index_unavailable",
@@ -366,18 +373,32 @@ pub fn bootstrap_policy_metadata() -> Value {
             "tool_runtime_failure",
             "repo_override_read_failed"
         ],
+        "agent_enforcement": {
+            "mode": "strict_hybrid",
+            "bootstrap_required": true,
+            "require_reason_code_on_fallback": true,
+            "block_native_tools_without_gate": true,
+            "discovery_route_sequence": ["query:neural", "query:lexical"],
+            "no_guessing": true
+        },
         "fallback_rules": [
             {
-                "gate_id": "neural_model_unavailable",
-                "condition": "semantic_runtime_or_model_missing",
+                "gate_id": "neural_mode_disabled",
+                "condition": "neural_mode_not_enabled_or_not_configured",
                 "allowed_tools": ["query"],
-                "reason_code": "neural_model_unavailable"
+                "reason_code": "neural_mode_disabled"
             },
             {
-                "gate_id": "neural_low_confidence",
-                "condition": "semantic_score_below_policy_threshold",
-                "allowed_tools": ["query", "symbol", "get_symbol"],
-                "reason_code": "neural_low_confidence"
+                "gate_id": "neural_provider_failure",
+                "condition": "neural_provider_request_failed_or_timed_out",
+                "allowed_tools": ["query"],
+                "reason_code": "neural_provider_failure"
+            },
+            {
+                "gate_id": "neural_no_relevant_matches",
+                "condition": "neural_rerank_returns_no_relevant_candidates",
+                "allowed_tools": ["query", "get_symbol"],
+                "reason_code": "neural_no_relevant_matches"
             },
             {
                 "gate_id": "exact_match_required",
@@ -387,7 +408,7 @@ pub fn bootstrap_policy_metadata() -> Value {
             },
             {
                 "gate_id": "query_parse_constraints",
-                "condition": "smart_query_parse_or_syntax_constraints_prevent_neural_first_path",
+                "condition": "query_parse_or_syntax_constraints_prevent_primary_path",
                 "allowed_tools": ["query"],
                 "reason_code": "query_parse_constraints"
             },

@@ -1,16 +1,17 @@
+use crate::config::Config;
 use crate::db::models::{SearchResult, Symbol};
 use crate::db::Database;
-use crate::neural::{cosine_similarity, embed_text, ensure_model_cached, EMBEDDING_MODEL_ID};
+use crate::neural::{cosine_similarity, provider_assist_rerank, pseudo_embedding};
 use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::FlashgrepError;
 use crate::FlashgrepResult;
 use glob::{MatchOptions, Pattern};
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tantivy::query::QueryParser;
 use tantivy::{Index, IndexReader, ReloadPolicy};
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryMode {
@@ -22,8 +23,7 @@ pub enum QueryMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryRetrievalMode {
     Lexical,
-    Semantic,
-    Hybrid,
+    Neural,
 }
 
 #[derive(Debug, Clone)]
@@ -102,11 +102,10 @@ impl QueryOptions {
             .unwrap_or("lexical")
         {
             "lexical" => QueryRetrievalMode::Lexical,
-            "semantic" => QueryRetrievalMode::Semantic,
-            "hybrid" => QueryRetrievalMode::Hybrid,
+            "neural" => QueryRetrievalMode::Neural,
             other => {
                 return Err(FlashgrepError::Config(format!(
-                    "Invalid retrieval_mode '{}'. Expected one of: lexical, semantic, hybrid",
+                    "Invalid retrieval_mode '{}'. Expected one of: lexical, neural",
                     other
                 )))
             }
@@ -148,12 +147,12 @@ pub struct Searcher {
     reader: IndexReader,
     query_parser: QueryParser,
     db: Database,
-    flashgrep_paths: crate::config::paths::FlashgrepPaths,
+    config: Config,
 }
 
 impl Searcher {
     /// Create a new searcher
-    pub fn new(index: &Index, db_path: &PathBuf) -> FlashgrepResult<Self> {
+    pub fn new(index: &Index, db_path: &Path) -> FlashgrepResult<Self> {
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommit)
@@ -165,23 +164,21 @@ impl Searcher {
         let query_parser = QueryParser::for_index(index, vec![content_field]);
 
         let db = Database::open(db_path)?;
-
-        let repo_root = db_path
+        let config_path = db_path
             .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| {
-                FlashgrepError::Config(format!(
-                    "Cannot infer repository root from metadata DB path {}",
-                    db_path.display()
-                ))
-            })?;
+            .map(|p| p.join("config.json"))
+            .ok_or_else(|| FlashgrepError::Config("invalid metadata db path".to_string()))?;
+        let config = if config_path.exists() {
+            Config::from_file(&config_path)?
+        } else {
+            Config::default()
+        };
 
         Ok(Self {
             reader,
             query_parser,
             db,
-            flashgrep_paths: crate::config::paths::FlashgrepPaths::new(&repo_root),
+            config,
         })
     }
 
@@ -209,9 +206,180 @@ impl Searcher {
 
         match options.retrieval_mode {
             QueryRetrievalMode::Lexical => self.query_lexical(options),
-            QueryRetrievalMode::Semantic => self.query_semantic(options),
-            QueryRetrievalMode::Hybrid => self.query_hybrid(options),
+            QueryRetrievalMode::Neural => self.query_neural_assisted(options),
         }
+    }
+
+    fn query_neural_assisted(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
+        if !self.config.neural.enabled {
+            warn!(
+                "Neural mode requested but disabled; falling back to lexical retrieval for query: {}",
+                options.text
+            );
+            return self.query_lexical_with_focus_fallback(options);
+        }
+
+        let mut lexical = options.clone();
+        lexical.retrieval_mode = QueryRetrievalMode::Lexical;
+        lexical.limit = options.limit.saturating_mul(3).min(
+            self.config
+                .neural
+                .provider
+                .max_candidates
+                .max(options.limit),
+        );
+        lexical.offset = 0;
+
+        let mut base = self.query_lexical(&lexical)?;
+        let query_embedding = pseudo_embedding(&options.text, 64);
+
+        if base.results.is_empty() {
+            let model_id = format!(
+                "provider:{}:{}",
+                self.config.neural.provider.provider, self.config.neural.provider.model
+            );
+            if let Ok(chunks) = self.db.get_semantic_chunks(&model_id) {
+                let mut seeded = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let similarity = cosine_similarity(&query_embedding, &chunk.embedding);
+                        SearchResult {
+                            file_path: chunk.file_path,
+                            start_line: chunk.start_line,
+                            end_line: chunk.end_line,
+                            symbol_name: None,
+                            relevance_score: similarity,
+                            preview: chunk.content.lines().take(3).collect::<Vec<_>>().join("\n"),
+                            content: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                seeded.sort_by(|a, b| {
+                    b.relevance_score
+                        .total_cmp(&a.relevance_score)
+                        .then_with(|| a.file_path.cmp(&b.file_path))
+                        .then_with(|| a.start_line.cmp(&b.start_line))
+                });
+                base.results = seeded
+                    .into_iter()
+                    .take(
+                        self.config
+                            .neural
+                            .provider
+                            .max_candidates
+                            .max(options.limit),
+                    )
+                    .collect();
+            }
+        }
+
+        if base.results.is_empty() {
+            warn!(
+                "Neural candidate set is empty; falling back to lexical retrieval for query: {}",
+                options.text
+            );
+            return self.query_lexical_with_focus_fallback(options);
+        }
+
+        for result in &mut base.results {
+            let emb = pseudo_embedding(&result.preview, 64);
+            result.relevance_score += cosine_similarity(&query_embedding, &emb) * 0.35;
+        }
+
+        let api_key = match self.config.resolve_neural_api_key() {
+            Some(k) => k,
+            None => {
+                warn!(
+                    "Neural mode requested but API key is missing; falling back to lexical retrieval for query: {}",
+                    options.text
+                );
+                return self.query_lexical_with_focus_fallback(options);
+            }
+        };
+
+        let order = match provider_assist_rerank(
+            &self.config.neural.provider,
+            &api_key,
+            &options.text,
+            &base.results,
+        ) {
+            Ok(order) => order,
+            Err(err) => {
+                warn!(
+                    "Neural provider rerank failed ({}); falling back to lexical retrieval",
+                    err
+                );
+                return self.query_lexical_with_focus_fallback(options);
+            }
+        };
+        let mut reranked = Vec::new();
+        for idx in order {
+            if let Some(item) = base.results.get(idx).cloned() {
+                reranked.push(item);
+            }
+        }
+
+        if reranked.is_empty() {
+            return Ok(QueryResponse {
+                results: Vec::new(),
+                truncated: false,
+                scanned_files: base.results.len(),
+                next_offset: None,
+            });
+        }
+
+        base.results = reranked;
+
+        base.results.sort_by(|a, b| {
+            b.relevance_score
+                .total_cmp(&a.relevance_score)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+
+        let scanned_files = base.results.len();
+        let results = base
+            .results
+            .into_iter()
+            .skip(options.offset)
+            .take(options.limit)
+            .collect::<Vec<_>>();
+        let truncated = scanned_files > options.offset.saturating_add(results.len());
+        let next_offset = if truncated {
+            Some(options.offset.saturating_add(results.len()))
+        } else {
+            None
+        };
+
+        Ok(QueryResponse {
+            results,
+            truncated,
+            scanned_files,
+            next_offset,
+        })
+    }
+
+    fn query_lexical_with_focus_fallback(
+        &self,
+        options: &QueryOptions,
+    ) -> FlashgrepResult<QueryResponse> {
+        let primary = self.query_lexical(options)?;
+        if !primary.results.is_empty() || options.text.trim().is_empty() {
+            return Ok(primary);
+        }
+
+        for term in extract_focus_terms(&options.text) {
+            let mut alt = options.clone();
+            alt.mode = QueryMode::Literal;
+            alt.fixed_patterns = vec![term.clone()];
+            alt.text = term;
+            let retry = self.query_lexical(&alt)?;
+            if !retry.results.is_empty() {
+                return Ok(retry);
+            }
+        }
+
+        Ok(primary)
     }
 
     fn query_lexical(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
@@ -354,174 +522,10 @@ impl Searcher {
         })
     }
 
-    fn query_semantic(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
-        ensure_model_cached(&self.flashgrep_paths)?;
-
-        let query_embedding = embed_text(&self.flashgrep_paths, &options.text)?;
-        let include_patterns = compile_patterns(&options.include)?;
-        let exclude_patterns = compile_patterns(&options.exclude)?;
-
-        let mut candidates = self.db.get_semantic_chunks(EMBEDDING_MODEL_ID)?;
-        candidates.retain(|chunk| {
-            path_matches(
-                &chunk.file_path,
-                &include_patterns,
-                &exclude_patterns,
-                options.case_sensitive,
-            )
-        });
-
-        let max_mtime = candidates
-            .iter()
-            .map(|c| c.last_modified)
-            .max()
-            .unwrap_or(0);
-
-        let mut ranked: Vec<SearchResult> = candidates
-            .iter()
-            .map(|chunk| {
-                let similarity = cosine_similarity(&query_embedding, &chunk.embedding);
-                let path_depth = chunk.file_path.components().count() as f32;
-                let depth_boost = 1.0 / (1.0 + path_depth.max(1.0));
-                let recency_boost = if max_mtime > 0 {
-                    ((chunk.last_modified as f32 / max_mtime as f32).clamp(0.0, 1.0)) * 0.05
-                } else {
-                    0.0
-                };
-                let score = similarity + (depth_boost * 0.05) + recency_boost;
-
-                let pinpoint = pinpoint_best_line(&chunk.content, &options.text);
-                let (start_line, end_line, preview, pinpoint_boost) =
-                    if let Some((offset, line)) = pinpoint {
-                        let exact_line = chunk.start_line.saturating_add(offset);
-                        (
-                            exact_line, exact_line, line,
-                            0.03, // prefer chunks where we can pinpoint a concrete line
-                        )
-                    } else {
-                        (
-                            chunk.start_line,
-                            chunk.end_line,
-                            chunk.content.lines().take(3).collect::<Vec<_>>().join("\n"),
-                            0.0,
-                        )
-                    };
-
-                SearchResult {
-                    file_path: chunk.file_path.clone(),
-                    start_line,
-                    end_line,
-                    symbol_name: None,
-                    relevance_score: score + pinpoint_boost,
-                    preview,
-                    content: None,
-                }
-            })
-            .collect();
-
-        ranked.sort_by(|a, b| {
-            b.relevance_score
-                .total_cmp(&a.relevance_score)
-                .then_with(|| a.file_path.cmp(&b.file_path))
-                .then_with(|| a.start_line.cmp(&b.start_line))
-        });
-
-        let scanned_files = ranked.len();
-        let window: Vec<SearchResult> = ranked
-            .into_iter()
-            .skip(options.offset)
-            .take(options.limit)
-            .collect();
-        let truncated = scanned_files > options.offset.saturating_add(window.len());
-        let next_offset = if truncated {
-            Some(options.offset.saturating_add(window.len()))
-        } else {
-            None
-        };
-
-        Ok(QueryResponse {
-            results: window,
-            truncated,
-            scanned_files,
-            next_offset,
-        })
-    }
-
-    fn query_hybrid(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
-        let mut lexical_options = options.clone();
-        lexical_options.retrieval_mode = QueryRetrievalMode::Lexical;
-        lexical_options.limit = options.limit.saturating_mul(2).max(10);
-        lexical_options.offset = 0;
-
-        let mut semantic_options = options.clone();
-        semantic_options.retrieval_mode = QueryRetrievalMode::Semantic;
-        semantic_options.limit = options.limit.saturating_mul(2).max(10);
-        semantic_options.offset = 0;
-
-        let lexical = match self.query_lexical(&lexical_options) {
-            Ok(result) => result,
-            Err(FlashgrepError::Search(msg))
-                if lexical_options.mode == QueryMode::Smart && msg.contains("Syntax Error") =>
-            {
-                let mut fallback = lexical_options.clone();
-                fallback.mode = QueryMode::Literal;
-                self.query_lexical(&fallback)?
-            }
-            Err(err) => return Err(err),
-        };
-        let semantic = self.query_semantic(&semantic_options)?;
-
-        let mut merged: Vec<SearchResult> = Vec::new();
-        for r in lexical.results {
-            merged.push(SearchResult {
-                relevance_score: r.relevance_score + 0.15,
-                ..r
-            });
-        }
-        for r in semantic.results {
-            if let Some(existing) = merged.iter_mut().find(|m| {
-                m.file_path == r.file_path
-                    && m.start_line == r.start_line
-                    && m.end_line == r.end_line
-            }) {
-                existing.relevance_score = existing.relevance_score.max(r.relevance_score + 0.2);
-            } else {
-                merged.push(r);
-            }
-        }
-
-        merged.sort_by(|a, b| {
-            b.relevance_score
-                .total_cmp(&a.relevance_score)
-                .then_with(|| a.file_path.cmp(&b.file_path))
-                .then_with(|| a.start_line.cmp(&b.start_line))
-        });
-
-        let scanned_files = merged.len();
-        let window: Vec<SearchResult> = merged
-            .into_iter()
-            .skip(options.offset)
-            .take(options.limit)
-            .collect();
-        let truncated = scanned_files > options.offset.saturating_add(window.len());
-        let next_offset = if truncated {
-            Some(options.offset.saturating_add(window.len()))
-        } else {
-            None
-        };
-
-        Ok(QueryResponse {
-            results: window,
-            truncated,
-            scanned_files,
-            next_offset,
-        })
-    }
-
     /// Get a specific slice of a file by line range
     pub fn get_slice(
         &self,
-        file_path: &PathBuf,
+        file_path: &Path,
         start_line: usize,
         end_line: usize,
     ) -> FlashgrepResult<Option<String>> {
@@ -554,6 +558,41 @@ impl Searcher {
     }
 }
 
+fn extract_focus_terms(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let mut in_quote = false;
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch == '"' {
+            if in_quote {
+                let term = current.trim();
+                if !term.is_empty() {
+                    out.push(term.to_string());
+                }
+                current.clear();
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            current.push(ch);
+        }
+    }
+
+    for token in input
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(|t| t.trim())
+        .filter(|t| t.len() >= 3)
+    {
+        out.push(token.to_string());
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn vec_from_str_array(value: Option<&Value>) -> FlashgrepResult<Vec<String>> {
     let mut items = Vec::new();
     if let Some(values) = value.and_then(Value::as_array) {
@@ -583,7 +622,7 @@ fn compile_patterns(patterns: &[String]) -> FlashgrepResult<Vec<Pattern>> {
 }
 
 fn path_matches(
-    path: &PathBuf,
+    path: &Path,
     include: &[Pattern],
     exclude: &[Pattern],
     case_sensitive: bool,
@@ -611,6 +650,7 @@ fn path_matches(
         .any(|p| p.matches_with(&normalized, opts) || p.matches_path_with(path, opts))
 }
 
+#[cfg(test)]
 fn pinpoint_best_line(content: &str, query: &str) -> Option<(usize, String)> {
     let query_norm = query.trim().to_ascii_lowercase();
     if query_norm.is_empty() {
@@ -697,7 +737,7 @@ fn matches_query(
 }
 
 fn render_context_preview(
-    file_path: &PathBuf,
+    file_path: &Path,
     start_line: usize,
     end_line: usize,
     context: usize,
@@ -735,13 +775,13 @@ mod tests {
     }
 
     #[test]
-    fn query_options_accept_semantic_retrieval_mode() {
+    fn query_options_accept_neural_retrieval_mode() {
         let opts = QueryOptions::from_mcp_args(&json!({
             "text": "find auth middleware",
-            "retrieval_mode": "semantic"
+            "retrieval_mode": "neural"
         }))
-        .expect("options");
-        assert_eq!(opts.retrieval_mode, QueryRetrievalMode::Semantic);
+        .expect("expected successful parse");
+        assert_eq!(opts.retrieval_mode, QueryRetrievalMode::Neural);
     }
 
     #[test]

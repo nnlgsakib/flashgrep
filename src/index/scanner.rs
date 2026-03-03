@@ -5,7 +5,7 @@ use walkdir::WalkDir;
 
 /// Build a normalized repository-relative path for ignore checks.
 /// Uses '/' separators across platforms.
-pub fn normalize_repo_relative_path(path: &Path, root: &PathBuf) -> String {
+pub fn normalize_repo_relative_path(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components()
         .filter_map(|c| match c {
@@ -167,7 +167,7 @@ impl FlashgrepIgnore {
     ///
     /// Patterns from `.flashgrepignore` are applied after `.gitignore`, so
     /// repository-local flashgrep overrides can refine behavior when needed.
-    pub fn from_root(root: &PathBuf) -> Self {
+    pub fn from_root(root: &Path) -> Self {
         let mut patterns = Vec::new();
 
         for ignore_name in [".gitignore", ".flashgrepignore"] {
@@ -187,7 +187,7 @@ impl FlashgrepIgnore {
     }
 
     /// Load ignore patterns from a file
-    pub fn from_file(path: &PathBuf) -> FlashgrepResult<Self> {
+    pub fn from_file(path: &Path) -> FlashgrepResult<Self> {
         let content = std::fs::read_to_string(path)?;
         Ok(Self {
             patterns: Self::parse_patterns(&content),
@@ -227,7 +227,7 @@ impl FlashgrepIgnore {
     }
 
     /// Check if a path is ignored
-    pub fn is_ignored(&self, path: &Path, root: &PathBuf) -> bool {
+    pub fn is_ignored(&self, path: &Path, root: &Path) -> bool {
         let relative_str = normalize_repo_relative_path(path, root);
 
         let mut ignored = false;
@@ -263,9 +263,8 @@ impl FlashgrepIgnore {
         }
 
         // Exact match or directory prefix match
-        if pattern.starts_with('/') {
+        if let Some(anchored_pattern) = pattern.strip_prefix('/') {
             // Anchored to root
-            let anchored_pattern = &pattern[1..];
             path == anchored_pattern || path.starts_with(&format!("{}/", anchored_pattern))
         } else {
             // Match at any level
@@ -289,7 +288,7 @@ impl FlashgrepIgnore {
                         return true; // * at end matches everything
                     }
                     let next_p = pattern_chars.peek().copied().unwrap();
-                    while let Some(c) = path_chars.next() {
+                    for c in path_chars.by_ref() {
                         if c == next_p {
                             break;
                         }

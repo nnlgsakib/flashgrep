@@ -1,13 +1,48 @@
 pub mod paths;
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ModelCacheScope {
-    Local,
-    Global,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeuralProviderConfig {
+    #[serde(default = "default_neural_provider")]
+    pub provider: String,
+    #[serde(default = "default_neural_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_neural_model")]
+    pub model: String,
+    #[serde(default = "default_neural_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_neural_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_neural_max_candidates")]
+    pub max_candidates: usize,
+}
+
+impl Default for NeuralProviderConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_neural_provider(),
+            base_url: default_neural_base_url(),
+            model: default_neural_model(),
+            api_key_env: default_neural_api_key_env(),
+            api_key: None,
+            timeout_ms: default_neural_timeout_ms(),
+            max_candidates: default_neural_max_candidates(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct NeuralConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_neural_config_initialized")]
+    pub initialized: bool,
+    #[serde(default)]
+    pub provider: NeuralProviderConfig,
 }
 
 /// Configuration for flashgrep
@@ -59,13 +94,9 @@ pub struct Config {
     #[serde(default = "default_index_state_path")]
     pub index_state_path: PathBuf,
 
-    /// Default model cache scope for neural model resolution
-    #[serde(default = "default_model_cache_scope")]
-    pub model_cache_scope: ModelCacheScope,
-
-    /// Absolute or repo-relative path to a shared model cache when scope is global
-    #[serde(default = "default_global_model_cache_path_opt")]
-    pub global_model_cache_path: Option<PathBuf>,
+    /// Neural navigation and provider configuration
+    #[serde(default)]
+    pub neural: NeuralConfig,
 }
 
 impl Default for Config {
@@ -83,61 +114,94 @@ impl Default for Config {
             enable_initial_index: default_enable_initial_index(),
             progress_interval: default_progress_interval(),
             index_state_path: default_index_state_path(),
-            model_cache_scope: default_model_cache_scope(),
-            global_model_cache_path: default_global_model_cache_path_opt(),
+            neural: NeuralConfig::default(),
         }
     }
 }
 
 impl Config {
     /// Load configuration from a file
-    pub fn from_file(path: &PathBuf) -> anyhow::Result<Self> {
+    pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let mut config: Config = serde_json::from_str(&content)?;
-        config.normalize_model_paths(path)?;
+        let config: Config = serde_json::from_str(&content)?;
         Ok(config)
     }
 
     /// Save configuration to a file
-    pub fn to_file(&self, path: &PathBuf) -> anyhow::Result<()> {
+    pub fn to_file(&self, path: &Path) -> anyhow::Result<()> {
         let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
     }
 
     /// Get the default configuration file path within a flashgrep directory
-    pub fn default_path(flashgrep_dir: &PathBuf) -> PathBuf {
+    pub fn default_path(flashgrep_dir: &Path) -> PathBuf {
         flashgrep_dir.join("config.json")
     }
 
-    fn normalize_model_paths(&mut self, config_path: &PathBuf) -> anyhow::Result<()> {
-        if let Some(path) = self.global_model_cache_path.clone() {
-            if path.as_os_str().is_empty() {
-                anyhow::bail!(
-                    "global_model_cache_path cannot be empty; set a valid path or remove it"
-                );
+    pub fn resolve_neural_api_key(&self) -> Option<String> {
+        if let Some(key) = self
+            .neural
+            .provider
+            .api_key
+            .as_ref()
+            .map(|k| k.trim().to_string())
+        {
+            if !key.is_empty() {
+                return Some(key);
             }
-
-            let normalized = if path.is_absolute() {
-                path
-            } else {
-                let repo_root = config_path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Cannot normalize global_model_cache_path; invalid config location {}",
-                            config_path.display()
-                        )
-                    })?;
-                repo_root.join(path)
-            };
-
-            self.global_model_cache_path = Some(normalized);
         }
 
+        let env_key = self.neural.provider.api_key_env.trim();
+        if env_key.is_empty() {
+            return None;
+        }
+        if !looks_like_env_var_name(env_key) {
+            return Some(env_key.to_string());
+        }
+        std::env::var(env_key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    pub fn validate_neural(&self) -> anyhow::Result<()> {
+        if !self.neural.enabled {
+            return Ok(());
+        }
+
+        if self.neural.provider.provider.trim().is_empty() {
+            anyhow::bail!("neural.provider.provider cannot be empty when neural mode is enabled");
+        }
+        if self.neural.provider.base_url.trim().is_empty() {
+            anyhow::bail!("neural.provider.base_url cannot be empty when neural mode is enabled");
+        }
+        if self.neural.provider.model.trim().is_empty() {
+            anyhow::bail!("neural.provider.model cannot be empty when neural mode is enabled");
+        }
+        if self.resolve_neural_api_key().is_none() {
+            let key_hint = if looks_like_env_var_name(&self.neural.provider.api_key_env) {
+                format!(
+                    "neural.provider.api_key or env var {}",
+                    self.neural.provider.api_key_env
+                )
+            } else {
+                "neural.provider.api_key or a valid API key env var name".to_string()
+            };
+            anyhow::bail!(
+                "Neural mode is enabled but no API key resolved. Set {}",
+                key_hint
+            );
+        }
         Ok(())
     }
+}
+
+fn looks_like_env_var_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn default_use_unix_socket() -> bool {
@@ -200,24 +264,32 @@ fn default_index_state_path() -> PathBuf {
     PathBuf::from("index-state.json")
 }
 
-fn default_model_cache_scope() -> ModelCacheScope {
-    ModelCacheScope::Local
+fn default_neural_provider() -> String {
+    "openrouter".to_string()
 }
 
-pub fn default_global_model_cache_path() -> PathBuf {
-    if let Some(base) = dirs::data_local_dir().or_else(dirs::data_dir) {
-        return base.join("flashgrep").join("model-cache");
-    }
-
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".flashgrep").join("model-cache");
-    }
-
-    PathBuf::from(".flashgrep/model-cache")
+fn default_neural_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
 }
 
-fn default_global_model_cache_path_opt() -> Option<PathBuf> {
-    Some(default_global_model_cache_path())
+fn default_neural_model() -> String {
+    "arcee-ai/trinity-large-preview:free".to_string()
+}
+
+fn default_neural_api_key_env() -> String {
+    "OPENROUTER_API_KEY".to_string()
+}
+
+fn default_neural_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_neural_max_candidates() -> usize {
+    24
+}
+
+fn default_neural_config_initialized() -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -243,45 +315,28 @@ mod tests {
     }
 
     #[test]
-    fn test_model_scope_default_is_local() {
-        let config = Config::default();
-        assert_eq!(config.model_cache_scope, ModelCacheScope::Local);
+    fn neural_defaults_match_openrouter_profile() {
+        let cfg = Config::default();
+        assert_eq!(cfg.neural.provider.provider, "openrouter");
+        assert_eq!(cfg.neural.provider.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(
-            config.global_model_cache_path,
-            Some(default_global_model_cache_path())
+            cfg.neural.provider.model,
+            "arcee-ai/trinity-large-preview:free"
         );
+        assert_eq!(cfg.neural.provider.api_key_env, "OPENROUTER_API_KEY");
+        assert!(!cfg.neural.enabled);
     }
 
     #[test]
-    fn test_normalize_relative_global_model_path() {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let flashgrep_dir = temp_dir.path().join(".flashgrep");
-        std::fs::create_dir_all(&flashgrep_dir).unwrap();
-        let config_path = flashgrep_dir.join("config.json");
+    fn resolve_neural_api_key_prefers_inline_key_then_env() {
+        let mut cfg = Config::default();
+        cfg.neural.provider.api_key = Some("inline-key".to_string());
+        assert_eq!(cfg.resolve_neural_api_key().as_deref(), Some("inline-key"));
 
-        let content = r#"{
-  "version": "0.1.0",
-  "mcp_port": 7777,
-  "use_unix_socket": false,
-  "socket_path": ".flashgrep/mcp.sock",
-  "max_file_size": 2097152,
-  "max_chunk_lines": 300,
-  "extensions": ["rs"],
-  "ignored_dirs": [".git"],
-  "debounce_ms": 500,
-  "enable_initial_index": true,
-  "progress_interval": 1000,
-  "index_state_path": "index-state.json",
-  "model_cache_scope": "global",
-  "global_model_cache_path": "shared-models"
-}"#;
-
-        std::fs::write(&config_path, content).unwrap();
-        let config = Config::from_file(&config_path).unwrap();
-        assert_eq!(config.model_cache_scope, ModelCacheScope::Global);
-        assert_eq!(
-            config.global_model_cache_path,
-            Some(temp_dir.path().join("shared-models"))
-        );
+        cfg.neural.provider.api_key = None;
+        cfg.neural.provider.api_key_env = "FLASHGREP_TEST_NEURAL_KEY".to_string();
+        std::env::set_var("FLASHGREP_TEST_NEURAL_KEY", "env-key");
+        assert_eq!(cfg.resolve_neural_api_key().as_deref(), Some("env-key"));
+        std::env::remove_var("FLASHGREP_TEST_NEURAL_KEY");
     }
 }

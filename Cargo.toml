@@ -1,15 +1,11 @@
 [package]
 name = "flashgrep"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Flashgrep Contributors"]
 description = "High-performance local code indexing engine"
 license = "Apache-2.0"
 repository = "https://github.com/nnlgsakib/flashgrep"
-
-[features]
-default = ["neural"]
-neural = ["dep:reqwest", "dep:fastembed", "dep:once_cell"]
 
 [dependencies]
 # MCP (Model Context Protocol)
@@ -61,11 +57,9 @@ hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 config = "0.14"
 dirs = "5.0"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
-fastembed = { version = "4.5", optional = true }
-once_cell = { version = "1.20", optional = true }
 indicatif = "0.17"
 rayon = "1.10"
+async-openai = "0.29"
 
 [dev-dependencies]
 tempfile = "3.10"

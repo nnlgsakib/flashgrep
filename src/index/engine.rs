@@ -1,16 +1,16 @@
 use crate::chunking::Chunker;
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
-use crate::db::models::{Chunk, ChunkVector, FileMetadata, Symbol};
+use crate::db::models::{Chunk, FileMetadata, Symbol};
 use crate::db::Database;
 use crate::index::scanner::{FileScanner, FlashgrepIgnore};
-use crate::neural::{embed_text, embed_texts, is_model_cached, EMBEDDING_MODEL_ID};
+use crate::neural::{build_knowledge_graph_edges, pseudo_embedding};
 use crate::symbols::SymbolDetector;
 use crate::FlashgrepResult;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tantivy::schema::*;
 use tantivy::{Index, IndexWriter, Term};
 use tracing::{debug, error, info};
@@ -25,13 +25,11 @@ struct PreparedFileIndex {
     metadata: FileMetadata,
     chunks: Vec<Chunk>,
     symbols: Vec<Symbol>,
-    vectors: Vec<ChunkVector>,
 }
 
 /// Main indexing engine
 pub struct Indexer {
     paths: FlashgrepPaths,
-    semantic_vectors_enabled: bool,
     db: Database,
     index: Index,
     writer: IndexWriter,
@@ -67,7 +65,6 @@ impl Indexer {
         let writer = index.writer(50_000_000)?; // 50MB buffer
 
         Ok(Self {
-            semantic_vectors_enabled: is_model_cached(&paths).unwrap_or(false),
             paths,
             db,
             index,
@@ -102,7 +99,7 @@ impl Indexer {
     }
 
     /// Create or open the Tantivy index
-    fn create_or_open_index(index_dir: &PathBuf) -> FlashgrepResult<Index> {
+    fn create_or_open_index(index_dir: &Path) -> FlashgrepResult<Index> {
         let schema = Self::create_schema();
 
         if index_dir.exists() && index_dir.join("meta.json").exists() {
@@ -117,12 +114,8 @@ impl Indexer {
 
     /// Index a single file with batch inserts for better performance
     /// Skips files that haven't changed since last indexing
-    pub fn index_file(&mut self, file_path: &PathBuf) -> FlashgrepResult<bool> {
+    pub fn index_file(&mut self, file_path: &Path) -> FlashgrepResult<bool> {
         debug!("Checking file: {}", file_path.display());
-
-        if !self.semantic_vectors_enabled {
-            self.semantic_vectors_enabled = is_model_cached(&self.paths).unwrap_or(false);
-        }
 
         // Get file metadata first to check modification time
         let metadata = FileMetadata::from_path(file_path)?;
@@ -143,6 +136,7 @@ impl Indexer {
         self.db.delete_file_chunks(file_path)?;
         self.db.delete_file_symbols(file_path)?;
         self.db.delete_file_vectors(file_path)?;
+        self.db.delete_file_graph(file_path)?;
 
         // Insert/update file record
         self.db.insert_file(&metadata)?;
@@ -150,7 +144,7 @@ impl Indexer {
         // Chunk the file
         let chunks = self
             .chunker
-            .chunk_file(file_path.clone(), &content, last_modified);
+            .chunk_file(file_path.to_path_buf(), &content, last_modified);
 
         // Collect all symbols from all chunks
         let mut all_symbols = Vec::new();
@@ -160,7 +154,7 @@ impl Indexer {
             // Detect symbols
             let symbols = self.symbol_detector.detect_in_chunk(
                 &chunk.content,
-                file_path.clone(),
+                file_path.to_path_buf(),
                 chunk.start_line,
             );
             all_symbols.extend(symbols);
@@ -174,46 +168,12 @@ impl Indexer {
             self.db.insert_chunks_batch(&chunks)?;
         }
 
-        // Build and persist semantic vectors for each chunk.
-        if !chunks.is_empty() && self.semantic_vectors_enabled {
-            let mut vectors = Vec::with_capacity(chunks.len());
-            for chunk in &chunks {
-                let embedding = match embed_text(&self.paths, &chunk.content) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        error!(
-                            "Failed to embed chunk for {}:{}-{}: {}",
-                            chunk.file_path.display(),
-                            chunk.start_line,
-                            chunk.end_line,
-                            err
-                        );
-                        self.semantic_vectors_enabled = false;
-                        vectors.clear();
-                        break;
-                    }
-                };
-                if embedding.is_empty() {
-                    continue;
-                }
-                vectors.push(ChunkVector {
-                    id: None,
-                    file_path: chunk.file_path.clone(),
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    content_hash: chunk.content_hash.clone(),
-                    embedding,
-                    model_id: EMBEDDING_MODEL_ID.to_string(),
-                    last_modified: chunk.last_modified,
-                });
-            }
-            self.db.upsert_chunk_vectors_batch(&vectors)?;
-        }
-
         // Batch insert symbols (much faster than individual inserts)
         if !all_symbols.is_empty() {
             self.db.insert_symbols_batch(&all_symbols)?;
         }
+
+        self.persist_neural_artifacts(file_path, &chunks, &all_symbols, last_modified)?;
 
         Ok(true) // File was indexed
     }
@@ -243,10 +203,10 @@ impl Indexer {
 
     /// Index the entire repository
     /// Only reindexes files that have changed since last indexing
-    pub fn index_repository(&mut self, repo_root: &PathBuf) -> FlashgrepResult<IndexStats> {
+    pub fn index_repository(&mut self, repo_root: &Path) -> FlashgrepResult<IndexStats> {
         info!("Starting repository indexing: {}", repo_root.display());
 
-        let scanner = FileScanner::new(repo_root.clone(), self.config.clone());
+        let scanner = FileScanner::new(repo_root.to_path_buf(), self.config.clone());
         let files: Vec<_> = scanner.scan().collect();
         let total_files = files.len();
 
@@ -297,8 +257,6 @@ impl Indexer {
             }
         }
 
-        let paths_for_workers = self.paths.clone();
-        let semantic_vectors_enabled = self.semantic_vectors_enabled;
         let progress_for_workers = progress.clone();
         let prepared_results: Vec<(PathBuf, FlashgrepResult<PreparedFileIndex>)> = plans
             .into_par_iter()
@@ -306,13 +264,7 @@ impl Indexer {
                 || (Chunker::new(), SymbolDetector::new()),
                 |(chunker, symbol_detector), plan| {
                     let path = plan.file_path.clone();
-                    let result = Self::prepare_file_for_indexing(
-                        &paths_for_workers,
-                        semantic_vectors_enabled,
-                        chunker,
-                        symbol_detector,
-                        plan,
-                    );
+                    let result = Self::prepare_file_for_indexing(chunker, symbol_detector, plan);
                     if let Some(pb) = &progress_for_workers {
                         pb.inc(1);
                     }
@@ -374,8 +326,6 @@ impl Indexer {
     }
 
     fn prepare_file_for_indexing(
-        paths: &FlashgrepPaths,
-        semantic_vectors_enabled: bool,
         chunker: &Chunker,
         symbol_detector: &SymbolDetector,
         plan: FileIndexPlan,
@@ -396,47 +346,11 @@ impl Indexer {
             ));
         }
 
-        let mut vectors = Vec::new();
-        if semantic_vectors_enabled && !chunks.is_empty() {
-            let chunk_contents: Vec<String> =
-                chunks.iter().map(|chunk| chunk.content.clone()).collect();
-            let embeddings = match embed_texts(paths, &chunk_contents) {
-                Ok(embeddings) => embeddings,
-                Err(err) => {
-                    error!(
-                        "Failed to embed chunks for {}: {}",
-                        plan.file_path.display(),
-                        err
-                    );
-                    Vec::new()
-                }
-            };
-
-            vectors.reserve(chunks.len());
-            for (chunk, embedding) in chunks.iter().zip(embeddings.into_iter()) {
-                if embedding.is_empty() {
-                    continue;
-                }
-
-                vectors.push(ChunkVector {
-                    id: None,
-                    file_path: chunk.file_path.clone(),
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    content_hash: chunk.content_hash.clone(),
-                    embedding,
-                    model_id: EMBEDDING_MODEL_ID.to_string(),
-                    last_modified: chunk.last_modified,
-                });
-            }
-        }
-
         Ok(PreparedFileIndex {
             file_path: plan.file_path,
             metadata: plan.metadata,
             chunks,
             symbols,
-            vectors,
         })
     }
 
@@ -444,6 +358,7 @@ impl Indexer {
         self.db.delete_file_chunks(&prepared.file_path)?;
         self.db.delete_file_symbols(&prepared.file_path)?;
         self.db.delete_file_vectors(&prepared.file_path)?;
+        self.db.delete_file_graph(&prepared.file_path)?;
         self.db.insert_file(&prepared.metadata)?;
 
         for chunk in &prepared.chunks {
@@ -454,14 +369,91 @@ impl Indexer {
             self.db.insert_chunks_batch(&prepared.chunks)?;
         }
 
-        if !prepared.vectors.is_empty() {
-            self.db.upsert_chunk_vectors_batch(&prepared.vectors)?;
-        }
-
         if !prepared.symbols.is_empty() {
             self.db.insert_symbols_batch(&prepared.symbols)?;
         }
 
+        self.persist_neural_artifacts(
+            &prepared.file_path,
+            &prepared.chunks,
+            &prepared.symbols,
+            prepared.metadata.last_modified,
+        )?;
+
+        Ok(())
+    }
+
+    fn persist_neural_artifacts(
+        &self,
+        file_path: &Path,
+        chunks: &[Chunk],
+        symbols: &[Symbol],
+        last_modified: i64,
+    ) -> FlashgrepResult<()> {
+        if !self.config.neural.enabled {
+            return Ok(());
+        }
+
+        let model_id = format!(
+            "provider:{}:{}",
+            self.config.neural.provider.provider, self.config.neural.provider.model
+        );
+        let vectors = chunks
+            .iter()
+            .map(|chunk| crate::db::models::ChunkVector {
+                id: None,
+                file_path: chunk.file_path.clone(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                content_hash: chunk.content_hash.clone(),
+                embedding: pseudo_embedding(&chunk.content, 64),
+                model_id: model_id.clone(),
+                last_modified,
+            })
+            .collect::<Vec<_>>();
+        self.db.upsert_chunk_vectors_batch(&vectors)?;
+
+        let file_str = file_path.to_string_lossy().to_string();
+        let mut nodes = vec![(
+            format!("file:{}", file_str),
+            "file".to_string(),
+            file_str.clone(),
+            last_modified,
+        )];
+        for chunk in chunks {
+            nodes.push((
+                format!(
+                    "chunk:{}:{}-{}",
+                    chunk.file_path.to_string_lossy(),
+                    chunk.start_line,
+                    chunk.end_line
+                ),
+                "chunk".to_string(),
+                file_str.clone(),
+                last_modified,
+            ));
+        }
+        for symbol in symbols {
+            nodes.push((
+                format!(
+                    "symbol:{}:{}:{}",
+                    symbol.file_path.to_string_lossy(),
+                    symbol.line_number,
+                    symbol.symbol_name
+                ),
+                "symbol".to_string(),
+                file_str.clone(),
+                last_modified,
+            ));
+        }
+        self.db.upsert_graph_nodes(&nodes)?;
+
+        let edges = build_knowledge_graph_edges(file_path, chunks, symbols)
+            .into_iter()
+            .map(|(from_node, to_node, relation)| (from_node, to_node, relation, file_str.clone()))
+            .collect::<Vec<_>>();
+        self.db.upsert_graph_edges(&edges)?;
+        let _ = self.db.increment_graph_revision()?;
         Ok(())
     }
 
@@ -471,7 +463,7 @@ impl Indexer {
     }
 
     /// Check if an index exists at the given path
-    pub fn index_exists(repo_root: &PathBuf) -> bool {
+    pub fn index_exists(repo_root: &Path) -> bool {
         let paths = FlashgrepPaths::new(repo_root);
         paths.exists()
     }
@@ -500,7 +492,7 @@ impl Indexer {
     }
 
     /// Remove one file from both Tantivy and metadata store.
-    pub fn remove_file_from_index(&mut self, file_path: &PathBuf) -> FlashgrepResult<()> {
+    pub fn remove_file_from_index(&mut self, file_path: &Path) -> FlashgrepResult<()> {
         let schema = self.index.schema();
         let file_path_field = schema.get_field("file_path").unwrap();
         self.writer.delete_term(Term::from_field_text(
@@ -516,7 +508,7 @@ impl Indexer {
     /// Returns (removed, kept) counts.
     pub fn reconcile_ignored_files(
         &mut self,
-        repo_root: &PathBuf,
+        repo_root: &Path,
         ignore_patterns: &FlashgrepIgnore,
     ) -> FlashgrepResult<(usize, usize)> {
         let indexed_files = self.db.get_all_files()?;
@@ -590,6 +582,34 @@ mod tests {
         let stats = indexer.get_stats()?;
         assert_eq!(stats.total_files, 1);
         assert!(stats.total_chunks > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_file_builds_neural_artifacts_when_enabled() -> FlashgrepResult<()> {
+        let temp_dir = TempDir::new()?;
+        let repo_root = temp_dir.path().to_path_buf();
+
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+        let mut config = Config::default();
+        config.neural.enabled = true;
+        config.neural.initialized = true;
+        config.to_file(&paths.config_file())?;
+
+        std::fs::write(repo_root.join("neural.rs"), "fn sort_names() {}\n")?;
+
+        let mut indexer = Indexer::new(repo_root.clone())?;
+        indexer.index_file(&repo_root.join("neural.rs"))?;
+
+        let model_id = format!(
+            "provider:{}:{}",
+            config.neural.provider.provider, config.neural.provider.model
+        );
+        let count = indexer.db().count_vectors_for_model(&model_id)?;
+        assert!(count > 0);
+        assert!(indexer.db().graph_revision()? > 0);
 
         Ok(())
     }

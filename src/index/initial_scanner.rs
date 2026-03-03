@@ -156,7 +156,7 @@ impl InitialScanner {
                             }
 
                             // Log progress
-                            if result.files_scanned % self.progress_interval == 0 {
+                            if result.files_scanned.is_multiple_of(self.progress_interval) {
                                 info!(
                                     "Initial indexing progress: {} files scanned",
                                     result.files_scanned
@@ -274,7 +274,7 @@ impl InitialScanner {
     async fn extract_file_metadata(&self, path: &Path) -> FlashgrepResult<FileMetadata> {
         let metadata = tokio::fs::metadata(path)
             .await
-            .map_err(|e| crate::FlashgrepError::Io(e))?;
+            .map_err(crate::FlashgrepError::Io)?;
 
         let size = metadata.len();
 
@@ -299,7 +299,7 @@ impl InitialScanner {
     async fn compute_content_hash(&self, path: &Path) -> FlashgrepResult<String> {
         let content = tokio::fs::read(path)
             .await
-            .map_err(|e| crate::FlashgrepError::Io(e))?;
+            .map_err(crate::FlashgrepError::Io)?;
 
         let hash_input = if content.len() > MAX_HASH_BYTES {
             &content[..MAX_HASH_BYTES]
@@ -358,8 +358,13 @@ mod tests {
         // Verify metrics are populated
         assert!(result.metrics.is_some());
         let metrics = result.metrics.unwrap();
-        assert!(metrics.duration_ms > 0);
-        assert!(metrics.files_per_second > 0.0);
+        // duration_ms can be 0 for very fast scans in CI; validate monotonic timestamps
+        assert!(metrics.end_time >= metrics.start_time);
+        if metrics.duration_ms == 0 {
+            assert_eq!(metrics.files_per_second, 0.0);
+        } else {
+            assert!(metrics.files_per_second > 0.0);
+        }
         assert!(metrics.bytes_processed > 0);
         assert!(metrics.avg_file_size_bytes > 0);
 

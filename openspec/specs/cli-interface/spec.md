@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Index command
-The CLI SHALL provide an index command for initial repository indexing and SHALL prompt for neural model download when required assets are missing.
+The CLI SHALL provide an index command for initial repository indexing and SHALL prompt users to enable neural navigation when neural configuration has not yet been initialized.
 
 #### Scenario: Run index command
 - **WHEN** the user runs `flashgrep index`
@@ -15,10 +15,10 @@ The CLI SHALL provide an index command for initial repository indexing and SHALL
 - **WHEN** the index command runs
 - **THEN** it SHALL display real-time progress to stdout
 
-#### Scenario: Prompt for missing neural model on index start
-- **WHEN** model assets are missing at index startup
-- **THEN** the CLI SHALL prompt user to download `BAAI/bge-small-en-v1.5`
-- **AND** if the user declines, it SHALL continue indexing normally without download
+#### Scenario: Prompt to enable neural navigation on first index
+- **WHEN** index starts and neural navigation configuration is unset in interactive mode
+- **THEN** the CLI SHALL prompt whether to enable neural navigation
+- **AND** if the user declines, indexing SHALL continue with lexical mode only
 
 #### Scenario: Success exit code
 - **WHEN** indexing completes successfully
@@ -53,15 +53,19 @@ The CLI SHALL provide a start command to run the daemon and SHALL handle model p
 - **THEN** it SHALL shut down gracefully, closing all connections and saving state
 
 ### Requirement: Help and version
-The CLI SHALL provide standard help and version commands.
+The CLI SHALL provide standard help and version commands, including a `version` subcommand and enriched platform details.
 
 #### Scenario: Show help
 - **WHEN** the user runs `flashgrep --help` or `flashgrep -h`
 - **THEN** it SHALL display usage information for all commands
 
-#### Scenario: Show version
+#### Scenario: Show version via flags
 - **WHEN** the user runs `flashgrep --version` or `flashgrep -V`
-- **THEN** it SHALL display the version number
+- **THEN** it SHALL display the Flashgrep version, operating system, and CPU architecture
+
+#### Scenario: Show version via command
+- **WHEN** the user runs `flashgrep version`
+- **THEN** it SHALL display the same version information as `--version` and `-V`
 
 ### Requirement: Flashgrepignore documentation
 The CLI documentation SHALL mention the `.flashgrepignore` file support.
@@ -126,3 +130,10 @@ The CLI SHALL provide actionable errors for missing index, invalid paths, and ma
 #### Scenario: Invalid command arguments
 - **WHEN** a user provides invalid required arguments
 - **THEN** the CLI SHALL return a non-zero exit and usage guidance
+
+### Requirement: CLI behavior parity during lint-compliance refactors
+Changes made to satisfy strict clippy linting SHALL NOT alter existing CLI command names, argument handling, output contracts, or exit-code behavior.
+
+#### Scenario: Existing command contracts remain stable
+- **WHEN** a user runs previously supported CLI commands with valid or invalid arguments after lint-compliance updates
+- **THEN** command parsing, output structure, and exit-code semantics SHALL match pre-change behavior

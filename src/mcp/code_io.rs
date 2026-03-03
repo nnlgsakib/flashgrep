@@ -97,11 +97,7 @@ pub fn read_code(paths: &FlashgrepPaths, arguments: &Value) -> FlashgrepResult<V
     let bounded = match apply_budgets(&read_target.lines, &limits) {
         Some(value) => value,
         None => {
-            let observed_bytes = read_target
-                .lines
-                .first()
-                .map(|(_, l)| l.as_bytes().len())
-                .unwrap_or(0);
+            let observed_bytes = read_target.lines.first().map(|(_, l)| l.len()).unwrap_or(0);
             return Ok(payload_too_large_error(
                 "read_code",
                 observed_bytes,
@@ -180,7 +176,7 @@ pub fn write_code(arguments: &Value) -> FlashgrepResult<Value> {
         return write_code_chunked(arguments, id, file_path, start_line, end_line, replacement);
     }
 
-    let replacement_size = replacement.as_bytes().len();
+    let replacement_size = replacement.len();
     if replacement_size > MAX_MCP_WRITE_REPLACEMENT_BYTES {
         let mut payload = payload_too_large_error(
             "write_code",
@@ -296,7 +292,7 @@ fn write_code_chunked(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let replacement_size = replacement_chunk.as_bytes().len();
+    let replacement_size = replacement_chunk.len();
     if replacement_size > MAX_MCP_WRITE_REPLACEMENT_BYTES {
         let mut payload = payload_too_large_error(
             "write_code",
@@ -677,7 +673,7 @@ fn apply_budgets(lines: &[(usize, String)], limits: &Limits) -> Option<BoundedCo
     let mut consumed_tokens = 0usize;
 
     for (line_no, line) in lines {
-        let line_bytes = line.as_bytes().len();
+        let line_bytes = line.len();
         let line_tokens = estimate_tokens(line);
         let sep_bytes = if included.is_empty() { 0 } else { 1 };
         let next_lines = included.len() + 1;

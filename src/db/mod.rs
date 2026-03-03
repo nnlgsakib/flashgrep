@@ -4,7 +4,7 @@ use crate::FlashgrepResult;
 use models::{Chunk, ChunkVector, FileMetadata, IndexStats, SemanticChunk, Symbol};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 /// Database wrapper with connection pooling
@@ -14,7 +14,7 @@ pub struct Database {
 
 impl Database {
     /// Open or create the database at the given path with optimizations
-    pub fn open(path: &PathBuf) -> FlashgrepResult<Self> {
+    pub fn open(path: &Path) -> FlashgrepResult<Self> {
         let manager = SqliteConnectionManager::file(path);
         let pool = Pool::builder()
             .max_size(10) // Max 10 connections in pool
@@ -114,6 +114,40 @@ impl Database {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chunk_vectors_model_id ON chunk_vectors(model_id)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS knowledge_graph_nodes (
+                node_id TEXT PRIMARY KEY,
+                node_type TEXT NOT NULL,
+                file_path TEXT,
+                last_modified INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS knowledge_graph_edges (
+                from_node TEXT NOT NULL,
+                to_node TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                file_path TEXT,
+                PRIMARY KEY (from_node, to_node, relation)
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS graph_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                revision INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO graph_meta (id, revision) VALUES (1, 0)",
             [],
         )?;
 
@@ -290,7 +324,7 @@ impl Database {
     }
 
     /// Delete all chunks for a file
-    pub fn delete_file_chunks(&self, file_path: &PathBuf) -> FlashgrepResult<usize> {
+    pub fn delete_file_chunks(&self, file_path: &Path) -> FlashgrepResult<usize> {
         let conn = self.pool.get()?;
         let count = conn.execute(
             "DELETE FROM chunks WHERE file_path = ?1",
@@ -300,7 +334,7 @@ impl Database {
     }
 
     /// Delete all symbols for a file
-    pub fn delete_file_symbols(&self, file_path: &PathBuf) -> FlashgrepResult<usize> {
+    pub fn delete_file_symbols(&self, file_path: &Path) -> FlashgrepResult<usize> {
         let conn = self.pool.get()?;
         let count = conn.execute(
             "DELETE FROM symbols WHERE file_path = ?1",
@@ -310,7 +344,7 @@ impl Database {
     }
 
     /// Delete all semantic vectors for a file.
-    pub fn delete_file_vectors(&self, file_path: &PathBuf) -> FlashgrepResult<usize> {
+    pub fn delete_file_vectors(&self, file_path: &Path) -> FlashgrepResult<usize> {
         let conn = self.pool.get()?;
         let count = conn.execute(
             "DELETE FROM chunk_vectors WHERE file_path = ?1",
@@ -319,8 +353,103 @@ impl Database {
         Ok(count)
     }
 
+    pub fn delete_file_graph(&self, file_path: &Path) -> FlashgrepResult<()> {
+        let conn = self.pool.get()?;
+        let path = file_path.to_string_lossy().to_string();
+        conn.execute(
+            "DELETE FROM knowledge_graph_edges WHERE file_path = ?1",
+            [&path],
+        )?;
+        conn.execute(
+            "DELETE FROM knowledge_graph_nodes WHERE file_path = ?1",
+            [&path],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_graph_nodes(
+        &self,
+        nodes: &[(String, String, String, i64)],
+    ) -> FlashgrepResult<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO knowledge_graph_nodes (node_id, node_type, file_path, last_modified)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    node_type = excluded.node_type,
+                    file_path = excluded.file_path,
+                    last_modified = excluded.last_modified",
+            )?;
+            for (id, kind, file_path, last_modified) in nodes {
+                stmt.execute([
+                    id.clone(),
+                    kind.clone(),
+                    file_path.clone(),
+                    last_modified.to_string(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_graph_edges(
+        &self,
+        edges: &[(String, String, String, String)],
+    ) -> FlashgrepResult<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO knowledge_graph_edges (from_node, to_node, relation, file_path)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(from_node, to_node, relation) DO UPDATE SET file_path = excluded.file_path",
+            )?;
+            for (from_node, to_node, relation, file_path) in edges {
+                stmt.execute([
+                    from_node.clone(),
+                    to_node.clone(),
+                    relation.clone(),
+                    file_path.clone(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn increment_graph_revision(&self) -> FlashgrepResult<i64> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE graph_meta SET revision = revision + 1 WHERE id = 1",
+            [],
+        )?;
+        let revision: i64 =
+            conn.query_row("SELECT revision FROM graph_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })?;
+        Ok(revision)
+    }
+
+    pub fn graph_revision(&self) -> FlashgrepResult<i64> {
+        let conn = self.pool.get()?;
+        let revision: i64 =
+            conn.query_row("SELECT revision FROM graph_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })?;
+        Ok(revision)
+    }
+
     /// Delete a file and all its associated chunks and symbols
-    pub fn delete_file(&self, file_path: &PathBuf) -> FlashgrepResult<()> {
+    pub fn delete_file(&self, file_path: &Path) -> FlashgrepResult<()> {
         let conn = self.pool.get()?;
         conn.execute(
             "DELETE FROM files WHERE file_path = ?1",
@@ -351,11 +480,7 @@ impl Database {
     }
 
     /// Check if a file needs reindexing (returns true if file is new or modified)
-    pub fn needs_reindex(
-        &self,
-        file_path: &PathBuf,
-        current_modified: i64,
-    ) -> FlashgrepResult<bool> {
+    pub fn needs_reindex(&self, file_path: &Path, current_modified: i64) -> FlashgrepResult<bool> {
         let conn = self.pool.get()?;
         let path_str = file_path.to_string_lossy().to_string();
 
@@ -526,8 +651,11 @@ impl Database {
         // Delete from child tables first (though CASCADE should handle this)
         conn.execute("DELETE FROM symbols", [])?;
         conn.execute("DELETE FROM chunk_vectors", [])?;
+        conn.execute("DELETE FROM knowledge_graph_edges", [])?;
+        conn.execute("DELETE FROM knowledge_graph_nodes", [])?;
         conn.execute("DELETE FROM chunks", [])?;
         conn.execute("DELETE FROM files", [])?;
+        conn.execute("UPDATE graph_meta SET revision = 0 WHERE id = 1", [])?;
 
         debug!("Database cleared: all tables emptied");
         Ok(())
@@ -667,7 +795,7 @@ mod tests {
             "fn auth_handler() {}".to_string(),
             1000,
         );
-        db.insert_chunks_batch(&[chunk.clone()])?;
+        db.insert_chunks_batch(std::slice::from_ref(&chunk))?;
 
         let vector = ChunkVector {
             id: None,

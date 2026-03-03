@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::index::engine::Indexer;
 use crate::mcp::stdio::McpStdioServer;
-use crate::neural::ensure_model_for_startup_prompt;
+use crate::neural::ensure_neural_config_prompt;
 use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::search::{QueryMode, QueryOptions, QueryRetrievalMode, Searcher};
 use crate::watcher::registry::{is_process_alive, kill_process, WatcherRegistry};
@@ -14,7 +14,7 @@ use crate::FlashgrepResult;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::info;
 
@@ -46,16 +46,14 @@ pub enum QueryModeArg {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RetrievalModeArg {
     Lexical,
-    Semantic,
-    Hybrid,
+    Neural,
 }
 
 impl From<RetrievalModeArg> for QueryRetrievalMode {
     fn from(value: RetrievalModeArg) -> Self {
         match value {
             RetrievalModeArg::Lexical => QueryRetrievalMode::Lexical,
-            RetrievalModeArg::Semantic => QueryRetrievalMode::Semantic,
-            RetrievalModeArg::Hybrid => QueryRetrievalMode::Hybrid,
+            RetrievalModeArg::Neural => QueryRetrievalMode::Neural,
         }
     }
 }
@@ -162,7 +160,7 @@ pub enum Commands {
         /// Query mode
         #[arg(long, value_enum, default_value_t = QueryModeArg::Smart)]
         mode: QueryModeArg,
-        /// Retrieval mode (lexical, semantic, hybrid)
+        /// Retrieval mode
         #[arg(long = "retrieval-mode", value_enum, default_value_t = RetrievalModeArg::Lexical)]
         retrieval_mode: RetrievalModeArg,
         /// Ignore case during matching
@@ -311,10 +309,17 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Index { path, force } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             info!("Indexing repository: {}", repo_root.display());
+
             let paths = FlashgrepPaths::new(&repo_root);
-            let _ = ensure_model_for_startup_prompt(&paths, "index startup")?;
+            if !paths.exists() {
+                paths.create()?;
+            }
+            if !paths.config_file().exists() {
+                Config::default().to_file(&paths.config_file())?;
+            }
+            let _ = ensure_neural_config_prompt(&paths);
 
             let mut indexer = Indexer::new(repo_root.clone())?;
 
@@ -333,7 +338,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Start { path, background } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             let canonical_repo_root = WatcherRegistry::canonicalize_repo_path(&repo_root)?;
             info!("Starting file watcher for: {}", repo_root.display());
 
@@ -397,7 +402,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Stop { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             let canonical_repo_root = WatcherRegistry::canonicalize_repo_path(&repo_root)?;
             info!("Stopping file watcher for: {}", repo_root.display());
 
@@ -456,7 +461,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             offset,
             output,
         } => {
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let mut options = QueryOptions::new(text.clone(), limit.max(1));
             options.mode = mode.into();
             options.retrieval_mode = retrieval_mode.into();
@@ -506,6 +511,11 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
                 ),
             )?;
             if rendered.is_empty() {
+                if options.retrieval_mode == QueryRetrievalMode::Neural {
+                    println!(
+                        "Neural search found no relevant matches for this intent in the current index."
+                    );
+                }
                 Ok(RunOutcome::NoMatch)
             } else {
                 Ok(RunOutcome::Success)
@@ -526,7 +536,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             limit,
             output,
         } => {
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let mut files = searcher.list_files()?;
 
             let mut includes = include;
@@ -623,7 +633,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Fs { command, path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             handle_fs_command(&repo_root, command)?;
             Ok(RunOutcome::Success)
         }
@@ -633,7 +643,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             limit,
             output,
         } => {
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let mut symbols = searcher.get_symbol(&symbol_name)?;
             symbols.sort_by(|a, b| {
                 a.file_path
@@ -678,7 +688,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
                 ));
             }
 
-            let (repo_root, searcher) = create_searcher(path.as_ref())?;
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
             let normalized_path = if file_path.is_absolute() {
                 file_path
             } else {
@@ -709,7 +719,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Stats { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
 
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found. Run 'flashgrep index' first.");
@@ -740,7 +750,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             port,
             log_level,
         } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             info!("Starting MCP server for: {}", repo_root.display());
 
             // Check if index exists
@@ -779,7 +789,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::McpStdio { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
             info!("Starting MCP stdio server for: {}", repo_root.display());
 
             // Check if index exists
@@ -797,7 +807,7 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             Ok(RunOutcome::Success)
         }
         Commands::Clear { path } => {
-            let repo_root = get_repo_root(path.as_ref())?;
+            let repo_root = get_repo_root(path.as_deref())?;
 
             if !FlashgrepPaths::new(&repo_root).exists() {
                 println!("⚠ No index found.");
@@ -850,7 +860,7 @@ fn print_active_watchers(registry: &WatcherRegistry) {
     }
 }
 
-fn spawn_background_watcher(repo_root: &PathBuf) -> FlashgrepResult<u32> {
+fn spawn_background_watcher(repo_root: &Path) -> FlashgrepResult<u32> {
     let exe_path = std::env::current_exe()?;
     let args = vec![
         OsString::from("start"),
@@ -886,7 +896,7 @@ fn spawn_process_for_background(
     Ok(child.id())
 }
 
-fn create_searcher(path: Option<&PathBuf>) -> FlashgrepResult<(PathBuf, Searcher)> {
+fn create_searcher(path: Option<&Path>) -> FlashgrepResult<(PathBuf, Searcher)> {
     let repo_root = get_repo_root(path)?;
     let paths = FlashgrepPaths::new(&repo_root);
     if !paths.exists() {
@@ -1081,17 +1091,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_query_with_semantic_mode() {
-        let cli = Cli::parse_from([
+    fn parse_query_rejects_removed_semantic_mode() {
+        let cli = Cli::try_parse_from([
             "flashgrep",
             "query",
             "find auth code",
             "--retrieval-mode",
             "semantic",
         ]);
+        assert!(cli.is_err());
+    }
+
+    #[test]
+    fn parse_query_accepts_neural_mode() {
+        let cli = Cli::parse_from([
+            "flashgrep",
+            "query",
+            "find sorter",
+            "--retrieval-mode",
+            "neural",
+        ]);
         match cli.command {
             Commands::Query { retrieval_mode, .. } => {
-                assert_eq!(retrieval_mode, RetrievalModeArg::Semantic)
+                assert_eq!(retrieval_mode, RetrievalModeArg::Neural)
             }
             _ => panic!("expected query command"),
         }
