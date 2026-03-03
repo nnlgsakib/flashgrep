@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Index command
-The CLI SHALL provide an index command for initial repository indexing and SHALL prompt for neural model download when required assets are missing.
+The CLI SHALL provide an index command for initial repository indexing and SHALL prompt users to enable neural navigation when neural configuration has not yet been initialized.
 
 #### Scenario: Run index command
 - **WHEN** the user runs `flashgrep index`
@@ -15,10 +15,10 @@ The CLI SHALL provide an index command for initial repository indexing and SHALL
 - **WHEN** the index command runs
 - **THEN** it SHALL display real-time progress to stdout
 
-#### Scenario: Prompt for missing neural model on index start
-- **WHEN** model assets are missing at index startup
-- **THEN** the CLI SHALL prompt user to download `BAAI/bge-small-en-v1.5`
-- **AND** if the user declines, it SHALL continue indexing normally without download
+#### Scenario: Prompt to enable neural navigation on first index
+- **WHEN** index starts and neural navigation configuration is unset in interactive mode
+- **THEN** the CLI SHALL prompt whether to enable neural navigation
+- **AND** if the user declines, indexing SHALL continue with lexical mode only
 
 #### Scenario: Success exit code
 - **WHEN** indexing completes successfully

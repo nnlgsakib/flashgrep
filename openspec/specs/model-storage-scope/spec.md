@@ -15,15 +15,15 @@ The system SHALL prompt interactive users to choose model storage scope when a m
 - **THEN** the system downloads the model into the repository-local `.flashgrep/model-cache` location
 
 ### Requirement: Config-driven global model cache path
-The system SHALL support a `.flashgrep` configuration field that defines a global model cache path used when scope is `global`.
+The system SHALL support `.flashgrep` configuration fields for neural mode including global model cache path, provider id, base URL, model id, and API key source metadata.
 
-#### Scenario: Global path is configured
-- **WHEN** scope is `global` and the configuration contains a valid global model cache path
-- **THEN** cache checks, manifest reads, and download targets use the configured global path
+#### Scenario: Global path and provider are configured
+- **WHEN** scope is `global` and configuration contains valid cache path and provider settings
+- **THEN** cache checks, manifest reads, and provider request configuration SHALL use configured values
 
-#### Scenario: Global path is missing
-- **WHEN** scope is `global` and no global model cache path is configured
-- **THEN** the system reports a clear configuration error with guidance to set the path or choose local scope
+#### Scenario: Required provider config is missing
+- **WHEN** neural mode is enabled and required provider configuration is absent
+- **THEN** the system SHALL report a clear configuration error with guidance to set provider/model/key fields or disable neural mode
 
 ### Requirement: Reuse global model across projects
 The system SHALL avoid re-downloading a model when the selected cache location already contains a valid manifest for the required model ID.
@@ -33,9 +33,8 @@ The system SHALL avoid re-downloading a model when the selected cache location a
 - **THEN** the system treats the model as cached and skips download
 
 ### Requirement: Non-interactive deterministic behavior
-The system SHALL not prompt for scope in non-interactive mode and MUST use deterministic cache-scope resolution.
+The system SHALL not prompt for scope or neural enablement in non-interactive mode and MUST use deterministic config resolution.
 
-#### Scenario: Non-interactive run without explicit scope
-- **WHEN** stdin/stdout are non-interactive and no explicit scope override is provided
-- **THEN** the system uses configured default scope resolution and continues without prompting
-
+#### Scenario: Non-interactive run without explicit overrides
+- **WHEN** stdin/stdout are non-interactive and no explicit scope or neural overrides are provided
+- **THEN** the system SHALL use configured defaults and continue without prompting
