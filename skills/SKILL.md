@@ -34,8 +34,9 @@ Bootstrap policy contract (machine-readable):
 
 Pick the smallest tool that solves the task:
 
-1. `query` / `flashgrep_query` with lexical retrieval for discovery and intent-style lookup.
-2. `query` with literal/regex modes when exact-match behavior is required.
+1. `query` / `flashgrep_query` with `retrieval_mode=neural` by default for discovery and intent-style lookup.
+2. If neural search fails, is unavailable, or returns no relevant matches, use deterministic lexical fallback via `query`.
+3. Use `query` literal/regex modes when exact-match behavior is required.
 3. `glob` / `files` / `list_files` / `flashgrep_glob`: indexed or advanced path discovery.
 4. `get_symbol` / `flashgrep_get_symbol`: symbol lookup.
 5. `read_code` / `flashgrep_read_code`: budgeted code reads.
@@ -52,6 +53,9 @@ Mandatory routing rule:
 - Use Flashgrep-native MCP routes first: `query`, `files`/`glob`, `get_symbol`, `read_code`, `write_code`.
 
 Allowed fallback gates (must record reason code):
+- `neural_mode_disabled`
+- `neural_provider_failure`
+- `neural_no_relevant_matches`
 - `exact_match_required`
 - `query_parse_constraints`
 - `flashgrep_index_unavailable`
@@ -158,10 +162,20 @@ Typed not-found contract:
 ## 4) Standard Workflows
 
 ### Code Discovery
-1. `query` (lexical) for candidate matches.
-2. `get_symbol` if symbol-oriented.
-3. `read_code` for bounded context.
-4. `get_slice` for exact extraction.
+1. Start with `query` using `retrieval_mode=neural` for intent discovery by default.
+2. If neural route fails, is not configured, or yields no relevant matches, fallback to lexical `query`.
+3. `get_symbol` if symbol-oriented.
+4. `read_code` for bounded context.
+5. `get_slice` for exact extraction.
+
+Neural intent examples:
+- `query` with `retrieval_mode=neural` and text `find this function "tokenize"`
+- `query` with `retrieval_mode=neural` and text `which files contain vector encoding logic`
+
+Neural result rules:
+- Use neural search as first-choice routing for discovery queries.
+- If neural cannot produce reliable results, switch to lexical search deterministically.
+- Do not invent results: strict relevance applies in both modes.
 
 ### Exact Match Lookup
 1. Start with lexical query in smart mode.
@@ -189,6 +203,7 @@ Typed not-found contract:
 - Use regex mode only when needed; literal/smart is cheaper and safer.
 - For large repos, narrow path scope early (`include`/`exclude`, `max_depth`).
 - For large IO, keep request payloads small and expect chunked continuation/retry loops.
+- For neural mode, keep candidate windows bounded and avoid full-file prompt payloads.
 
 ## 6) Compliance Recovery
 

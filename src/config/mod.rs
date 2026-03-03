@@ -3,6 +3,58 @@ pub mod paths;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeuralProviderConfig {
+    #[serde(default = "default_neural_provider")]
+    pub provider: String,
+    #[serde(default = "default_neural_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_neural_model")]
+    pub model: String,
+    #[serde(default = "default_neural_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_neural_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_neural_max_candidates")]
+    pub max_candidates: usize,
+}
+
+impl Default for NeuralProviderConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_neural_provider(),
+            base_url: default_neural_base_url(),
+            model: default_neural_model(),
+            api_key_env: default_neural_api_key_env(),
+            api_key: None,
+            timeout_ms: default_neural_timeout_ms(),
+            max_candidates: default_neural_max_candidates(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NeuralConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_neural_config_initialized")]
+    pub initialized: bool,
+    #[serde(default)]
+    pub provider: NeuralProviderConfig,
+}
+
+impl Default for NeuralConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initialized: false,
+            provider: NeuralProviderConfig::default(),
+        }
+    }
+}
+
 /// Configuration for flashgrep
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -51,6 +103,10 @@ pub struct Config {
     /// Path to store index state (relative to .flashgrep directory)
     #[serde(default = "default_index_state_path")]
     pub index_state_path: PathBuf,
+
+    /// Neural navigation and provider configuration
+    #[serde(default)]
+    pub neural: NeuralConfig,
 }
 
 impl Default for Config {
@@ -68,6 +124,7 @@ impl Default for Config {
             enable_initial_index: default_enable_initial_index(),
             progress_interval: default_progress_interval(),
             index_state_path: default_index_state_path(),
+            neural: NeuralConfig::default(),
         }
     }
 }
@@ -91,6 +148,70 @@ impl Config {
     pub fn default_path(flashgrep_dir: &Path) -> PathBuf {
         flashgrep_dir.join("config.json")
     }
+
+    pub fn resolve_neural_api_key(&self) -> Option<String> {
+        if let Some(key) = self
+            .neural
+            .provider
+            .api_key
+            .as_ref()
+            .map(|k| k.trim().to_string())
+        {
+            if !key.is_empty() {
+                return Some(key);
+            }
+        }
+
+        let env_key = self.neural.provider.api_key_env.trim();
+        if env_key.is_empty() {
+            return None;
+        }
+        if !looks_like_env_var_name(env_key) {
+            return Some(env_key.to_string());
+        }
+        std::env::var(env_key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    pub fn validate_neural(&self) -> anyhow::Result<()> {
+        if !self.neural.enabled {
+            return Ok(());
+        }
+
+        if self.neural.provider.provider.trim().is_empty() {
+            anyhow::bail!("neural.provider.provider cannot be empty when neural mode is enabled");
+        }
+        if self.neural.provider.base_url.trim().is_empty() {
+            anyhow::bail!("neural.provider.base_url cannot be empty when neural mode is enabled");
+        }
+        if self.neural.provider.model.trim().is_empty() {
+            anyhow::bail!("neural.provider.model cannot be empty when neural mode is enabled");
+        }
+        if self.resolve_neural_api_key().is_none() {
+            let key_hint = if looks_like_env_var_name(&self.neural.provider.api_key_env) {
+                format!(
+                    "neural.provider.api_key or env var {}",
+                    self.neural.provider.api_key_env
+                )
+            } else {
+                "neural.provider.api_key or a valid API key env var name".to_string()
+            };
+            anyhow::bail!(
+                "Neural mode is enabled but no API key resolved. Set {}",
+                key_hint
+            );
+        }
+        Ok(())
+    }
+}
+
+fn looks_like_env_var_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn default_use_unix_socket() -> bool {
@@ -153,6 +274,34 @@ fn default_index_state_path() -> PathBuf {
     PathBuf::from("index-state.json")
 }
 
+fn default_neural_provider() -> String {
+    "openrouter".to_string()
+}
+
+fn default_neural_base_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+
+fn default_neural_model() -> String {
+    "arcee-ai/trinity-large-preview:free".to_string()
+}
+
+fn default_neural_api_key_env() -> String {
+    "OPENROUTER_API_KEY".to_string()
+}
+
+fn default_neural_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_neural_max_candidates() -> usize {
+    24
+}
+
+fn default_neural_config_initialized() -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +322,31 @@ mod tests {
         let deserialized: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(config.version, deserialized.version);
         assert_eq!(config.mcp_port, deserialized.mcp_port);
+    }
+
+    #[test]
+    fn neural_defaults_match_openrouter_profile() {
+        let cfg = Config::default();
+        assert_eq!(cfg.neural.provider.provider, "openrouter");
+        assert_eq!(cfg.neural.provider.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(
+            cfg.neural.provider.model,
+            "arcee-ai/trinity-large-preview:free"
+        );
+        assert_eq!(cfg.neural.provider.api_key_env, "OPENROUTER_API_KEY");
+        assert!(!cfg.neural.enabled);
+    }
+
+    #[test]
+    fn resolve_neural_api_key_prefers_inline_key_then_env() {
+        let mut cfg = Config::default();
+        cfg.neural.provider.api_key = Some("inline-key".to_string());
+        assert_eq!(cfg.resolve_neural_api_key().as_deref(), Some("inline-key"));
+
+        cfg.neural.provider.api_key = None;
+        cfg.neural.provider.api_key_env = "FLASHGREP_TEST_NEURAL_KEY".to_string();
+        std::env::set_var("FLASHGREP_TEST_NEURAL_KEY", "env-key");
+        assert_eq!(cfg.resolve_neural_api_key().as_deref(), Some("env-key"));
+        std::env::remove_var("FLASHGREP_TEST_NEURAL_KEY");
     }
 }

@@ -986,7 +986,7 @@ mod tests {
         );
         assert_eq!(
             canonical["policy_metadata"]["search_routing"]["default_strategy"],
-            serde_json::Value::String("programmatic_first".to_string())
+            serde_json::Value::String("neural_first".to_string())
         );
         assert_eq!(canonical["policy_metadata"], alias["policy_metadata"]);
     }

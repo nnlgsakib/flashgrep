@@ -1,5 +1,7 @@
+use crate::config::Config;
 use crate::db::models::{SearchResult, Symbol};
 use crate::db::Database;
+use crate::neural::{cosine_similarity, provider_assist_rerank, pseudo_embedding};
 use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::FlashgrepError;
 use crate::FlashgrepResult;
@@ -9,7 +11,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tantivy::query::QueryParser;
 use tantivy::{Index, IndexReader, ReloadPolicy};
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryMode {
@@ -21,6 +23,7 @@ pub enum QueryMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryRetrievalMode {
     Lexical,
+    Neural,
 }
 
 #[derive(Debug, Clone)]
@@ -99,9 +102,10 @@ impl QueryOptions {
             .unwrap_or("lexical")
         {
             "lexical" => QueryRetrievalMode::Lexical,
+            "neural" => QueryRetrievalMode::Neural,
             other => {
                 return Err(FlashgrepError::Config(format!(
-                    "Invalid retrieval_mode '{}'. Expected one of: lexical",
+                    "Invalid retrieval_mode '{}'. Expected one of: lexical, neural",
                     other
                 )))
             }
@@ -143,6 +147,7 @@ pub struct Searcher {
     reader: IndexReader,
     query_parser: QueryParser,
     db: Database,
+    config: Config,
 }
 
 impl Searcher {
@@ -159,11 +164,21 @@ impl Searcher {
         let query_parser = QueryParser::for_index(index, vec![content_field]);
 
         let db = Database::open(db_path)?;
+        let config_path = db_path
+            .parent()
+            .map(|p| p.join("config.json"))
+            .ok_or_else(|| FlashgrepError::Config("invalid metadata db path".to_string()))?;
+        let config = if config_path.exists() {
+            Config::from_file(&config_path)?
+        } else {
+            Config::default()
+        };
 
         Ok(Self {
             reader,
             query_parser,
             db,
+            config,
         })
     }
 
@@ -189,7 +204,159 @@ impl Searcher {
             });
         }
 
-        self.query_lexical(options)
+        match options.retrieval_mode {
+            QueryRetrievalMode::Lexical => self.query_lexical(options),
+            QueryRetrievalMode::Neural => self.query_neural_assisted(options),
+        }
+    }
+
+    fn query_neural_assisted(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
+        if !self.config.neural.enabled {
+            warn!(
+                "Neural mode requested but disabled; falling back to lexical retrieval for query: {}",
+                options.text
+            );
+            return self.query_lexical(options);
+        }
+
+        let mut lexical = options.clone();
+        lexical.retrieval_mode = QueryRetrievalMode::Lexical;
+        lexical.limit = options.limit.saturating_mul(3).min(
+            self.config
+                .neural
+                .provider
+                .max_candidates
+                .max(options.limit),
+        );
+        lexical.offset = 0;
+
+        let mut base = self.query_lexical(&lexical)?;
+        let query_embedding = pseudo_embedding(&options.text, 64);
+
+        if base.results.is_empty() {
+            let model_id = format!(
+                "provider:{}:{}",
+                self.config.neural.provider.provider, self.config.neural.provider.model
+            );
+            if let Ok(chunks) = self.db.get_semantic_chunks(&model_id) {
+                let mut seeded = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        let similarity = cosine_similarity(&query_embedding, &chunk.embedding);
+                        SearchResult {
+                            file_path: chunk.file_path,
+                            start_line: chunk.start_line,
+                            end_line: chunk.end_line,
+                            symbol_name: None,
+                            relevance_score: similarity,
+                            preview: chunk.content.lines().take(3).collect::<Vec<_>>().join("\n"),
+                            content: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                seeded.sort_by(|a, b| {
+                    b.relevance_score
+                        .total_cmp(&a.relevance_score)
+                        .then_with(|| a.file_path.cmp(&b.file_path))
+                        .then_with(|| a.start_line.cmp(&b.start_line))
+                });
+                base.results = seeded
+                    .into_iter()
+                    .take(
+                        self.config
+                            .neural
+                            .provider
+                            .max_candidates
+                            .max(options.limit),
+                    )
+                    .collect();
+            }
+        }
+
+        if base.results.is_empty() {
+            warn!(
+                "Neural candidate set is empty; falling back to lexical retrieval for query: {}",
+                options.text
+            );
+            return self.query_lexical(options);
+        }
+
+        for result in &mut base.results {
+            let emb = pseudo_embedding(&result.preview, 64);
+            result.relevance_score += cosine_similarity(&query_embedding, &emb) * 0.35;
+        }
+
+        let api_key = match self.config.resolve_neural_api_key() {
+            Some(k) => k,
+            None => {
+                warn!(
+                    "Neural mode requested but API key is missing; falling back to lexical retrieval for query: {}",
+                    options.text
+                );
+                return self.query_lexical(options);
+            }
+        };
+
+        let order = match provider_assist_rerank(
+            &self.config.neural.provider,
+            &api_key,
+            &options.text,
+            &base.results,
+        ) {
+            Ok(order) => order,
+            Err(err) => {
+                warn!(
+                    "Neural provider rerank failed ({}); falling back to lexical retrieval",
+                    err
+                );
+                return self.query_lexical(options);
+            }
+        };
+        let mut reranked = Vec::new();
+        for idx in order {
+            if let Some(item) = base.results.get(idx).cloned() {
+                reranked.push(item);
+            }
+        }
+
+        if reranked.is_empty() {
+            return Ok(QueryResponse {
+                results: Vec::new(),
+                truncated: false,
+                scanned_files: base.results.len(),
+                next_offset: None,
+            });
+        }
+
+        base.results = reranked;
+
+        base.results.sort_by(|a, b| {
+            b.relevance_score
+                .total_cmp(&a.relevance_score)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+        });
+
+        let scanned_files = base.results.len();
+        let results = base
+            .results
+            .into_iter()
+            .skip(options.offset)
+            .take(options.limit)
+            .collect::<Vec<_>>();
+        let truncated = scanned_files > options.offset.saturating_add(results.len());
+        let next_offset = if truncated {
+            Some(options.offset.saturating_add(results.len()))
+        } else {
+            None
+        };
+
+        Ok(QueryResponse {
+            results,
+            truncated,
+            scanned_files,
+            next_offset,
+        })
     }
 
     fn query_lexical(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
@@ -550,13 +717,13 @@ mod tests {
     }
 
     #[test]
-    fn query_options_reject_non_lexical_retrieval_mode() {
-        let err = QueryOptions::from_mcp_args(&json!({
+    fn query_options_accept_neural_retrieval_mode() {
+        let opts = QueryOptions::from_mcp_args(&json!({
             "text": "find auth middleware",
-            "retrieval_mode": "semantic"
+            "retrieval_mode": "neural"
         }))
-        .expect_err("expected validation error");
-        assert!(err.to_string().contains("Expected one of: lexical"));
+        .expect("expected successful parse");
+        assert_eq!(opts.retrieval_mode, QueryRetrievalMode::Neural);
     }
 
     #[test]

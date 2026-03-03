@@ -59,6 +59,7 @@ config = "0.14"
 dirs = "5.0"
 indicatif = "0.17"
 rayon = "1.10"
+async-openai = "0.29"
 
 [dev-dependencies]
 tempfile = "3.10"

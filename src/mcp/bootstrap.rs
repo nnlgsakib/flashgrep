@@ -318,11 +318,11 @@ mod tests {
         );
         assert_eq!(
             payload["policy_metadata"]["search_routing"]["default_strategy"],
-            Value::String("programmatic_first".to_string())
+            Value::String("neural_first".to_string())
         );
         assert_eq!(
             payload["policy_metadata"]["search_routing"]["programmatic_priority"],
-            Value::String("primary".to_string())
+            Value::String("fallback".to_string())
         );
         assert!(payload["policy_metadata"]["search_routing"]["fallback_reason_codes"].is_array());
         assert!(payload["policy_metadata"]["prohibited_native_tools"].is_object());

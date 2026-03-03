@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::db::models::{Chunk, FileMetadata, Symbol};
 use crate::db::Database;
 use crate::index::scanner::{FileScanner, FlashgrepIgnore};
+use crate::neural::{build_knowledge_graph_edges, pseudo_embedding};
 use crate::symbols::SymbolDetector;
 use crate::FlashgrepResult;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -135,6 +136,7 @@ impl Indexer {
         self.db.delete_file_chunks(file_path)?;
         self.db.delete_file_symbols(file_path)?;
         self.db.delete_file_vectors(file_path)?;
+        self.db.delete_file_graph(file_path)?;
 
         // Insert/update file record
         self.db.insert_file(&metadata)?;
@@ -170,6 +172,8 @@ impl Indexer {
         if !all_symbols.is_empty() {
             self.db.insert_symbols_batch(&all_symbols)?;
         }
+
+        self.persist_neural_artifacts(file_path, &chunks, &all_symbols, last_modified)?;
 
         Ok(true) // File was indexed
     }
@@ -354,6 +358,7 @@ impl Indexer {
         self.db.delete_file_chunks(&prepared.file_path)?;
         self.db.delete_file_symbols(&prepared.file_path)?;
         self.db.delete_file_vectors(&prepared.file_path)?;
+        self.db.delete_file_graph(&prepared.file_path)?;
         self.db.insert_file(&prepared.metadata)?;
 
         for chunk in &prepared.chunks {
@@ -368,6 +373,87 @@ impl Indexer {
             self.db.insert_symbols_batch(&prepared.symbols)?;
         }
 
+        self.persist_neural_artifacts(
+            &prepared.file_path,
+            &prepared.chunks,
+            &prepared.symbols,
+            prepared.metadata.last_modified,
+        )?;
+
+        Ok(())
+    }
+
+    fn persist_neural_artifacts(
+        &self,
+        file_path: &Path,
+        chunks: &[Chunk],
+        symbols: &[Symbol],
+        last_modified: i64,
+    ) -> FlashgrepResult<()> {
+        if !self.config.neural.enabled {
+            return Ok(());
+        }
+
+        let model_id = format!(
+            "provider:{}:{}",
+            self.config.neural.provider.provider, self.config.neural.provider.model
+        );
+        let vectors = chunks
+            .iter()
+            .map(|chunk| crate::db::models::ChunkVector {
+                id: None,
+                file_path: chunk.file_path.clone(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                content_hash: chunk.content_hash.clone(),
+                embedding: pseudo_embedding(&chunk.content, 64),
+                model_id: model_id.clone(),
+                last_modified,
+            })
+            .collect::<Vec<_>>();
+        self.db.upsert_chunk_vectors_batch(&vectors)?;
+
+        let file_str = file_path.to_string_lossy().to_string();
+        let mut nodes = vec![(
+            format!("file:{}", file_str),
+            "file".to_string(),
+            file_str.clone(),
+            last_modified,
+        )];
+        for chunk in chunks {
+            nodes.push((
+                format!(
+                    "chunk:{}:{}-{}",
+                    chunk.file_path.to_string_lossy(),
+                    chunk.start_line,
+                    chunk.end_line
+                ),
+                "chunk".to_string(),
+                file_str.clone(),
+                last_modified,
+            ));
+        }
+        for symbol in symbols {
+            nodes.push((
+                format!(
+                    "symbol:{}:{}:{}",
+                    symbol.file_path.to_string_lossy(),
+                    symbol.line_number,
+                    symbol.symbol_name
+                ),
+                "symbol".to_string(),
+                file_str.clone(),
+                last_modified,
+            ));
+        }
+        self.db.upsert_graph_nodes(&nodes)?;
+
+        let edges = build_knowledge_graph_edges(file_path, chunks, symbols)
+            .into_iter()
+            .map(|(from_node, to_node, relation)| (from_node, to_node, relation, file_str.clone()))
+            .collect::<Vec<_>>();
+        self.db.upsert_graph_edges(&edges)?;
+        let _ = self.db.increment_graph_revision()?;
         Ok(())
     }
 
@@ -496,6 +582,34 @@ mod tests {
         let stats = indexer.get_stats()?;
         assert_eq!(stats.total_files, 1);
         assert!(stats.total_chunks > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_file_builds_neural_artifacts_when_enabled() -> FlashgrepResult<()> {
+        let temp_dir = TempDir::new()?;
+        let repo_root = temp_dir.path().to_path_buf();
+
+        let paths = FlashgrepPaths::new(&repo_root);
+        paths.create()?;
+        let mut config = Config::default();
+        config.neural.enabled = true;
+        config.neural.initialized = true;
+        config.to_file(&paths.config_file())?;
+
+        std::fs::write(repo_root.join("neural.rs"), "fn sort_names() {}\n")?;
+
+        let mut indexer = Indexer::new(repo_root.clone())?;
+        indexer.index_file(&repo_root.join("neural.rs"))?;
+
+        let model_id = format!(
+            "provider:{}:{}",
+            config.neural.provider.provider, config.neural.provider.model
+        );
+        let count = indexer.db().count_vectors_for_model(&model_id)?;
+        assert!(count > 0);
+        assert!(indexer.db().graph_revision()? > 0);
 
         Ok(())
     }

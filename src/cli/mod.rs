@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::index::engine::Indexer;
 use crate::mcp::stdio::McpStdioServer;
+use crate::neural::ensure_neural_config_prompt;
 use crate::path_utils::{normalize_glob_pattern, normalize_path_for_matching};
 use crate::search::{QueryMode, QueryOptions, QueryRetrievalMode, Searcher};
 use crate::watcher::registry::{is_process_alive, kill_process, WatcherRegistry};
@@ -45,12 +46,14 @@ pub enum QueryModeArg {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RetrievalModeArg {
     Lexical,
+    Neural,
 }
 
 impl From<RetrievalModeArg> for QueryRetrievalMode {
     fn from(value: RetrievalModeArg) -> Self {
         match value {
             RetrievalModeArg::Lexical => QueryRetrievalMode::Lexical,
+            RetrievalModeArg::Neural => QueryRetrievalMode::Neural,
         }
     }
 }
@@ -309,6 +312,15 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             let repo_root = get_repo_root(path.as_deref())?;
             info!("Indexing repository: {}", repo_root.display());
 
+            let paths = FlashgrepPaths::new(&repo_root);
+            if !paths.exists() {
+                paths.create()?;
+            }
+            if !paths.config_file().exists() {
+                Config::default().to_file(&paths.config_file())?;
+            }
+            let _ = ensure_neural_config_prompt(&paths);
+
             let mut indexer = Indexer::new(repo_root.clone())?;
 
             if force {
@@ -499,6 +511,11 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
                 ),
             )?;
             if rendered.is_empty() {
+                if options.retrieval_mode == QueryRetrievalMode::Neural {
+                    println!(
+                        "Neural search found no relevant matches for this intent in the current index."
+                    );
+                }
                 Ok(RunOutcome::NoMatch)
             } else {
                 Ok(RunOutcome::Success)
@@ -1083,6 +1100,23 @@ mod tests {
             "semantic",
         ]);
         assert!(cli.is_err());
+    }
+
+    #[test]
+    fn parse_query_accepts_neural_mode() {
+        let cli = Cli::parse_from([
+            "flashgrep",
+            "query",
+            "find sorter",
+            "--retrieval-mode",
+            "neural",
+        ]);
+        match cli.command {
+            Commands::Query { retrieval_mode, .. } => {
+                assert_eq!(retrieval_mode, RetrievalModeArg::Neural)
+            }
+            _ => panic!("expected query command"),
+        }
     }
 
     #[test]

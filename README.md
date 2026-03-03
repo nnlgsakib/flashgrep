@@ -52,6 +52,8 @@ This injects policy/tool guidance for the session and prepares Flashgrep-first r
 - **Single Binary CLI**: Distributed as a single executable with local index data in `.flashgrep/`
 - **MCP Compatible**: JSON-RPC server for integration with coding agents
 - **Lexical Retrieval**: Deterministic indexed search with smart/literal/regex query modes
+- **Optional Neural Navigation**: Index-first natural-language navigation using bounded candidate context and provider-assisted reranking
+- **Neural-First Option**: For discovery intents, you can run neural retrieval first with deterministic lexical fallback behavior
 
 ## Installation
 
@@ -109,6 +111,13 @@ Features:
 - **Incremental indexing**: Only re-indexes changed files
 - **Fast**: Indexes 1,500+ files in under 3 seconds
 - **Smart filtering**: Ignores `target/`, `node_modules/`, `.git/`, etc.
+- **Neural setup prompt**: On first interactive index, prompts for:
+  - enable/disable neural navigation
+  - provider (`openrouter` / `openai` / `custom`)
+  - model
+  - base URL
+  - API key env var name
+  - API key (optional inline)
 
 #### `flashgrep start [PATH]`
 
@@ -129,7 +138,7 @@ The daemon:
 
 #### `flashgrep query <TEXT> [PATH]`
 
-Run indexed search using lexical retrieval modes.
+Run indexed search with neural-first intent routing when enabled, with deterministic lexical fallback.
 
 ```bash
 # Find top matches
@@ -146,7 +155,66 @@ flashgrep query "a+b" --mode literal --ignore-case
 
 # Retrieval mode is lexical-only
 flashgrep query "find authentication middleware" --retrieval-mode lexical --limit 20
+
+# Optional neural-assisted mode (must be enabled/configured)
+flashgrep query "find code that sorts names" --retrieval-mode neural --limit 20
+
+# Natural-language function lookup (neural mode)
+flashgrep query "find this function \"tokenize\"" --retrieval-mode neural --limit 10
+
+# Force lexical mode explicitly
+flashgrep query "tokenize" --retrieval-mode lexical --limit 20
 ```
+
+Neural query behavior:
+- Uses index-first candidate retrieval, then provider-assisted reranking on bounded snippets.
+- Recommended discovery order: neural first, then lexical fallback if neural is unavailable or returns no relevant matches.
+- Returns `0 result(s)` when no relevant intent match is found (instead of unrelated guesses).
+- If provider/API fails, falls back deterministically to lexical retrieval.
+
+### Neural Navigation Setup
+
+#### Quick setup (interactive)
+
+```bash
+flashgrep index --force
+```
+
+When prompted, choose provider/model/base URL and set key inline or via env var.
+
+#### Quick setup (environment variable)
+
+OpenRouter:
+
+```bash
+# PowerShell
+$env:OPENROUTER_API_KEY="your_key_here"
+flashgrep query "find vector encoding logic" --retrieval-mode neural --limit 10
+```
+
+OpenAI:
+
+```bash
+# PowerShell
+$env:OPENAI_API_KEY="your_key_here"
+flashgrep query "find auth middleware" --retrieval-mode neural --limit 10
+```
+
+#### Provider compatibility
+
+Flashgrep neural routing uses an OpenAI-compatible chat completions SDK/client path.
+Any provider with OpenAI-compatible endpoints can be configured via:
+
+- `neural.provider.base_url`
+- `neural.provider.model`
+- `neural.provider.api_key_env` or `neural.provider.api_key`
+
+Default profile:
+
+- provider: `openrouter`
+- base_url: `https://openrouter.ai/api/v1`
+- model: `arcee-ai/trinity-large-preview:free`
+- api_key_env: `OPENROUTER_API_KEY`
 
 #### `flashgrep files [PATH]`
 
@@ -296,7 +364,7 @@ Bootstrap behavior:
 - Embedded payload is default (`payload_source: embedded`) and does not require local skill files
 - Optional repository override is opt-in (`allow_repo_override: true`) and falls back deterministically when unreadable
 - Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
-- Search routing defaults to programmatic lexical discovery, with gated fallback to generic/native tools when needed
+- Search routing defaults to neural-first discovery when enabled, with deterministic lexical fallback when neural routing is unavailable or non-relevant
 
 Bootstrap policy metadata:
 - `policy_metadata.policy_strength`: enforcement mode (default: `strict`)
@@ -305,12 +373,15 @@ Bootstrap policy metadata:
 - `policy_metadata.bootstrap_state`: current session state (`injected` or `already_injected`)
 - `policy_metadata.preferred_tool_families`: explicit native Flashgrep routing families
 - `policy_metadata.preferred_tools`: Flashgrep-first tool routing groups
-- `policy_metadata.search_routing`: programmatic-first search order and fallback reason contracts
+- `policy_metadata.search_routing`: neural-first search order and fallback reason contracts
 - `policy_metadata.fallback_rules`: allowed fallback gates with typed `reason_code`
 - `policy_metadata.compliance_checks`: client-side compliance expectations
 - `policy_metadata.prohibited_native_tools`: native/host tools to avoid unless fallback gate is active
 
 Fallback gate defaults:
+- `neural_mode_disabled`
+- `neural_provider_failure`
+- `neural_no_relevant_matches`
 - `exact_match_required`
 - `query_parse_constraints`
 - `flashgrep_index_unavailable`
@@ -598,9 +669,39 @@ The config is stored in `.flashgrep/config.json`:
   "debounce_ms": 500,
   "enable_initial_index": true,
   "progress_interval": 1000,
-  "index_state_path": "index-state.json"
+  "index_state_path": "index-state.json",
+  "neural": {
+    "enabled": false,
+    "initialized": false,
+    "provider": {
+      "provider": "openrouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model": "arcee-ai/trinity-large-preview:free",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "api_key": null,
+      "timeout_ms": 5000,
+      "max_candidates": 24
+    }
+  }
 }
 ```
+
+Neural mode efficiency rules:
+- candidate retrieval stays local/index-first
+- provider calls receive bounded snippet context only
+- lexical fallback remains deterministic on provider failures/timeouts
+
+Neural config field notes:
+
+- `neural.enabled`: enable neural retrieval path
+- `neural.initialized`: whether setup prompt has already been completed
+- `neural.provider.provider`: provider id (`openrouter`, `openai`, or custom)
+- `neural.provider.base_url`: OpenAI-compatible API base URL (for OpenRouter use `https://openrouter.ai/api/v1`)
+- `neural.provider.model`: chat model id
+- `neural.provider.api_key_env`: env var name for key resolution
+- `neural.provider.api_key`: optional inline key in config (use carefully)
+- `neural.provider.timeout_ms`: provider request timeout
+- `neural.provider.max_candidates`: cap on candidate snippets sent for reranking
 
 ## Architecture
 

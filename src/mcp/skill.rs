@@ -305,7 +305,7 @@ pub fn get_skill_documentation() -> SkillDocumentation {
     }
 
     SkillDocumentation {
-        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Bootstrap uses embedded guidance by default at init and policy metadata enforces programmatic Flashgrep-first routing for discovery intents, with deterministic gated fallback to generic tools when required.".to_string(),
+        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Bootstrap uses embedded guidance by default at init and policy metadata enforces neural-first routing for discovery intents when neural mode is enabled, with deterministic fallback to lexical/programmatic retrieval.".to_string(),
         commands,
     }
 }
@@ -313,7 +313,8 @@ pub fn get_skill_documentation() -> SkillDocumentation {
 pub fn bootstrap_policy() -> Vec<String> {
     vec![
         "Always use Flashgrep-native tools first; treat them as primary routing.".to_string(),
-        "For discovery-style search, prefer programmatic lexical retrieval through query tools.".to_string(),
+        "For discovery-style search, prefer neural-assisted retrieval first when neural mode is enabled.".to_string(),
+        "If neural mode is unavailable, returns no relevant matches, or provider inference fails, fallback to lexical/programmatic query.".to_string(),
         "Use generic/native search tools only as second-choice fallback under explicit typed gates.".to_string(),
         "Do not use native grep/glob/read/write tools unless a declared fallback gate is active."
             .to_string(),
@@ -329,11 +330,14 @@ pub fn bootstrap_policy_metadata() -> Value {
         "policy_strength": "strict",
         "enforcement_mode": "strict",
         "search_routing": {
-            "default_strategy": "programmatic_first",
-            "discovery_order": ["lexical"],
-            "programmatic_priority": "primary",
+            "default_strategy": "neural_first",
+            "discovery_order": ["neural_assisted", "lexical"],
+            "programmatic_priority": "fallback",
             "fallback_required": true,
             "fallback_reason_codes": [
+                "neural_mode_disabled",
+                "neural_provider_failure",
+                "neural_no_relevant_matches",
                 "exact_match_required",
                 "query_parse_constraints",
                 "flashgrep_index_unavailable",
