@@ -1,10 +1,9 @@
 use crate::chunking::Chunker;
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
-use crate::db::models::{Chunk, ChunkVector, FileMetadata, Symbol};
+use crate::db::models::{Chunk, FileMetadata, Symbol};
 use crate::db::Database;
 use crate::index::scanner::{FileScanner, FlashgrepIgnore};
-use crate::neural::{embed_text, embed_texts, is_model_cached, EMBEDDING_MODEL_ID};
 use crate::symbols::SymbolDetector;
 use crate::FlashgrepResult;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -25,13 +24,11 @@ struct PreparedFileIndex {
     metadata: FileMetadata,
     chunks: Vec<Chunk>,
     symbols: Vec<Symbol>,
-    vectors: Vec<ChunkVector>,
 }
 
 /// Main indexing engine
 pub struct Indexer {
     paths: FlashgrepPaths,
-    semantic_vectors_enabled: bool,
     db: Database,
     index: Index,
     writer: IndexWriter,
@@ -67,7 +64,6 @@ impl Indexer {
         let writer = index.writer(50_000_000)?; // 50MB buffer
 
         Ok(Self {
-            semantic_vectors_enabled: is_model_cached(&paths).unwrap_or(false),
             paths,
             db,
             index,
@@ -120,10 +116,6 @@ impl Indexer {
     pub fn index_file(&mut self, file_path: &Path) -> FlashgrepResult<bool> {
         debug!("Checking file: {}", file_path.display());
 
-        if !self.semantic_vectors_enabled {
-            self.semantic_vectors_enabled = is_model_cached(&self.paths).unwrap_or(false);
-        }
-
         // Get file metadata first to check modification time
         let metadata = FileMetadata::from_path(file_path)?;
         let last_modified = metadata.last_modified;
@@ -172,42 +164,6 @@ impl Indexer {
         // Batch insert chunks (much faster than individual inserts)
         if !chunks.is_empty() {
             self.db.insert_chunks_batch(&chunks)?;
-        }
-
-        // Build and persist semantic vectors for each chunk.
-        if !chunks.is_empty() && self.semantic_vectors_enabled {
-            let mut vectors = Vec::with_capacity(chunks.len());
-            for chunk in &chunks {
-                let embedding = match embed_text(&self.paths, &chunk.content) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        error!(
-                            "Failed to embed chunk for {}:{}-{}: {}",
-                            chunk.file_path.display(),
-                            chunk.start_line,
-                            chunk.end_line,
-                            err
-                        );
-                        self.semantic_vectors_enabled = false;
-                        vectors.clear();
-                        break;
-                    }
-                };
-                if embedding.is_empty() {
-                    continue;
-                }
-                vectors.push(ChunkVector {
-                    id: None,
-                    file_path: chunk.file_path.clone(),
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    content_hash: chunk.content_hash.clone(),
-                    embedding,
-                    model_id: EMBEDDING_MODEL_ID.to_string(),
-                    last_modified: chunk.last_modified,
-                });
-            }
-            self.db.upsert_chunk_vectors_batch(&vectors)?;
         }
 
         // Batch insert symbols (much faster than individual inserts)
@@ -297,8 +253,6 @@ impl Indexer {
             }
         }
 
-        let paths_for_workers = self.paths.clone();
-        let semantic_vectors_enabled = self.semantic_vectors_enabled;
         let progress_for_workers = progress.clone();
         let prepared_results: Vec<(PathBuf, FlashgrepResult<PreparedFileIndex>)> = plans
             .into_par_iter()
@@ -306,13 +260,7 @@ impl Indexer {
                 || (Chunker::new(), SymbolDetector::new()),
                 |(chunker, symbol_detector), plan| {
                     let path = plan.file_path.clone();
-                    let result = Self::prepare_file_for_indexing(
-                        &paths_for_workers,
-                        semantic_vectors_enabled,
-                        chunker,
-                        symbol_detector,
-                        plan,
-                    );
+                    let result = Self::prepare_file_for_indexing(chunker, symbol_detector, plan);
                     if let Some(pb) = &progress_for_workers {
                         pb.inc(1);
                     }
@@ -374,8 +322,6 @@ impl Indexer {
     }
 
     fn prepare_file_for_indexing(
-        paths: &FlashgrepPaths,
-        semantic_vectors_enabled: bool,
         chunker: &Chunker,
         symbol_detector: &SymbolDetector,
         plan: FileIndexPlan,
@@ -396,47 +342,11 @@ impl Indexer {
             ));
         }
 
-        let mut vectors = Vec::new();
-        if semantic_vectors_enabled && !chunks.is_empty() {
-            let chunk_contents: Vec<String> =
-                chunks.iter().map(|chunk| chunk.content.clone()).collect();
-            let embeddings = match embed_texts(paths, &chunk_contents) {
-                Ok(embeddings) => embeddings,
-                Err(err) => {
-                    error!(
-                        "Failed to embed chunks for {}: {}",
-                        plan.file_path.display(),
-                        err
-                    );
-                    Vec::new()
-                }
-            };
-
-            vectors.reserve(chunks.len());
-            for (chunk, embedding) in chunks.iter().zip(embeddings.into_iter()) {
-                if embedding.is_empty() {
-                    continue;
-                }
-
-                vectors.push(ChunkVector {
-                    id: None,
-                    file_path: chunk.file_path.clone(),
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    content_hash: chunk.content_hash.clone(),
-                    embedding,
-                    model_id: EMBEDDING_MODEL_ID.to_string(),
-                    last_modified: chunk.last_modified,
-                });
-            }
-        }
-
         Ok(PreparedFileIndex {
             file_path: plan.file_path,
             metadata: plan.metadata,
             chunks,
             symbols,
-            vectors,
         })
     }
 
@@ -452,10 +362,6 @@ impl Indexer {
 
         if !prepared.chunks.is_empty() {
             self.db.insert_chunks_batch(&prepared.chunks)?;
-        }
-
-        if !prepared.vectors.is_empty() {
-            self.db.upsert_chunk_vectors_batch(&prepared.vectors)?;
         }
 
         if !prepared.symbols.is_empty() {

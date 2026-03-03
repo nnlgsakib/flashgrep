@@ -5,40 +5,11 @@ use flashgrep::db::models::{FileMetadata, SymbolType};
 use flashgrep::db::Database;
 use flashgrep::index::engine::Indexer;
 use flashgrep::index::scanner::{FileScanner, FlashgrepIgnore};
-use flashgrep::neural::{ensure_model_for_startup_prompt, ModelStartupPromptOutcome};
 use flashgrep::search::Searcher;
 use flashgrep::symbols::SymbolDetector;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-
-struct EnvGuard {
-    key: &'static str,
-    old: Option<String>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let old = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self { key, old }
-    }
-
-    fn unset(key: &'static str) -> Self {
-        let old = std::env::var(key).ok();
-        std::env::remove_var(key);
-        Self { key, old }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.old {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
 
 /// Helper to create a test file with content
 fn create_test_file(dir: &Path, name: &str, content: &str) {
@@ -500,46 +471,4 @@ fn test_ignore_file_update_prunes_newly_ignored_indexed_files() {
     let searcher = Searcher::new(indexer.tantivy_index(), &paths.metadata_db()).unwrap();
     let hits = searcher.query("TRANSIENT_IGNORE_TOKEN", 10).unwrap();
     assert!(hits.is_empty());
-}
-
-#[test]
-fn test_noninteractive_startup_uses_local_scope_without_prompt() {
-    let temp_dir = TempDir::new().unwrap();
-    let repo_root = temp_dir.path().to_path_buf();
-    let paths = FlashgrepPaths::new(&repo_root);
-    paths.create().unwrap();
-
-    let config = Config {
-        global_model_cache_path: Some(repo_root.join("isolated-global-model-cache")),
-        ..Default::default()
-    };
-    config.to_file(&paths.config_file()).unwrap();
-
-    let _noninteractive = EnvGuard::set("FLASHGREP_NONINTERACTIVE", "1");
-    let _prompt_response = EnvGuard::unset("FLASHGREP_MODEL_PROMPT_RESPONSE");
-    let _scope_override = EnvGuard::unset("FLASHGREP_MODEL_CACHE_SCOPE");
-
-    let outcome = ensure_model_for_startup_prompt(&paths, "integration startup").unwrap();
-    assert_eq!(outcome, ModelStartupPromptOutcome::NonInteractiveSkip);
-}
-
-#[test]
-fn test_global_scope_uses_configured_or_default_path_without_error() {
-    let temp_dir = TempDir::new().unwrap();
-    let repo_root = temp_dir.path().to_path_buf();
-    let paths = FlashgrepPaths::new(&repo_root);
-    paths.create().unwrap();
-
-    let config = Config {
-        global_model_cache_path: Some(repo_root.join("shared-global-model-cache")),
-        ..Default::default()
-    };
-    config.to_file(&paths.config_file()).unwrap();
-
-    let _scope_override = EnvGuard::set("FLASHGREP_MODEL_CACHE_SCOPE", "global");
-    let _noninteractive = EnvGuard::set("FLASHGREP_NONINTERACTIVE", "1");
-    let _prompt_response = EnvGuard::unset("FLASHGREP_MODEL_PROMPT_RESPONSE");
-
-    let outcome = ensure_model_for_startup_prompt(&paths, "integration startup").unwrap();
-    assert_eq!(outcome, ModelStartupPromptOutcome::NonInteractiveSkip);
 }

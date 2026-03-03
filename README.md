@@ -51,7 +51,7 @@ This injects policy/tool guidance for the session and prepares Flashgrep-first r
 - **Token Efficient**: Returns exact code slices, not full files
 - **Single Binary CLI**: Distributed as a single executable with local index data in `.flashgrep/`
 - **MCP Compatible**: JSON-RPC server for integration with coding agents
-- **Neural + Lexical Retrieval**: Semantic discovery with deterministic lexical fallback when exact matching is needed
+- **Lexical Retrieval**: Deterministic indexed search with smart/literal/regex query modes
 
 ## Installation
 
@@ -109,7 +109,6 @@ Features:
 - **Incremental indexing**: Only re-indexes changed files
 - **Fast**: Indexes 1,500+ files in under 3 seconds
 - **Smart filtering**: Ignores `target/`, `node_modules/`, `.git/`, etc.
-- **Model onboarding prompt**: If neural model cache is missing, startup asks whether to download `BAAI/bge-small-en-v1.5` and where to store it (`local` or `global`)
 
 #### `flashgrep start [PATH]`
 
@@ -127,11 +126,10 @@ The daemon:
 - Watches files for changes and auto-updates index
 - Runs MCP server on `localhost:7777`
 - Supports graceful shutdown (Ctrl+C)
-- Prompts for optional neural model download before initial indexing when cache is missing (with `local`/`global` storage scope selection)
 
 #### `flashgrep query <TEXT> [PATH]`
 
-Run indexed search using lexical, semantic, or hybrid retrieval modes.
+Run indexed search using lexical retrieval modes.
 
 ```bash
 # Find top matches
@@ -146,18 +144,9 @@ flashgrep query "fn\\s+main" --mode regex --include "src/**/*.rs" --context 2
 # Literal mode + case-insensitive
 flashgrep query "a+b" --mode literal --ignore-case
 
-# Semantic mode for intent-style search
-flashgrep query "find authentication middleware" --retrieval-mode semantic --limit 20
-
-# Hybrid mode blends lexical and semantic ranking
-flashgrep query "jwt validation" --retrieval-mode hybrid --output json
+# Retrieval mode is lexical-only
+flashgrep query "find authentication middleware" --retrieval-mode lexical --limit 20
 ```
-
-Neural retrieval uses model `BAAI/bge-small-en-v1.5` and caches assets in either:
-- Local cache: `.flashgrep/model-cache/BAAI__bge-small-en-v1.5`
-- Global cache: `global_model_cache_path/BAAI__bge-small-en-v1.5` (defaults to OS user app-data location; configurable in `.flashgrep/config.json`)
-
-On first download prompt, choose whether to store the model locally (per repository) or globally (shared across repositories).
 
 #### `flashgrep files [PATH]`
 
@@ -307,7 +296,7 @@ Bootstrap behavior:
 - Embedded payload is default (`payload_source: embedded`) and does not require local skill files
 - Optional repository override is opt-in (`allow_repo_override: true`) and falls back deterministically when unreadable
 - Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
-- Search routing defaults to neural-first for discovery intent (`query` with `retrieval_mode=semantic` or `hybrid`), with gated lexical/programmatic fallback
+- Search routing defaults to programmatic lexical discovery, with gated fallback to generic/native tools when needed
 
 Bootstrap policy metadata:
 - `policy_metadata.policy_strength`: enforcement mode (default: `strict`)
@@ -316,14 +305,12 @@ Bootstrap policy metadata:
 - `policy_metadata.bootstrap_state`: current session state (`injected` or `already_injected`)
 - `policy_metadata.preferred_tool_families`: explicit native Flashgrep routing families
 - `policy_metadata.preferred_tools`: Flashgrep-first tool routing groups
-- `policy_metadata.search_routing`: neural-first search order and fallback reason contracts
+- `policy_metadata.search_routing`: programmatic-first search order and fallback reason contracts
 - `policy_metadata.fallback_rules`: allowed fallback gates with typed `reason_code`
 - `policy_metadata.compliance_checks`: client-side compliance expectations
 - `policy_metadata.prohibited_native_tools`: native/host tools to avoid unless fallback gate is active
 
 Fallback gate defaults:
-- `neural_model_unavailable`
-- `neural_low_confidence`
 - `exact_match_required`
 - `query_parse_constraints`
 - `flashgrep_index_unavailable`
@@ -611,15 +598,9 @@ The config is stored in `.flashgrep/config.json`:
   "debounce_ms": 500,
   "enable_initial_index": true,
   "progress_interval": 1000,
-  "index_state_path": "index-state.json",
-  "model_cache_scope": "local",
-  "global_model_cache_path": "C:/Users/<you>/.flashgrep/model-cache"
+  "index_state_path": "index-state.json"
 }
 ```
-
-Notes:
-- `model_cache_scope` accepts `local` or `global`.
-- `global_model_cache_path` is optional; if omitted, Flashgrep uses an OS-appropriate user app-data path.
 
 ## Architecture
 
@@ -630,7 +611,6 @@ Notes:
 - **Symbol Detector**: Regex-based detection of functions, classes, imports, etc.
 - **Tantivy Index**: Full-text search engine with custom ranking
 - **SQLite Store**: Metadata storage with connection pooling and batch inserts
-- **Neural Embedding Layer**: Local semantic embeddings (`BAAI/bge-small-en-v1.5`) for intent-style retrieval
 - **File Watcher**: Incremental re-indexing with debouncing
 - **MCP Server**: JSON-RPC over TCP for agent integration
 
@@ -642,7 +622,6 @@ Flashgrep is often faster than traditional `grep`/`glob` workflows for active de
 - **No full tree scan per query**: traditional grep often re-walks directories and re-reads files every run.
 - **Structured metadata paths**: symbol lookup and file listing use indexed tables instead of regex over raw files.
 - **Watcher-assisted freshness**: background watcher updates changed files incrementally, avoiding full rebuilds.
-- **Semantic retrieval option**: neural search helps agents find intent-based matches before exact lexical narrowing.
 - **Deterministic bounded output**: command limits are enforced before render for stable, script-friendly responses.
 
 Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when you run many searches per session and want index-backed speed, structure, and deterministic pagination.
@@ -663,8 +642,7 @@ Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when yo
 ├── text_index/        # Tantivy full-text index
 ├── metadata.db        # SQLite database (chunks, symbols, file metadata)
 ├── config.json        # Configuration
-├── vectors/           # Runtime vector/index auxiliary artifacts
-└── model-cache/       # Cached neural model assets (downloaded on demand)
+└── vectors/           # Runtime index auxiliary artifacts
 ```
 
 ## Performance
@@ -756,7 +734,6 @@ src/
 ├── chunking/         # File chunking logic
 ├── symbols/          # Symbol detection
 ├── search/           # Search engine
-├── neural/           # Semantic embedding/model integration
 ├── watcher/          # File system watcher
 └── mcp/              # MCP server
 ```
@@ -788,31 +765,6 @@ rm -rf .flashgrep
 flashgrep index
 ```
 
-### Semantic model download fails
-
-- Ensure internet access on first semantic/hybrid run.
-- Verify cache path is writable: `.flashgrep/model-cache/BAAI__bge-small-en-v1.5`.
-- If you intentionally run offline, pre-populate model cache first and keep `FLASHGREP_OFFLINE=1`.
-
-If cache metadata is corrupted, remove cache and retry:
-
-```bash
-rm -rf .flashgrep/model-cache/BAAI__bge-small-en-v1.5
-flashgrep query "find auth code" --retrieval-mode semantic
-```
-
-For non-interactive scripts/CI, startup skips prompts and continues lexical indexing.
-You can force this behavior with:
-
-```bash
-FLASHGREP_NONINTERACTIVE=1 flashgrep index
-```
-
-To script prompt answers explicitly:
-
-```bash
-FLASHGREP_MODEL_PROMPT_RESPONSE=y flashgrep start
-```
 
 ## License
 
@@ -828,5 +780,4 @@ Contributions are welcome! Please read CONTRIBUTING.md for guidelines.
 - [ ] Team shared index
 - [ ] Visual graph UI
 - [ ] Call graph engine
-- [x] Semantic embeddings
 - [ ] Refactor impact analysis

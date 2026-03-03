@@ -179,7 +179,7 @@ impl McpStdioServer {
                                 "text": {"type": "string", "description": "Search text"},
                                 "limit": {"type": "integer", "description": "Maximum results", "default": 10},
                                 "mode": {"type": "string", "enum": ["smart", "literal", "regex"], "default": "smart"},
-                                "retrieval_mode": {"type": "string", "enum": ["lexical", "semantic", "hybrid"], "default": "lexical"},
+                                "retrieval_mode": {"type": "string", "enum": ["lexical"], "default": "lexical"},
                                 "case_sensitive": {"type": "boolean", "default": true},
                                 "regex_flags": {"type": "string", "description": "Regex flags (e.g. i for case-insensitive)"},
                                 "include": {"type": "array", "items": {"type": "string"}},
@@ -1052,7 +1052,7 @@ mod tests {
         );
         assert_eq!(
             alias_payload["policy_metadata"]["search_routing"]["default_strategy"],
-            Value::String("neural_first".to_string())
+            Value::String("programmatic_first".to_string())
         );
 
         let invalid_payload = payload_text(

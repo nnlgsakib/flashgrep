@@ -318,11 +318,11 @@ mod tests {
         );
         assert_eq!(
             payload["policy_metadata"]["search_routing"]["default_strategy"],
-            Value::String("neural_first".to_string())
+            Value::String("programmatic_first".to_string())
         );
         assert_eq!(
             payload["policy_metadata"]["search_routing"]["programmatic_priority"],
-            Value::String("secondary".to_string())
+            Value::String("primary".to_string())
         );
         assert!(payload["policy_metadata"]["search_routing"]["fallback_reason_codes"].is_array());
         assert!(payload["policy_metadata"]["prohibited_native_tools"].is_object());
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn neural_fallback_reason_codes_are_typed_and_present() {
+    fn fallback_reason_codes_are_typed_and_present() {
         let (_temp, paths, injected) = setup_paths_with_skill(None);
         let payload = build_bootstrap_payload(
             &paths,
@@ -419,8 +419,6 @@ mod tests {
             .expect("reason codes");
         let as_strings: Vec<&str> = reasons.iter().filter_map(Value::as_str).collect();
 
-        assert!(as_strings.contains(&"neural_model_unavailable"));
-        assert!(as_strings.contains(&"neural_low_confidence"));
         assert!(as_strings.contains(&"exact_match_required"));
         assert!(as_strings.contains(&"query_parse_constraints"));
     }

@@ -1,19 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: Full-text search
-The search engine SHALL perform lexical full-text queries and semantic vector queries against indexed repository content.
+The search engine SHALL perform lexical full-text queries against indexed repository content.
 
 #### Scenario: Basic text query
 - **WHEN** a user submits a text query
 - **THEN** the system SHALL return matching chunks ranked by relevance
-
-#### Scenario: Semantic text query
-- **WHEN** a user submits a natural-language query in semantic mode
-- **THEN** the system SHALL return semantically matched chunks ranked by relevance
-
-#### Scenario: Hybrid text query
-- **WHEN** a user submits a query in hybrid mode
-- **THEN** the system SHALL combine lexical and semantic scoring deterministically
 
 #### Scenario: Limit results
 - **WHEN** a query specifies a limit parameter

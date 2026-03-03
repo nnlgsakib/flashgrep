@@ -34,8 +34,8 @@ Bootstrap policy contract (machine-readable):
 
 Pick the smallest tool that solves the task:
 
-1. `query` / `flashgrep_query` with `retrieval_mode=semantic` (or `hybrid`) for discovery and intent-style lookup.
-2. `query` with lexical/literal/regex only when an explicit fallback gate applies.
+1. `query` / `flashgrep_query` with lexical retrieval for discovery and intent-style lookup.
+2. `query` with literal/regex modes when exact-match behavior is required.
 3. `glob` / `files` / `list_files` / `flashgrep_glob`: indexed or advanced path discovery.
 4. `get_symbol` / `flashgrep_get_symbol`: symbol lookup.
 5. `read_code` / `flashgrep_read_code`: budgeted code reads.
@@ -52,8 +52,6 @@ Mandatory routing rule:
 - Use Flashgrep-native MCP routes first: `query`, `files`/`glob`, `get_symbol`, `read_code`, `write_code`.
 
 Allowed fallback gates (must record reason code):
-- `neural_model_unavailable`
-- `neural_low_confidence`
 - `exact_match_required`
 - `query_parse_constraints`
 - `flashgrep_index_unavailable`
@@ -160,13 +158,13 @@ Typed not-found contract:
 ## 4) Standard Workflows
 
 ### Code Discovery
-1. `query` with `retrieval_mode=semantic` (or `hybrid`) for candidate matches.
+1. `query` (lexical) for candidate matches.
 2. `get_symbol` if symbol-oriented.
 3. `read_code` for bounded context.
 4. `get_slice` for exact extraction.
 
 ### Exact Match Lookup
-1. Start with neural/hybrid if intent is unclear.
+1. Start with lexical query in smart mode.
 2. If exact literal/regex semantics are required, activate fallback with reason `exact_match_required`.
 3. Run `query` in `literal` or `regex` mode and continue deterministic pagination as needed.
 
@@ -197,7 +195,7 @@ Typed not-found contract:
 If the agent drifts to native tools:
 1. Re-run bootstrap with `{ "force": true, "compact": true }`.
 2. Re-check `policy_metadata.policy_strength`, `payload_source`, `bootstrap_state`, `search_routing.default_strategy`, and fallback gates.
-3. Restart task routing from Flashgrep tools with neural-first discovery (`query` semantic/hybrid, then gated lexical fallback).
+3. Restart task routing from Flashgrep tools with lexical discovery (`query` smart/literal/regex as needed).
 4. Keep fallback usage only under a declared gate + reason code.
 
 ## 7) Native Tool Ban List

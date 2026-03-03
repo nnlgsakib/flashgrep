@@ -305,7 +305,7 @@ pub fn get_skill_documentation() -> SkillDocumentation {
     }
 
     SkillDocumentation {
-        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Bootstrap uses embedded guidance by default at init and policy metadata enforces neural-first search routing for discovery intents, with deterministic gated fallback to programmatic tools when required.".to_string(),
+        overview: "Flashgrep is a high-performance local code indexing engine with native MCP bootstrap support. Bootstrap uses embedded guidance by default at init and policy metadata enforces programmatic Flashgrep-first routing for discovery intents, with deterministic gated fallback to generic tools when required.".to_string(),
         commands,
     }
 }
@@ -313,8 +313,8 @@ pub fn get_skill_documentation() -> SkillDocumentation {
 pub fn bootstrap_policy() -> Vec<String> {
     vec![
         "Always use Flashgrep-native tools first; treat them as primary routing.".to_string(),
-        "For discovery-style search, prefer neural retrieval first (query with retrieval_mode=semantic or hybrid).".to_string(),
-        "Use programmatic/lexical search only as second-choice fallback under explicit typed gates.".to_string(),
+        "For discovery-style search, prefer programmatic lexical retrieval through query tools.".to_string(),
+        "Use generic/native search tools only as second-choice fallback under explicit typed gates.".to_string(),
         "Do not use native grep/glob/read/write tools unless a declared fallback gate is active."
             .to_string(),
         "Use query/files/symbol for indexed discovery and navigation.".to_string(),
@@ -329,13 +329,11 @@ pub fn bootstrap_policy_metadata() -> Value {
         "policy_strength": "strict",
         "enforcement_mode": "strict",
         "search_routing": {
-            "default_strategy": "neural_first",
-            "discovery_order": ["semantic", "hybrid", "lexical"],
-            "programmatic_priority": "secondary",
+            "default_strategy": "programmatic_first",
+            "discovery_order": ["lexical"],
+            "programmatic_priority": "primary",
             "fallback_required": true,
             "fallback_reason_codes": [
-                "neural_model_unavailable",
-                "neural_low_confidence",
                 "exact_match_required",
                 "query_parse_constraints",
                 "flashgrep_index_unavailable",
@@ -357,8 +355,6 @@ pub fn bootstrap_policy_metadata() -> Value {
             "write": ["write_code"]
         },
         "fallback_gate_ids": [
-            "neural_model_unavailable",
-            "neural_low_confidence",
             "exact_match_required",
             "query_parse_constraints",
             "index_unavailable",
@@ -368,18 +364,6 @@ pub fn bootstrap_policy_metadata() -> Value {
         ],
         "fallback_rules": [
             {
-                "gate_id": "neural_model_unavailable",
-                "condition": "semantic_runtime_or_model_missing",
-                "allowed_tools": ["query"],
-                "reason_code": "neural_model_unavailable"
-            },
-            {
-                "gate_id": "neural_low_confidence",
-                "condition": "semantic_score_below_policy_threshold",
-                "allowed_tools": ["query", "symbol", "get_symbol"],
-                "reason_code": "neural_low_confidence"
-            },
-            {
                 "gate_id": "exact_match_required",
                 "condition": "request_requires_literal_or_regex_exactness",
                 "allowed_tools": ["query", "symbol", "get_symbol"],
@@ -387,7 +371,7 @@ pub fn bootstrap_policy_metadata() -> Value {
             },
             {
                 "gate_id": "query_parse_constraints",
-                "condition": "smart_query_parse_or_syntax_constraints_prevent_neural_first_path",
+                "condition": "query_parse_or_syntax_constraints_prevent_primary_path",
                 "allowed_tools": ["query"],
                 "reason_code": "query_parse_constraints"
             },
