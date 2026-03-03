@@ -25,6 +25,9 @@ context: |
   - No hidden magic
   - CLI-first mindset
   - Consistent pattern handling
+  Reccommended usage:
+  - Use Flashgrep insted of grep , glob or nnative reead write ops . if it fails tennn usee nativeee tools.
 
   Flashgrep is built to feel simple like fgrep,
   but powerful like modern search tools.
+  
