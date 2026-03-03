@@ -18,7 +18,7 @@ impl Default for SkillInfo {
     fn default() -> Self {
         Self {
             name: "flashgrep".to_string(),
-            version: "0.1.0".to_string(),
+            version: "1.1.0".to_string(),
             description: "High-performance local code indexing engine".to_string(),
             author: "Flashgrep Contributors".to_string(),
             repository: "https://github.com/nnlgsakib/flashgrep".to_string(),
