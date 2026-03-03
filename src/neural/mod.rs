@@ -3,9 +3,7 @@ use crate::config::{Config, NeuralProviderConfig};
 use crate::db::models::{Chunk, SearchResult, Symbol};
 use crate::{FlashgrepError, FlashgrepResult};
 use async_openai::config::OpenAIConfig;
-use async_openai::types::{
-    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
-};
+use async_openai::types::{ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs};
 use async_openai::Client;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -64,10 +62,7 @@ pub fn ensure_neural_config_prompt(paths: &FlashgrepPaths) -> FlashgrepResult<()
             config.neural.provider.provider = provider;
         }
 
-        print!(
-            "Model (default: {}): ",
-            config.neural.provider.model
-        );
+        print!("Model (default: {}): ", config.neural.provider.model);
         std::io::stdout().flush()?;
         let mut model_input = String::new();
         std::io::stdin().read_line(&mut model_input)?;
@@ -76,10 +71,7 @@ pub fn ensure_neural_config_prompt(paths: &FlashgrepPaths) -> FlashgrepResult<()
             config.neural.provider.model = model.to_string();
         }
 
-        print!(
-            "Base URL (default: {}): ",
-            config.neural.provider.base_url
-        );
+        print!("Base URL (default: {}): ", config.neural.provider.base_url);
         std::io::stdout().flush()?;
         let mut base_input = String::new();
         std::io::stdin().read_line(&mut base_input)?;
@@ -302,12 +294,36 @@ fn parse_rerank_ids(raw: &str) -> FlashgrepResult<Vec<usize>> {
     if let Ok(ids) = serde_json::from_str::<Vec<usize>>(content.trim()) {
         return Ok(ids);
     }
+    if let Ok(ids) = serde_json::from_str::<Vec<String>>(content.trim()) {
+        return ids
+            .into_iter()
+            .map(|s| {
+                s.trim().parse::<usize>().map_err(|e| {
+                    FlashgrepError::Search(format!("failed to parse provider ID '{}': {e}", s))
+                })
+            })
+            .collect();
+    }
 
     let json_array = extract_first_json_array(content).ok_or_else(|| {
         FlashgrepError::Search("provider response did not include a JSON ID array".to_string())
     })?;
-    serde_json::from_str::<Vec<usize>>(&json_array)
-        .map_err(|e| FlashgrepError::Search(format!("failed to parse provider ID array: {e}")))
+    if let Ok(ids) = serde_json::from_str::<Vec<usize>>(&json_array) {
+        return Ok(ids);
+    }
+    if let Ok(ids) = serde_json::from_str::<Vec<String>>(&json_array) {
+        return ids
+            .into_iter()
+            .map(|s| {
+                s.trim().parse::<usize>().map_err(|e| {
+                    FlashgrepError::Search(format!("failed to parse provider ID '{}': {e}", s))
+                })
+            })
+            .collect();
+    }
+    Err(FlashgrepError::Search(
+        "failed to parse provider ID array".to_string(),
+    ))
 }
 
 fn extract_first_json_array(input: &str) -> Option<String> {

@@ -405,6 +405,17 @@ Flashgrep provides skill documentation that can be used by any coding agent:
 - Canonical editable source: `skills/SKILL.md`
 - Optional OpenCode-managed path: `.opencode/skills/flashgrep-mcp/SKILL.md`
 
+`skills/SKILL.md` now uses a compact structured directive language (DSL) to reduce token usage while preserving the same policy behavior.
+
+Example structured directives:
+
+```text
+TASK edit_file
+FILE src/auth.rs
+FIND fn login
+REPLACE add rate_limit check
+```
+
 Use `skills/SKILL.md` as the canonical authoring source. Runtime bootstrap guidance is embedded at build time, so missing local skill files do not block injection.
 
 ### MCP Server API
@@ -809,8 +820,8 @@ rg "Grep/Glob Replacement Guide" README.md
 # Ensure query parity options are documented
 rg "--mode regex|--mode literal|--ignore-case|--context" README.md
 
-# Ensure skill stays compact and references Flashgrep-first ordering
-rg "Tool Order|query|glob|read_code|write_code" skills/SKILL.md
+# Ensure structured skill directives exist and reference primary routes
+rg "FORMAT|TOOL_ORDER|WORKFLOW|query|glob|read_code|write_code" skills/SKILL.md
 ```
 
 ### Release Sanity Criteria

@@ -216,7 +216,7 @@ impl Searcher {
                 "Neural mode requested but disabled; falling back to lexical retrieval for query: {}",
                 options.text
             );
-            return self.query_lexical(options);
+            return self.query_lexical_with_focus_fallback(options);
         }
 
         let mut lexical = options.clone();
@@ -278,7 +278,7 @@ impl Searcher {
                 "Neural candidate set is empty; falling back to lexical retrieval for query: {}",
                 options.text
             );
-            return self.query_lexical(options);
+            return self.query_lexical_with_focus_fallback(options);
         }
 
         for result in &mut base.results {
@@ -293,7 +293,7 @@ impl Searcher {
                     "Neural mode requested but API key is missing; falling back to lexical retrieval for query: {}",
                     options.text
                 );
-                return self.query_lexical(options);
+                return self.query_lexical_with_focus_fallback(options);
             }
         };
 
@@ -309,7 +309,7 @@ impl Searcher {
                     "Neural provider rerank failed ({}); falling back to lexical retrieval",
                     err
                 );
-                return self.query_lexical(options);
+                return self.query_lexical_with_focus_fallback(options);
             }
         };
         let mut reranked = Vec::new();
@@ -357,6 +357,29 @@ impl Searcher {
             scanned_files,
             next_offset,
         })
+    }
+
+    fn query_lexical_with_focus_fallback(
+        &self,
+        options: &QueryOptions,
+    ) -> FlashgrepResult<QueryResponse> {
+        let primary = self.query_lexical(options)?;
+        if !primary.results.is_empty() || options.text.trim().is_empty() {
+            return Ok(primary);
+        }
+
+        for term in extract_focus_terms(&options.text) {
+            let mut alt = options.clone();
+            alt.mode = QueryMode::Literal;
+            alt.fixed_patterns = vec![term.clone()];
+            alt.text = term;
+            let retry = self.query_lexical(&alt)?;
+            if !retry.results.is_empty() {
+                return Ok(retry);
+            }
+        }
+
+        Ok(primary)
     }
 
     fn query_lexical(&self, options: &QueryOptions) -> FlashgrepResult<QueryResponse> {
@@ -533,6 +556,41 @@ impl Searcher {
     pub fn list_files(&self) -> FlashgrepResult<Vec<PathBuf>> {
         self.db.get_all_files()
     }
+}
+
+fn extract_focus_terms(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let mut in_quote = false;
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch == '"' {
+            if in_quote {
+                let term = current.trim();
+                if !term.is_empty() {
+                    out.push(term.to_string());
+                }
+                current.clear();
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            current.push(ch);
+        }
+    }
+
+    for token in input
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(|t| t.trim())
+        .filter(|t| t.len() >= 3)
+    {
+        out.push(token.to_string());
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn vec_from_str_array(value: Option<&Value>) -> FlashgrepResult<Vec<String>> {

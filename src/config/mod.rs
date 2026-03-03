@@ -35,7 +35,7 @@ impl Default for NeuralProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct NeuralConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -43,16 +43,6 @@ pub struct NeuralConfig {
     pub initialized: bool,
     #[serde(default)]
     pub provider: NeuralProviderConfig,
-}
-
-impl Default for NeuralConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            initialized: false,
-            provider: NeuralProviderConfig::default(),
-        }
-    }
 }
 
 /// Configuration for flashgrep
