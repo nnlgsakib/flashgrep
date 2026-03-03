@@ -358,8 +358,13 @@ mod tests {
         // Verify metrics are populated
         assert!(result.metrics.is_some());
         let metrics = result.metrics.unwrap();
-        assert!(metrics.duration_ms > 0);
-        assert!(metrics.files_per_second > 0.0);
+        // duration_ms can be 0 for very fast scans in CI; validate monotonic timestamps
+        assert!(metrics.end_time >= metrics.start_time);
+        if metrics.duration_ms == 0 {
+            assert_eq!(metrics.files_per_second, 0.0);
+        } else {
+            assert!(metrics.files_per_second > 0.0);
+        }
         assert!(metrics.bytes_processed > 0);
         assert!(metrics.avg_file_size_bytes > 0);
 
