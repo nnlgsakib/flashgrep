@@ -47,12 +47,12 @@ This injects policy/tool guidance for the session and prepares Flashgrep-first r
 - **Language Agnostic**: Works with any programming language using regex-based heuristics
 - **Index-First Performance**: Fast repeated queries after indexing, with incremental updates for changed files
 - **Resource Efficient**: Built for low-overhead local operation on medium and large repositories
-- **Fully Local**: No cloud dependencies, all data stays on your machine
+- **Local Index, Optional Remote LLM**: Core indexing/search stays local; optional neural reranking uses your configured provider API key
 - **Token Efficient**: Returns exact code slices, not full files
 - **Single Binary CLI**: Distributed as a single executable with local index data in `.flashgrep/`
 - **MCP Compatible**: JSON-RPC server for integration with coding agents
 - **Lexical Retrieval**: Deterministic indexed search with smart/literal/regex query modes
-- **Optional Neural Navigation**: Index-first natural-language navigation using bounded candidate context and provider-assisted reranking
+- **Optional Neural Navigation**: Knowledge-graph-first natural-language navigation using bounded candidate context and provider-assisted reranking
 - **Neural-First Option**: For discovery intents, you can run neural retrieval first with deterministic lexical fallback behavior
 
 ## Installation
@@ -167,10 +167,11 @@ flashgrep query "tokenize" --retrieval-mode lexical --limit 20
 ```
 
 Neural query behavior:
-- Uses index-first candidate retrieval, then provider-assisted reranking on bounded snippets.
+- Uses knowledge-graph/index-first candidate retrieval, then provider-assisted reranking on bounded snippets.
 - Recommended discovery order: neural first, then lexical fallback if neural is unavailable or returns no relevant matches.
 - Returns `0 result(s)` when no relevant intent match is found (instead of unrelated guesses).
 - If provider/API fails, falls back deterministically to lexical retrieval.
+- No local model download step is required.
 
 ### Neural Navigation Setup
 
@@ -215,6 +216,8 @@ Default profile:
 - base_url: `https://openrouter.ai/api/v1`
 - model: `arcee-ai/trinity-large-preview:free`
 - api_key_env: `OPENROUTER_API_KEY`
+
+You can switch to any free/low-cost OpenAI-compatible provider by changing provider/model/base URL and key settings.
 
 #### `flashgrep files [PATH]`
 
@@ -698,7 +701,7 @@ The config is stored in `.flashgrep/config.json`:
 ```
 
 Neural mode efficiency rules:
-- candidate retrieval stays local/index-first
+- candidate retrieval stays local knowledge-graph/index-first
 - provider calls receive bounded snippet context only
 - lexical fallback remains deterministic on provider failures/timeouts
 
@@ -721,6 +724,7 @@ Neural config field notes:
 - **File Scanner**: Recursively finds indexable files, respects `.flashgrepignore`
 - **Chunker**: Splits files into logical chunks (max 300 lines, preserves bracket balance)
 - **Symbol Detector**: Regex-based detection of functions, classes, imports, etc.
+- **Knowledge Graph Builder**: Builds file/chunk/symbol relationship artifacts for neural candidate routing
 - **Tantivy Index**: Full-text search engine with custom ranking
 - **SQLite Store**: Metadata storage with connection pooling and batch inserts
 - **File Watcher**: Incremental re-indexing with debouncing
@@ -743,9 +747,10 @@ Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when yo
 1. **Scanner** discovers indexable files and applies ignore rules.
 2. **Chunker** splits files into bounded line ranges and computes content hashes.
 3. **Symbol Detector** extracts structural entries (function/class/import/etc.).
-4. **Tantivy** stores searchable text chunks and ranking fields.
-5. **SQLite** stores files/chunks/symbol metadata for lookup/list/stat operations.
-6. **CLI/MCP layers** query these stores in read mode and render text/JSON outputs.
+4. **Knowledge Graph Builder** creates relationship artifacts used for neural candidate expansion.
+5. **Tantivy** stores searchable text chunks and ranking fields.
+6. **SQLite** stores files/chunks/symbol/graph metadata for lookup/list/stat operations.
+7. **CLI/MCP layers** query these stores in read mode and render text/JSON outputs.
 
 ### Index Structure
 
@@ -754,7 +759,7 @@ Use `grep` for tiny one-off folders or ad-hoc exact scans; use Flashgrep when yo
 ├── text_index/        # Tantivy full-text index
 ├── metadata.db        # SQLite database (chunks, symbols, file metadata)
 ├── config.json        # Configuration
-└── vectors/           # Runtime index auxiliary artifacts
+└── vectors/           # Runtime neural/graph auxiliary artifacts
 ```
 
 ## Performance
