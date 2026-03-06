@@ -22,6 +22,12 @@ pub const REASON_BATCH_OVERLAPPING_OPERATIONS: &str = "overlapping_operations";
 pub const REASON_FALLBACK_GATE_REQUIRED: &str = "fallback_gate_required";
 pub const REASON_UNSUPPORTED_FALLBACK_REASON_CODE: &str = "unsupported_fallback_reason_code";
 pub const REASON_FALLBACK_GATE_MISMATCH: &str = "fallback_gate_mismatch";
+pub const REASON_AI_MODE_DISABLED: &str = "ai_mode_disabled";
+pub const REASON_AI_BUDGET_PROFILE_INVALID: &str = "ai_budget_profile_invalid";
+pub const REASON_NEURAL_NO_RELEVANT_MATCHES: &str = "neural_no_relevant_matches";
+pub const REASON_PROMPT_POLICY_VIOLATION: &str = "prompt_policy_violation";
+pub const REASON_PROMPT_POLICY_ESCALATION_REQUIRED: &str = "prompt_policy_escalation_required";
+pub const REASON_PROMPT_VERSION_UNSUPPORTED: &str = "prompt_version_unsupported";
 
 pub fn json_size_bytes(value: &Value) -> FlashgrepResult<usize> {
     Ok(serde_json::to_vec(value)?.len())

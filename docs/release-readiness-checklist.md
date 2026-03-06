@@ -12,6 +12,9 @@ Use this checklist before declaring Flashgrep production-ready as a grep/glob re
 - [ ] `batch_write_code` validates deterministic ordering and mode semantics (`atomic`/`best_effort`).
 - [ ] Ungated fallback search routes return typed `policy_denied` diagnostics.
 - [ ] Valid fallback gate + reason pairs are admitted and audited.
+- [ ] AI discovery requests require explicit `ai_mode` and emit typed route metadata.
+- [ ] Prompt governance denials are typed (`prompt_policy_violation`, `prompt_policy_escalation_required`, `prompt_version_unsupported`).
+- [ ] Query responses include `prompt_hash`, `policy_rule_hits`, and budget telemetry (`tokens_used`, `reduction_applied`).
 
 ## Filesystem Operations
 
@@ -38,4 +41,5 @@ Use this checklist before declaring Flashgrep production-ready as a grep/glob re
 - [ ] `skills/SKILL.md` keeps Flashgrep-first routing with explicit fallback gates.
 - [ ] README and skill examples include `batch_write_code` fields and typed status semantics.
 - [ ] README and skill examples include `policy_denied`, `fallback_gate`, and `fallback_reason_code` semantics.
+- [ ] README and `skills/SKILL.md` include `ai_mode`, `budget_profile`, `prompt_version`, `prompt_hash`, and `policy_rule_hits` guidance.
 - [ ] Parity matrix updated (`docs/grep-glob-production-parity-matrix.md`).

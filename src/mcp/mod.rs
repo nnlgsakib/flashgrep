@@ -11,8 +11,9 @@ use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
 use crate::db::Database;
 use crate::mcp::bootstrap::{
-    build_bootstrap_payload, evaluate_policy_route, is_bootstrap_tool, policy_denied_payload,
-    PolicyRouteState,
+    build_bootstrap_payload, evaluate_ai_discovery_fallback, evaluate_policy_route,
+    is_bootstrap_tool, policy_denied_payload, prompt_budget_telemetry,
+    prompt_governance_from_arguments, PolicyRouteDecision, PolicyRouteState,
 };
 use crate::mcp::code_io::{batch_write_code, read_code, write_code};
 use crate::mcp::fs_tools::{
@@ -24,7 +25,7 @@ use crate::mcp::safety::{
     payload_too_large_error, MAX_MCP_GET_SLICE_BYTES, MAX_MCP_REQUEST_BYTES,
     MAX_MCP_RESPONSE_BYTES,
 };
-use crate::search::{QueryOptions, Searcher};
+use crate::search::{QueryOptions, QueryRetrievalMode, Searcher};
 use crate::FlashgrepResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -182,7 +183,19 @@ async fn handle_request(
     let result = match request.method.as_str() {
         // Existing methods
         "query" => {
-            let options = match QueryOptions::from_mcp_args(&request.params) {
+            let decision = evaluate_policy_route("query", &request.params);
+            if decision.route_state == PolicyRouteState::Denied {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(policy_denied_payload("query", &decision)),
+                    error: None,
+                });
+            }
+
+            let mut route_decision: PolicyRouteDecision = decision;
+
+            let mut options = match QueryOptions::from_mcp_args(&request.params) {
                 Ok(opts) => opts,
                 Err(e) => {
                     return Ok(JsonRpcResponse {
@@ -198,12 +211,31 @@ async fn handle_request(
                 }
             };
 
+            if route_decision.route_state == PolicyRouteState::AllowedAi {
+                let config = Config::from_file(&paths.config_file()).unwrap_or_default();
+                if let Some(fallback) = evaluate_ai_discovery_fallback(&request.params, config.neural.enabled) {
+                    route_decision = fallback;
+                    options.retrieval_mode = QueryRetrievalMode::Lexical;
+                }
+            }
+
+            let prompt_governance = prompt_governance_from_arguments(&request.params)
+                .map(|g| g.as_value())
+                .unwrap_or_else(|d| policy_denied_payload("query", d.as_ref()));
+
             if options.text.is_empty() {
                 Some(serde_json::json!({
                     "results": [],
                     "query": options.text,
                     "limit": options.limit,
-                    "error": "Empty query"
+                    "error": "Empty query",
+                    "route_state": route_decision.as_str(),
+                    "reason_code": route_decision.reason_code,
+                    "fallback_gate_id": route_decision.fallback_gate_id,
+                    "ai_scope": route_decision.ai_scope,
+                    "budget_profile": route_decision.budget_profile,
+                    "prompt_version": route_decision.prompt_version,
+                    "prompt_governance": prompt_governance,
                 }))
             } else {
                 // Perform actual search using Tantivy
@@ -236,6 +268,24 @@ async fn handle_request(
                                 "mode": format!("{:?}", options.mode).to_lowercase(),
                                 "retrieval_mode": format!("{:?}", options.retrieval_mode).to_lowercase(),
                                 "case_sensitive": options.case_sensitive,
+                                "route_state": route_decision.as_str(),
+                                "reason_code": route_decision.reason_code,
+                                "fallback_gate_id": route_decision.fallback_gate_id,
+                                "ai_scope": route_decision.ai_scope,
+                                "budget_profile": route_decision.budget_profile,
+                                "prompt_version": route_decision.prompt_version,
+                                "prompt_governance": prompt_governance,
+                                "prompt_budget": prompt_budget_telemetry(
+                                    &request.params,
+                                    &options.text,
+                                    &response
+                                        .results
+                                        .iter()
+                                        .map(|r| r.preview.clone())
+                                        .collect::<Vec<_>>(),
+                                    response.truncated,
+                                    response.next_offset,
+                                ),
                             })
                         }
                         Err(e) => {
@@ -245,6 +295,13 @@ async fn handle_request(
                                 "query": options.text,
                                 "limit": options.limit,
                                 "error": format!("Search failed: {}", e),
+                                "route_state": route_decision.as_str(),
+                                "reason_code": route_decision.reason_code,
+                                "fallback_gate_id": route_decision.fallback_gate_id,
+                                "ai_scope": route_decision.ai_scope,
+                                "budget_profile": route_decision.budget_profile,
+                                "prompt_version": route_decision.prompt_version,
+                                "prompt_governance": prompt_governance,
                             })
                         }
                     }
@@ -254,9 +311,187 @@ async fn handle_request(
                         "query": options.text,
                         "limit": options.limit,
                         "error": "Search index not available",
+                        "route_state": route_decision.as_str(),
+                        "reason_code": route_decision.reason_code,
+                        "fallback_gate_id": route_decision.fallback_gate_id,
+                        "ai_scope": route_decision.ai_scope,
+                        "budget_profile": route_decision.budget_profile,
+                        "prompt_version": route_decision.prompt_version,
+                        "prompt_governance": prompt_governance,
                     })
                 };
                 Some(search_results)
+            }
+        }
+        "ask" => {
+            let question = request
+                .params
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            let mut normalized = request.params.clone();
+            if let Some(obj) = normalized.as_object_mut() {
+                obj.insert("text".to_string(), serde_json::json!(question));
+                if !obj.contains_key("retrieval_mode") {
+                    obj.insert("retrieval_mode".to_string(), serde_json::json!("neural"));
+                }
+                if !obj.contains_key("ai_mode") {
+                    obj.insert("ai_mode".to_string(), serde_json::json!("discovery"));
+                }
+                if !obj.contains_key("budget_profile") {
+                    obj.insert("budget_profile".to_string(), serde_json::json!("balanced"));
+                }
+                if !obj.contains_key("prompt_version") {
+                    obj.insert("prompt_version".to_string(), serde_json::json!("1.0"));
+                }
+            }
+
+            let decision = evaluate_policy_route("ask", &normalized);
+            if decision.route_state == PolicyRouteState::Denied {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(policy_denied_payload("ask", &decision)),
+                    error: None,
+                });
+            }
+
+            let mut route_decision: PolicyRouteDecision = decision;
+
+            let mut options = match QueryOptions::from_mcp_args(&normalized) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    return Ok(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: request.id,
+                        result: Some(serde_json::json!({
+                            "question": question,
+                            "answer": "Invalid request parameters",
+                            "evidence": [],
+                            "error": "invalid_params",
+                            "message": e.to_string(),
+                        })),
+                        error: None,
+                    })
+                }
+            };
+
+            if route_decision.route_state == PolicyRouteState::AllowedAi {
+                let config = Config::from_file(&paths.config_file()).unwrap_or_default();
+                if let Some(fallback) = evaluate_ai_discovery_fallback(&normalized, config.neural.enabled) {
+                    route_decision = fallback;
+                    options.retrieval_mode = QueryRetrievalMode::Lexical;
+                }
+            }
+
+            let prompt_governance = prompt_governance_from_arguments(&normalized)
+                .map(|g| g.as_value())
+                .unwrap_or_else(|d| policy_denied_payload("ask", d.as_ref()));
+
+            if options.text.is_empty() {
+                Some(serde_json::json!({
+                    "question": question,
+                    "answer": "Question is empty.",
+                    "evidence": [],
+                    "route_state": route_decision.as_str(),
+                    "reason_code": route_decision.reason_code,
+                    "fallback_gate_id": route_decision.fallback_gate_id,
+                    "ai_scope": route_decision.ai_scope,
+                    "budget_profile": route_decision.budget_profile,
+                    "prompt_version": route_decision.prompt_version,
+                    "prompt_governance": prompt_governance,
+                }))
+            } else {
+                let ask_results = if let Some(index) = tantivy_index {
+                    let searcher = Searcher::new(index, &paths.metadata_db())?;
+                    match searcher.query_with_options(&options) {
+                        Ok(response) => {
+                            let evidence: Vec<_> = response
+                                .results
+                                .iter()
+                                .map(|r| {
+                                    serde_json::json!({
+                                        "file_path": r.file_path.to_string_lossy(),
+                                        "start_line": r.start_line,
+                                        "end_line": r.end_line,
+                                        "symbol_name": r.symbol_name,
+                                        "relevance_score": r.relevance_score,
+                                        "preview": r.preview,
+                                    })
+                                })
+                                .collect();
+                            let answer = if evidence.is_empty() {
+                                "I could not find a confident answer in the current index.".to_string()
+                            } else {
+                                format!(
+                                    "I found {} likely code location(s) related to your question.",
+                                    evidence.len()
+                                )
+                            };
+                            serde_json::json!({
+                                "question": question,
+                                "answer": answer,
+                                "evidence": evidence,
+                                "total": response.results.len(),
+                                "truncated": response.truncated,
+                                "scanned_files": response.scanned_files,
+                                "next_offset": response.next_offset,
+                                "retrieval_mode": format!("{:?}", options.retrieval_mode).to_lowercase(),
+                                "route_state": route_decision.as_str(),
+                                "reason_code": route_decision.reason_code,
+                                "fallback_gate_id": route_decision.fallback_gate_id,
+                                "ai_scope": route_decision.ai_scope,
+                                "budget_profile": route_decision.budget_profile,
+                                "prompt_version": route_decision.prompt_version,
+                                "prompt_governance": prompt_governance,
+                                "prompt_budget": prompt_budget_telemetry(
+                                    &normalized,
+                                    &options.text,
+                                    &response
+                                        .results
+                                        .iter()
+                                        .map(|r| r.preview.clone())
+                                        .collect::<Vec<_>>(),
+                                    response.truncated,
+                                    response.next_offset,
+                                ),
+                            })
+                        }
+                        Err(e) => {
+                            serde_json::json!({
+                                "question": question,
+                                "answer": "Search failed",
+                                "evidence": [],
+                                "error": format!("Search failed: {}", e),
+                                "route_state": route_decision.as_str(),
+                                "reason_code": route_decision.reason_code,
+                                "fallback_gate_id": route_decision.fallback_gate_id,
+                                "ai_scope": route_decision.ai_scope,
+                                "budget_profile": route_decision.budget_profile,
+                                "prompt_version": route_decision.prompt_version,
+                                "prompt_governance": prompt_governance,
+                            })
+                        }
+                    }
+                } else {
+                    serde_json::json!({
+                        "question": question,
+                        "answer": "Search index is not available.",
+                        "evidence": [],
+                        "error": "Search index not available",
+                        "route_state": route_decision.as_str(),
+                        "reason_code": route_decision.reason_code,
+                        "fallback_gate_id": route_decision.fallback_gate_id,
+                        "ai_scope": route_decision.ai_scope,
+                        "budget_profile": route_decision.budget_profile,
+                        "prompt_version": route_decision.prompt_version,
+                        "prompt_governance": prompt_governance,
+                    })
+                };
+                Some(ask_results)
             }
         }
         "get_slice" => {
@@ -845,6 +1080,7 @@ struct JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::engine::Indexer;
     use crate::mcp::safety::MAX_MCP_WRITE_REPLACEMENT_BYTES;
     use tempfile::TempDir;
 
@@ -1097,5 +1333,78 @@ mod tests {
         let response = handle_request(req, &paths, None).await.expect("response");
         let payload = response.result.expect("result payload");
         assert!(payload["results"].is_array());
+    }
+
+    #[tokio::test]
+    async fn tcp_query_reports_deterministic_ai_fallback_reason() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        let paths = FlashgrepPaths::new(&root);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "query".to_string(),
+            params: serde_json::json!({
+                "text": "find auth middleware",
+                "retrieval_mode": "neural",
+                "ai_mode": "discovery",
+                "simulate_ai_unavailable": true,
+                "prompt_version": "1.0"
+            }),
+            id: Some(2),
+        };
+
+        let response = handle_request(req, &paths, None).await.expect("response");
+        let payload = response.result.expect("query payload");
+        assert_eq!(
+            payload["route_state"],
+            serde_json::Value::String("allowed_fallback".to_string())
+        );
+        assert_eq!(
+            payload["reason_code"],
+            serde_json::Value::String("ai_mode_disabled".to_string())
+        );
+        assert_eq!(
+            payload["fallback_gate_id"],
+            serde_json::Value::String("neural_mode_disabled".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_ask_returns_answer_and_evidence_shape() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn rpc_query_handler() { println!(\"query\"); }\n",
+        )
+        .expect("main file");
+
+        let mut indexer = Indexer::new(root.clone()).expect("indexer");
+        indexer.index_repository(&root).expect("index repository");
+        drop(indexer);
+
+        let paths = FlashgrepPaths::new(&root);
+        let index = tantivy::Index::open_in_dir(paths.text_index_dir()).expect("open index");
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "ask".to_string(),
+            params: serde_json::json!({
+                "question": "where is rpc query handled",
+                "retrieval_mode": "neural",
+                "include": ["src/**/*.rs"],
+                "limit": 5
+            }),
+            id: Some(3),
+        };
+
+        let response = handle_request(req, &paths, Some(&index)).await.expect("response");
+        let payload = response.result.expect("result payload");
+        assert!(payload["answer"].as_str().is_some());
+        assert!(payload["evidence"].is_array());
+        assert!(matches!(
+            payload["route_state"].as_str(),
+            Some("allowed_ai") | Some("allowed_fallback")
+        ));
     }
 }

@@ -13,6 +13,7 @@ pub struct ToolDefinition {
 
 pub fn create_tools() -> Vec<ToolDefinition> {
     vec![
+        create_ask_tool(),
         create_glob_tool(),
         create_batch_write_code_tool(),
         create_fs_create_tool(),
@@ -28,6 +29,32 @@ pub fn create_tools() -> Vec<ToolDefinition> {
         create_search_with_context_tool(),
         create_search_by_regex_tool(),
     ]
+}
+
+fn create_ask_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "ask".to_string(),
+        description:
+            "Answer natural-language codebase questions with evidence and neural-first retrieval"
+                .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1},
+                "retrieval_mode": {"type": "string", "enum": ["lexical", "neural"]},
+                "ai_mode": {"type": "string", "enum": ["discovery", "synthesis", "planning", "off"]},
+                "budget_profile": {"type": "string", "enum": ["fast", "balanced", "deep"]},
+                "prompt_version": {"type": "string"},
+                "include": {"type": "array", "items": {"type": "string"}},
+                "exclude": {"type": "array", "items": {"type": "string"}},
+                "context": {"type": "integer", "minimum": 0},
+                "offset": {"type": "integer", "minimum": 0}
+            },
+            "required": ["question"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
+    }
 }
 
 fn create_fs_create_tool() -> ToolDefinition {

@@ -4,10 +4,13 @@
 //! This is the standard transport method used by most MCP clients.
 
 use crate::config::paths::FlashgrepPaths;
+use crate::config::Config;
 use crate::db::Database;
 use crate::mcp::bootstrap::{
-    build_bootstrap_payload, evaluate_policy_route, is_bootstrap_tool, policy_denied_payload,
-    PolicyRouteState, CANONICAL_BOOTSTRAP_TRIGGER,
+    build_bootstrap_payload, evaluate_ai_discovery_fallback, evaluate_policy_route,
+    is_bootstrap_tool, policy_denied_payload, prompt_budget_telemetry,
+    prompt_governance_from_arguments, PolicyRouteDecision, PolicyRouteState,
+    CANONICAL_BOOTSTRAP_TRIGGER,
 };
 use crate::mcp::code_io::{
     batch_write_code, batch_write_code_input_schema, read_code, read_code_input_schema, write_code,
@@ -23,7 +26,7 @@ use crate::mcp::safety::{
     MAX_MCP_RESPONSE_BYTES,
 };
 use crate::mcp::tools::{create_bootstrap_tools, create_tools};
-use crate::search::{QueryOptions, Searcher};
+use crate::search::{QueryOptions, QueryRetrievalMode, Searcher};
 use crate::FlashgrepResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -278,6 +281,7 @@ impl McpStdioServer {
 
                 match tool_name {
                     "query" => self.handle_query_tool(&arguments, tantivy_index)?,
+                    "ask" => self.handle_ask_tool(&arguments, tantivy_index)?,
                     "get_slice" => self.handle_get_slice_tool(&arguments)?,
                     "read_code" => self.handle_read_code_tool(&arguments)?,
                     "write_code" => self.handle_write_code_tool(&arguments)?,
@@ -358,7 +362,14 @@ impl McpStdioServer {
         arguments: &Value,
         tantivy_index: Option<&tantivy::Index>,
     ) -> FlashgrepResult<Option<Value>> {
-        let options = match QueryOptions::from_mcp_args(arguments) {
+        let decision = evaluate_policy_route("query", arguments);
+        if decision.route_state == PolicyRouteState::Denied {
+            return Self::as_tool_envelope(policy_denied_payload("query", &decision));
+        }
+
+        let mut route_decision: PolicyRouteDecision = decision;
+
+        let mut options = match QueryOptions::from_mcp_args(arguments) {
             Ok(opts) => opts,
             Err(e) => {
                 return Ok(Some(serde_json::json!({
@@ -367,6 +378,19 @@ impl McpStdioServer {
                 })))
             }
         };
+
+        if route_decision.route_state == PolicyRouteState::AllowedAi {
+            let config = Config::from_file(&self.paths.config_file()).unwrap_or_default();
+            if let Some(fallback) = evaluate_ai_discovery_fallback(arguments, config.neural.enabled)
+            {
+                route_decision = fallback;
+                options.retrieval_mode = QueryRetrievalMode::Lexical;
+            }
+        }
+
+        let prompt_governance = prompt_governance_from_arguments(arguments)
+            .map(|g| g.as_value())
+            .unwrap_or_else(|d| policy_denied_payload("query", d.as_ref()));
 
         if options.text.is_empty() {
             return Ok(Some(serde_json::json!({
@@ -403,6 +427,24 @@ impl McpStdioServer {
                         "mode": format!("{:?}", options.mode).to_lowercase(),
                         "retrieval_mode": format!("{:?}", options.retrieval_mode).to_lowercase(),
                         "case_sensitive": options.case_sensitive,
+                        "route_state": route_decision.as_str(),
+                        "reason_code": route_decision.reason_code,
+                        "fallback_gate_id": route_decision.fallback_gate_id,
+                        "ai_scope": route_decision.ai_scope,
+                        "budget_profile": route_decision.budget_profile,
+                        "prompt_version": route_decision.prompt_version,
+                        "prompt_governance": prompt_governance,
+                        "prompt_budget": prompt_budget_telemetry(
+                            arguments,
+                            &options.text,
+                            &response
+                                .results
+                                .iter()
+                                .map(|r| r.preview.clone())
+                                .collect::<Vec<_>>(),
+                            response.truncated,
+                            response.next_offset,
+                        ),
                     });
 
                     Ok(Some(serde_json::json!({
@@ -411,6 +453,155 @@ impl McpStdioServer {
                 }
                 Err(e) => Ok(Some(serde_json::json!({
                     "content": [{"type": "text", "text": format!("Search error: {}", e)}],
+                    "isError": true
+                }))),
+            }
+        } else {
+            Ok(Some(serde_json::json!({
+                "content": [{"type": "text", "text": "Error: Search index not available"}],
+                "isError": true
+            })))
+        }
+    }
+
+    fn handle_ask_tool(
+        &self,
+        arguments: &Value,
+        tantivy_index: Option<&tantivy::Index>,
+    ) -> FlashgrepResult<Option<Value>> {
+        let question = arguments
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        let mut normalized = arguments.clone();
+        if let Some(obj) = normalized.as_object_mut() {
+            obj.insert("text".to_string(), json!(question));
+            if !obj.contains_key("retrieval_mode") {
+                obj.insert("retrieval_mode".to_string(), json!("neural"));
+            }
+            if !obj.contains_key("ai_mode") {
+                obj.insert("ai_mode".to_string(), json!("discovery"));
+            }
+            if !obj.contains_key("budget_profile") {
+                obj.insert("budget_profile".to_string(), json!("balanced"));
+            }
+            if !obj.contains_key("prompt_version") {
+                obj.insert("prompt_version".to_string(), json!("1.0"));
+            }
+        }
+
+        let decision = evaluate_policy_route("ask", &normalized);
+        if decision.route_state == PolicyRouteState::Denied {
+            return Self::as_tool_envelope(policy_denied_payload("ask", &decision));
+        }
+
+        let mut route_decision: PolicyRouteDecision = decision;
+        let mut options = match QueryOptions::from_mcp_args(&normalized) {
+            Ok(opts) => opts,
+            Err(e) => {
+                return Ok(Some(serde_json::json!({
+                    "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                    "isError": true
+                })))
+            }
+        };
+
+        if route_decision.route_state == PolicyRouteState::AllowedAi {
+            let config = Config::from_file(&self.paths.config_file()).unwrap_or_default();
+            if let Some(fallback) =
+                evaluate_ai_discovery_fallback(&normalized, config.neural.enabled)
+            {
+                route_decision = fallback;
+                options.retrieval_mode = QueryRetrievalMode::Lexical;
+            }
+        }
+
+        let prompt_governance = prompt_governance_from_arguments(&normalized)
+            .map(|g| g.as_value())
+            .unwrap_or_else(|d| policy_denied_payload("ask", d.as_ref()));
+
+        if options.text.is_empty() {
+            let payload = json!({
+                "question": question,
+                "answer": "Question is empty.",
+                "evidence": [],
+                "route_state": route_decision.as_str(),
+                "reason_code": route_decision.reason_code,
+                "fallback_gate_id": route_decision.fallback_gate_id,
+                "ai_scope": route_decision.ai_scope,
+                "budget_profile": route_decision.budget_profile,
+                "prompt_version": route_decision.prompt_version,
+                "prompt_governance": prompt_governance,
+            });
+            return Ok(Some(serde_json::json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&payload)?}]
+            })));
+        }
+
+        if let Some(index) = tantivy_index {
+            let searcher = Searcher::new(index, &self.paths.metadata_db())?;
+            match searcher.query_with_options(&options) {
+                Ok(response) => {
+                    let evidence: Vec<Value> = response
+                        .results
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "file_path": r.file_path.to_string_lossy(),
+                                "start_line": r.start_line,
+                                "end_line": r.end_line,
+                                "score": r.relevance_score,
+                                "preview": r.preview,
+                            })
+                        })
+                        .collect();
+                    let answer = if evidence.is_empty() {
+                        "I could not find a confident answer in the current index.".to_string()
+                    } else {
+                        format!(
+                            "I found {} likely code location(s) related to your question.",
+                            evidence.len()
+                        )
+                    };
+
+                    let payload = json!({
+                        "question": question,
+                        "answer": answer,
+                        "evidence": evidence,
+                        "total": response.results.len(),
+                        "truncated": response.truncated,
+                        "scanned_files": response.scanned_files,
+                        "next_offset": response.next_offset,
+                        "retrieval_mode": format!("{:?}", options.retrieval_mode).to_lowercase(),
+                        "route_state": route_decision.as_str(),
+                        "reason_code": route_decision.reason_code,
+                        "fallback_gate_id": route_decision.fallback_gate_id,
+                        "ai_scope": route_decision.ai_scope,
+                        "budget_profile": route_decision.budget_profile,
+                        "prompt_version": route_decision.prompt_version,
+                        "prompt_governance": prompt_governance,
+                        "prompt_budget": prompt_budget_telemetry(
+                            &normalized,
+                            &options.text,
+                            &response
+                                .results
+                                .iter()
+                                .map(|r| r.preview.clone())
+                                .collect::<Vec<_>>(),
+                            response.truncated,
+                            response.next_offset,
+                        ),
+                    });
+
+                    Ok(Some(serde_json::json!({
+                        "content": [{"type": "text", "text": serde_json::to_string(&payload)?}]
+                    })))
+                }
+                Err(e) => Ok(Some(serde_json::json!({
+                    "content": [{"type": "text", "text": format!("Ask failed: {}", e)}],
                     "isError": true
                 }))),
             }
@@ -1035,6 +1226,7 @@ struct JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::engine::Indexer;
     use crate::mcp::safety::MAX_MCP_WRITE_REPLACEMENT_BYTES;
     use serde_json::json;
     use std::fs;
@@ -1381,6 +1573,77 @@ mod tests {
             payload["reason_code"],
             Value::String("fallback_gate_required".to_string())
         );
+    }
+
+    #[test]
+    fn stdio_tools_list_includes_ask_tool() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().to_path_buf();
+        let server = McpStdioServer::new(root).expect("server");
+
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/list".to_string(),
+            params: json!({}),
+            id: Some(1),
+        };
+        let response = server.handle_request(req, None).expect("response");
+        let result = response.result.expect("result payload");
+        let tools = result["tools"].as_array().expect("tools array");
+        assert!(tools
+            .iter()
+            .any(|t| t.get("name").and_then(Value::as_str) == Some("ask")));
+    }
+
+    #[test]
+    fn stdio_ask_tool_returns_answer_and_evidence_shape() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn handle_query() { println!(\"rpc query\"); }\n",
+        )
+        .expect("write file");
+
+        let mut indexer = Indexer::new(root.clone()).expect("indexer");
+        indexer.index_repository(&root).expect("index repo");
+        drop(indexer);
+
+        let paths = FlashgrepPaths::new(&root);
+        let index = tantivy::Index::open_in_dir(paths.text_index_dir()).expect("open index");
+        let server = McpStdioServer::new(root).expect("server");
+
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "ask",
+                "arguments": {
+                    "question": "where is rpc query handled",
+                    "retrieval_mode": "neural",
+                    "include": ["src/**/*.rs"],
+                    "limit": 5
+                }
+            }),
+            id: Some(2),
+        };
+
+        let response = server
+            .handle_request(req, Some(&index))
+            .expect("ask response");
+        let result = response.result.expect("result payload");
+        let payload: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().expect("payload text"))
+                .expect("payload json");
+
+        assert!(payload["question"].as_str().is_some());
+        assert!(payload["answer"].as_str().is_some());
+        assert!(payload["evidence"].is_array());
+        assert!(matches!(
+            payload["route_state"].as_str(),
+            Some("allowed_ai") | Some("allowed_fallback")
+        ));
     }
 
     #[test]

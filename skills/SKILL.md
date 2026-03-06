@@ -12,9 +12,11 @@ SOURCE default=embedded override=allow_repo_override:true fallback=repo_override
 POLICY_METADATA
 REQUIRE policy_strength enforcement_mode payload_source bootstrap_state preferred_tools fallback_rules compliance_checks
 SEARCH_ROUTING default=neural_first fallback=lexical_deterministic
+AI_GOVERNANCE require=ai_mode|budget_profile|prompt_version expose=prompt_hash|policy_rule_hits
 
 TOOL_ORDER
 DISCOVERY query(retrieval_mode=neural) -> query(retrieval_mode=lexical) -> get_symbol -> read_code -> get_slice
+NL_DISCOVERY ask(retrieval_mode=neural) -> review_evidence -> optional ask(retrieval_mode=lexical)
 FILES glob|files|list_files
 EDIT write_code|batch_write_code (after read_code/get_slice validation)
 HEALTH stats
@@ -37,10 +39,17 @@ BAN grep rg find cat sed shell_glob Read Write Glob Grep
 EXCEPTION only_when_fallback_gate_active
 
 QUERY
-ARGS text(required) mode(smart|literal|regex) retrieval_mode(neural|lexical) case_sensitive regex_flags include exclude context limit
+ARGS text(required) mode(smart|literal|regex) retrieval_mode(neural|lexical) ai_mode(discovery|synthesis|planning|off) budget_profile(fast|balanced|deep) prompt_version prompt_hash case_sensitive regex_flags include exclude context limit
 RULE neural-first for discovery intents
 RULE if neural fails/unavailable/non-relevant then lexical fallback
 RULE exact-match workloads use mode=literal|regex with gate=exact_match_required
+RULE prompt policy hits must be typed (`policy_rule_hits`: allow|deny|escalate) and denials return `policy_denied`
+
+ASK
+ARGS question(required) retrieval_mode(neural|lexical) include exclude context limit output(text|json)
+RULE use ask for natural-language codebase questions
+RULE answer must cite evidence paths/lines from returned snippets
+RULE if neural path has no confident evidence, retry ask with retrieval_mode=lexical
 
 READ
 USE read_code for bounded reads
@@ -58,6 +67,11 @@ STEP query text="<intent>" retrieval_mode=neural limit=20
 STEP if no_results_or_failure then query text="<intent>" retrieval_mode=lexical limit=20
 STEP optional get_symbol symbol_name="<name>"
 STEP read_code file_path="<path>" start_line=<n> max_lines=80
+
+WORKFLOW ask_nl
+STEP ask question="<natural language question>" retrieval_mode=neural limit=8 include="src/**/*.rs"
+STEP if no_confident_evidence then ask question="<same question>" retrieval_mode=lexical limit=12
+STEP verify top evidence with read_code/get_slice before edits
 
 WORKFLOW exact_lookup
 STEP query text="<literal_or_regex>" mode=literal|regex limit=50
@@ -93,3 +107,4 @@ RULE keep outputs bounded (limit/offset/budgets)
 RULE deterministic sorting for automation (path asc)
 RULE do not invent results; empty set is valid
 RULE keep neural candidate window bounded
+RULE emit prompt governance (`prompt_hash`, `policy_rule_hits`) and budget telemetry (`tokens_used`, `reduction_applied`)

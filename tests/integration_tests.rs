@@ -516,3 +516,26 @@ fn test_release_docs_cover_policy_parity_checks() {
     assert!(readiness.contains("README"));
     assert!(readiness.contains("skills/SKILL.md"));
 }
+
+#[test]
+fn test_runtime_docs_skills_parity_for_ai_governance_fields() {
+    let readme = fs::read_to_string("README.md").expect("read README.md");
+    let skill = fs::read_to_string("skills/SKILL.md").expect("read skills/SKILL.md");
+    let troubleshooting = fs::read_to_string("docs/bootstrap-policy-troubleshooting.md")
+        .expect("read troubleshooting doc");
+
+    for field in [
+        "ai_mode",
+        "budget_profile",
+        "prompt_version",
+        "prompt_hash",
+        "policy_rule_hits",
+        "policy_denied",
+    ] {
+        assert!(readme.contains(field), "README missing {field}");
+        assert!(skill.contains(field), "skills/SKILL.md missing {field}");
+    }
+
+    assert!(troubleshooting.contains("prompt_hash"));
+    assert!(troubleshooting.contains("budget_profile"));
+}

@@ -1,0 +1,7 @@
+{
+  "text": "find auth middleware entrypoint",
+  "retrieval_mode": "neural",
+  "ai_mode": "discovery",
+  "budget_profile": "balanced",
+  "prompt_version": "1.0"
+}

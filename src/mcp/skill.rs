@@ -18,7 +18,7 @@ impl Default for SkillInfo {
     fn default() -> Self {
         Self {
             name: "flashgrep".to_string(),
-            version: "1.1.0".to_string(),
+            version: "1.3.0".to_string(),
             description: "High-performance local code indexing engine".to_string(),
             author: "Flashgrep Contributors".to_string(),
             repository: "https://github.com/nnlgsakib/flashgrep".to_string(),
@@ -236,6 +236,47 @@ pub fn get_skill_documentation() -> SkillDocumentation {
         },
     );
 
+    commands.insert(
+        "ask".to_string(),
+        CommandDocumentation {
+            description:
+                "Answer a natural-language codebase question with evidence (neural-first, lexical fallback)"
+                    .to_string(),
+            parameters: vec![
+                ParameterDocumentation {
+                    name: "question".to_string(),
+                    type_: "string".to_string(),
+                    description: "Natural-language question about the codebase".to_string(),
+                    required: true,
+                },
+                ParameterDocumentation {
+                    name: "retrieval_mode".to_string(),
+                    type_: "string".to_string(),
+                    description: "Retrieval mode (neural or lexical; default neural)".to_string(),
+                    required: false,
+                },
+                ParameterDocumentation {
+                    name: "ai_mode/budget_profile/prompt_version".to_string(),
+                    type_: "mixed".to_string(),
+                    description:
+                        "AI governance controls for deterministic route and prompt budgeting"
+                            .to_string(),
+                    required: false,
+                },
+                ParameterDocumentation {
+                    name: "include/exclude/context/limit".to_string(),
+                    type_: "mixed".to_string(),
+                    description: "Scope and bound evidence snippets".to_string(),
+                    required: false,
+                },
+            ],
+            examples: vec![
+                r#"{"question":"where is rpc query handled?","retrieval_mode":"neural","include":["src/**/*.rs"],"limit":8}"#.to_string(),
+                r#"{"question":"how is policy_denied returned","retrieval_mode":"lexical","limit":10}"#.to_string(),
+            ],
+        },
+    );
+
     for alias in BOOTSTRAP_TOOL_ALIASES {
         let doc = if alias == "bootstrap_skill" {
             CommandDocumentation {
@@ -305,7 +346,7 @@ pub fn get_skill_documentation() -> SkillDocumentation {
     }
 
     SkillDocumentation {
-        overview: "Flashgrep MCP bootstrap injects HYBRID policy directives (compact DSL + strict guard rules) to enforce agent behavior. Discovery is neural-first, lexical fallback is deterministic, and native tools are blocked unless a typed fallback gate is active.".to_string(),
+        overview: "Flashgrep MCP bootstrap injects HYBRID policy directives (compact DSL + strict guard rules) to enforce agent behavior. Discovery is neural-first, lexical fallback is deterministic, and native tools are blocked unless a typed fallback gate is active. For CLI-native natural-language Q&A, prefer the `ask` command with neural-first retrieval and lexical fallback.".to_string(),
         commands,
     }
 }
@@ -314,14 +355,19 @@ pub fn bootstrap_policy() -> Vec<String> {
     vec![
         "FORMAT v1 HYBRID_ENFORCED".to_string(),
         "ENFORCE bootstrap_required=true reason_code_required=true".to_string(),
-        "ROUTE discovery primary=query(neural) fallback=query(lexical)".to_string(),
+        "ROUTE discovery primary=ask(neural) fallback=ask(lexical)".to_string(),
+        "ROUTE nl_discovery mcp=ask(neural->lexical) legacy=query(neural->lexical) cli=ask(neural->lexical)".to_string(),
+        "ROUTE ai_scopes discovery|synthesis|planning explicit_mode_required=true".to_string(),
         "ROUTE files primary=glob|files symbols=get_symbol reads=read_code writes=write_code|batch_write_code".to_string(),
         "RULE native_tools_banned=true unless=fallback_gate_active".to_string(),
+        "RULE prompt_policy_checks=pre_execution typed_denial=policy_denied".to_string(),
+        "RULE budget_profiles=fast|balanced|deep token_budget_enforced=true".to_string(),
         "RULE no_guessing=true empty_results_valid=true".to_string(),
         "FALLBACK neural_mode_disabled neural_provider_failure neural_no_relevant_matches".to_string(),
         "FALLBACK exact_match_required query_parse_constraints flashgrep_index_unavailable".to_string(),
         "FALLBACK flashgrep_operation_not_supported flashgrep_tool_runtime_failure repo_override_unavailable".to_string(),
-        "WORKFLOW discovery query(neural)->query(lexical_on_fail_or_no_match)->get_symbol->read_code".to_string(),
+        "WORKFLOW discovery ask(neural)->ask(lexical_on_fail_or_no_match)->get_symbol->read_code".to_string(),
+        "WORKFLOW ask_nl cli:ask(neural)->ask(lexical_on_no_match) mcp:ask(neural)->ask(lexical_on_no_match)".to_string(),
         "WORKFLOW edit read_code->write_code(precondition)->read_code".to_string(),
         "WORKFLOW batch_edit read_code->batch_write_code(mode+precondition)->read_code".to_string(),
         "WORKFLOW recovery bootstrap(force=true,compact=true)->verify(policy_metadata)->resume(route_order)".to_string(),
@@ -336,9 +382,18 @@ pub fn bootstrap_policy_metadata() -> Value {
         "search_routing": {
             "default_strategy": "neural_first",
             "discovery_order": ["neural_assisted", "lexical"],
+            "nl_discovery": {
+                "mcp_primary": "ask:neural",
+                "mcp_fallback": "ask:lexical",
+                "legacy_query_primary": "query:neural",
+                "legacy_query_fallback": "query:lexical",
+                "cli_primary": "ask:neural",
+                "cli_fallback": "ask:lexical"
+            },
             "programmatic_priority": "fallback",
             "routing_mode": "hybrid_enforced",
             "fallback_required": true,
+            "ai_mode_required_for_neural": true,
             "fallback_reason_codes": [
                 "neural_mode_disabled",
                 "neural_provider_failure",
@@ -352,14 +407,14 @@ pub fn bootstrap_policy_metadata() -> Value {
             ]
         },
         "preferred_tool_families": {
-            "query": ["query"],
+            "query": ["ask", "query"],
             "files_glob": ["files", "glob"],
             "symbol": ["symbol", "get_symbol"],
             "read": ["read_code", "get_slice"],
             "write": ["write_code", "batch_write_code"]
         },
         "preferred_tools": {
-            "search": ["query", "files", "glob", "symbol", "get_symbol"],
+            "search": ["ask", "query", "files", "glob", "symbol", "get_symbol"],
             "read": ["read_code", "get_slice"],
             "write": ["write_code", "batch_write_code"]
         },
@@ -379,38 +434,66 @@ pub fn bootstrap_policy_metadata() -> Value {
             "bootstrap_required": true,
             "require_reason_code_on_fallback": true,
             "block_native_tools_without_gate": true,
-            "discovery_route_sequence": ["query:neural", "query:lexical"],
+            "prompt_policy_precheck": true,
+            "supported_prompt_versions": ["1.0"],
+            "discovery_route_sequence": ["ask:neural", "ask:lexical", "query:neural", "query:lexical"],
             "no_guessing": true
+        },
+        "ai_budget_profiles": {
+            "fast": {
+                "system_pct": 15,
+                "context_pct": 45,
+                "memory_pct": 10,
+                "response_pct": 30
+            },
+            "balanced": {
+                "system_pct": 20,
+                "context_pct": 50,
+                "memory_pct": 20,
+                "response_pct": 10
+            },
+            "deep": {
+                "system_pct": 20,
+                "context_pct": 60,
+                "memory_pct": 10,
+                "response_pct": 10
+            }
+        },
+        "prompt_governance": {
+            "prompt_id": "flashgrep-core",
+            "default_prompt_version": "1.0",
+            "typed_denial_error": "policy_denied",
+            "required_fields": ["prompt_id", "prompt_version", "prompt_hash", "policy_rule_hits"]
         },
         "fallback_rules": [
             {
                 "gate_id": "neural_mode_disabled",
                 "condition": "neural_mode_not_enabled_or_not_configured",
-                "allowed_tools": ["query"],
+                "allowed_tools": ["ask", "query"],
                 "reason_code": "neural_mode_disabled"
             },
             {
                 "gate_id": "neural_provider_failure",
                 "condition": "neural_provider_request_failed_or_timed_out",
-                "allowed_tools": ["query"],
+                "allowed_tools": ["ask", "query"],
                 "reason_code": "neural_provider_failure"
             },
             {
                 "gate_id": "neural_no_relevant_matches",
                 "condition": "neural_rerank_returns_no_relevant_candidates",
-                "allowed_tools": ["query", "get_symbol"],
+                "allowed_tools": ["ask", "query", "get_symbol"],
                 "reason_code": "neural_no_relevant_matches"
             },
             {
                 "gate_id": "exact_match_required",
                 "condition": "request_requires_literal_or_regex_exactness",
-                "allowed_tools": ["query", "symbol", "get_symbol"],
+                "allowed_tools": ["ask", "query", "symbol", "get_symbol"],
                 "reason_code": "exact_match_required"
             },
             {
                 "gate_id": "query_parse_constraints",
                 "condition": "query_parse_or_syntax_constraints_prevent_primary_path",
-                "allowed_tools": ["query"],
+                "allowed_tools": ["ask", "query"],
                 "reason_code": "query_parse_constraints"
             },
             {

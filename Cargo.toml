@@ -1,6 +1,6 @@
 [package]
 name = "flashgrep"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 authors = ["Flashgrep Contributors"]
 description = "High-performance local code indexing engine"

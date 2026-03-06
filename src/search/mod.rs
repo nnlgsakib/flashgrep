@@ -142,6 +142,58 @@ pub struct QueryResponse {
     pub next_offset: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiContextEntry {
+    pub source_path: PathBuf,
+    pub symbol_name: Option<String>,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiContextPack {
+    pub entries: Vec<AiContextEntry>,
+    pub reduction_applied: bool,
+    pub continuation_id: Option<String>,
+}
+
+pub fn build_ai_context_pack(entries: Vec<AiContextEntry>, max_entries: usize) -> AiContextPack {
+    let mut ordered = entries;
+    ordered.sort_by(|a, b| {
+        a.source_path
+            .cmp(&b.source_path)
+            .then_with(|| a.start_line.cmp(&b.start_line))
+            .then_with(|| a.end_line.cmp(&b.end_line))
+    });
+    ordered.dedup_by(|a, b| {
+        a.source_path == b.source_path
+            && a.start_line == b.start_line
+            && a.end_line == b.end_line
+            && a.symbol_name == b.symbol_name
+    });
+
+    let reduction_applied = ordered.len() > max_entries;
+    let continuation_id = if reduction_applied {
+        Some(format!(
+            "ctx:{}:{}",
+            ordered.len(),
+            ordered
+                .last()
+                .map(|e| e.source_path.to_string_lossy().to_string())
+                .unwrap_or_default()
+        ))
+    } else {
+        None
+    };
+
+    AiContextPack {
+        entries: ordered.into_iter().take(max_entries).collect(),
+        reduction_applied,
+        continuation_id,
+    }
+}
+
 /// Search engine for querying the index
 pub struct Searcher {
     reader: IndexReader,
@@ -849,5 +901,54 @@ mod tests {
         let pinpoint = pinpoint_best_line(content, "usage text2vec dim flag").expect("pinpoint");
         assert_eq!(pinpoint.0, 2);
         assert!(pinpoint.1.contains("flag.Int"));
+    }
+
+    #[test]
+    fn ai_context_pack_reduces_and_orders_deterministically() {
+        let entries = vec![
+            AiContextEntry {
+                source_path: PathBuf::from("src/b.rs"),
+                symbol_name: Some("beta".to_string()),
+                start_line: 20,
+                end_line: 30,
+                text: "B".to_string(),
+            },
+            AiContextEntry {
+                source_path: PathBuf::from("src/a.rs"),
+                symbol_name: Some("alpha".to_string()),
+                start_line: 10,
+                end_line: 12,
+                text: "A".to_string(),
+            },
+            AiContextEntry {
+                source_path: PathBuf::from("src/a.rs"),
+                symbol_name: Some("alpha".to_string()),
+                start_line: 10,
+                end_line: 12,
+                text: "A duplicate".to_string(),
+            },
+        ];
+
+        let pack = build_ai_context_pack(entries, 1);
+        assert!(pack.reduction_applied);
+        assert_eq!(pack.entries.len(), 1);
+        assert_eq!(pack.entries[0].source_path, PathBuf::from("src/a.rs"));
+        assert!(pack.continuation_id.is_some());
+    }
+
+    #[test]
+    fn ai_context_pack_without_reduction_has_no_continuation() {
+        let entries = vec![AiContextEntry {
+            source_path: PathBuf::from("src/main.rs"),
+            symbol_name: None,
+            start_line: 1,
+            end_line: 2,
+            text: "fn main() {}".to_string(),
+        }];
+
+        let pack = build_ai_context_pack(entries, 5);
+        assert!(!pack.reduction_applied);
+        assert_eq!(pack.entries.len(), 1);
+        assert_eq!(pack.continuation_id, None);
     }
 }

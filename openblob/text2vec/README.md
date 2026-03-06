@@ -31,6 +31,18 @@ go run ./text2vec/cmd/text2vec -dim 32 -max-ngram 2 "hello world hello"
 go run ./text2vec/cmd/text2vec -dim 64 -max-ngram 2 -compare "hello there world" "hello world"
 ```
 
+## Interactive TUI
+
+```bash
+go run ./text2vec/cmd/text2vec -dim 64 -max-ngram 2 -tui
+```
+
+TUI commands:
+
+- `:q` / `:quit` / `exit`: leave interactive mode
+- `:config`: print active vectorizer settings
+- `:skip` (at `compare>` prompt): skip similarity check for this input
+
 ## Test
 
 ```bash

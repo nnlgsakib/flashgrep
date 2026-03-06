@@ -87,6 +87,9 @@ flashgrep index
 # Run fast indexed CLI search (grep-like)
 flashgrep query "main" --limit 10
 
+# Ask a natural-language question with ranked evidence
+flashgrep ask "where is MCP query handled?" --retrieval-mode neural --include "src/**/*.rs" --limit 8
+
 # Start watcher in background (optional)
 flashgrep start -b
 ```
@@ -153,7 +156,7 @@ flashgrep query "fn\\s+main" --mode regex --include "src/**/*.rs" --context 2
 # Literal mode + case-insensitive
 flashgrep query "a+b" --mode literal --ignore-case
 
-# Retrieval mode is lexical-only
+# Force lexical retrieval
 flashgrep query "find authentication middleware" --retrieval-mode lexical --limit 20
 
 # Optional neural-assisted mode (must be enabled/configured)
@@ -165,6 +168,27 @@ flashgrep query "find this function \"tokenize\"" --retrieval-mode neural --limi
 # Force lexical mode explicitly
 flashgrep query "tokenize" --retrieval-mode lexical --limit 20
 ```
+
+#### `flashgrep ask <QUESTION> [PATH]`
+
+Answer a natural-language question by retrieving likely code locations and printing a concise answer with evidence snippets.
+
+```bash
+# Natural-language code discovery (neural-first)
+flashgrep ask "where is MCP query handled?" --retrieval-mode neural --include "src/**/*.rs" --limit 8
+
+# Force lexical retrieval for deterministic exact-term discovery
+flashgrep ask "where is McpServer defined" --retrieval-mode lexical --include "src/**/*.rs" --limit 8
+
+# JSON output for automation
+flashgrep ask "how is policy_denied returned" --output json --limit 6
+```
+
+Ask behavior:
+- Returns a short natural-language answer and ranked evidence snippets.
+- Uses the same indexed retrieval engine as `query`; no hallucinated files are invented.
+- `--retrieval-mode neural` prefers neural reranking when configured; falls back deterministically when unavailable.
+- Returns no-match with a clear hint when evidence is insufficient.
 
 Neural query behavior:
 - Uses knowledge-graph/index-first candidate retrieval, then provider-assisted reranking on bounded snippets.
@@ -319,7 +343,7 @@ Use stdio transport for MCP clients that launch local tools as child processes.
 1. Build and install `flashgrep`.
 2. Index the repository you want to search: `flashgrep index`.
 3. Configure your MCP client with the Flashgrep server entry.
-4. Start your client and verify Flashgrep tools are available (`query`, `glob`, `get_slice`, `read_code`, `write_code`, `batch_write_code`, `fs_create`, `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_copy`, `fs_move`, `fs_remove`, `get_symbol`, `list_files`, `stats`, `bootstrap_skill`, `flashgrep-init`, `fgrep-boot`).
+4. Start your client and verify Flashgrep tools are available (`ask`, `query`, `glob`, `get_slice`, `read_code`, `write_code`, `batch_write_code`, `fs_create`, `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_copy`, `fs_move`, `fs_remove`, `get_symbol`, `list_files`, `stats`, `bootstrap_skill`, `flashgrep-init`, `fgrep-boot`).
 5. Bootstrap is injected automatically during `initialize` using embedded policy guidance.
 6. Optionally call `bootstrap_skill` (or alias) to inspect/refresh session policy metadata.
 
@@ -368,6 +392,9 @@ Bootstrap behavior:
 - Optional repository override is opt-in (`allow_repo_override: true`) and falls back deterministically when unreadable
 - Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`, `batch_write_code`) over generic grep/glob fallbacks
 - Search routing defaults to neural-first discovery when enabled, with deterministic lexical fallback when neural routing is unavailable or non-relevant
+- AI controls are explicit per request (`ai_mode`, `retrieval_mode`, `budget_profile`, `prompt_version`)
+- Query payloads expose prompt governance fields (`prompt_id`, `prompt_version`, `prompt_hash`, `policy_rule_hits`)
+- Query payloads expose budget telemetry fields (`budget_total`, `tokens_used`, `reduction_applied`, `continuation_id`)
 
 Bootstrap policy metadata:
 - `policy_metadata.policy_strength`: enforcement mode (default: `strict`)
@@ -407,6 +434,11 @@ Native-tool routing expectations:
 - Agents should avoid host-native `Read`/`Write`/`Glob`/`Grep` and shell `grep`/`cat`/ad-hoc globbing unless a declared fallback gate is active.
 - Preferred Flashgrep routes remain `query`, `files`/`glob`, `symbol`/`get_symbol`, `read_code`, `write_code`, `batch_write_code`.
 - Fallback tooling (`search`, `search-in-directory`, `search-with-context`, `search-by-regex`) requires explicit `fallback_gate` and `fallback_reason_code`.
+
+AI governance and budget metadata on `query` responses:
+- Route fields: `route_state`, `reason_code`, `fallback_gate_id`, `ai_scope`, `budget_profile`.
+- Prompt fields: `prompt_governance.prompt_id`, `prompt_governance.prompt_version`, `prompt_governance.prompt_hash`, `prompt_governance.policy_rule_hits`.
+- Budget fields: `prompt_budget.budget_total`, `prompt_budget.tokens_used`, `prompt_budget.reduction_applied`, `prompt_budget.continuation_id`.
 
 Compatibility and rollback notes:
 - Legacy bootstrap fields (`status`, `canonical_trigger`, `skill_hash`, `skill_version`, `policy`) remain available.
@@ -530,6 +562,29 @@ Search for text in the indexed codebase.
   "id": 1
 }
 ```
+
+#### `ask(question, limit)`
+
+Natural-language, neural-first codebase Q&A with deterministic lexical fallback.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "ask",
+  "params": {
+    "question": "where is rpc query handled?",
+    "retrieval_mode": "neural",
+    "include": ["src/**/*.rs"],
+    "limit": 8
+  },
+  "id": 11
+}
+```
+
+Response includes:
+- `question`, `answer`, and `evidence` snippets
+- `route_state` + typed reason metadata
+- prompt governance + budget telemetry fields (`prompt_hash`, `policy_rule_hits`, `tokens_used`, `reduction_applied`)
 
 #### `get_slice(file_path, start_line, end_line)`
 

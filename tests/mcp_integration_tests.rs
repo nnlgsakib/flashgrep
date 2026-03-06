@@ -107,7 +107,10 @@ mod integration {
 
 #[cfg(test)]
 mod behavior {
-    use flashgrep::mcp::bootstrap::{current_policy_hash, evaluate_policy_route, PolicyRouteState};
+    use flashgrep::mcp::bootstrap::{
+        current_policy_hash, evaluate_ai_discovery_fallback, evaluate_policy_route,
+        prompt_budget_telemetry, prompt_governance_from_arguments, PolicyRouteState,
+    };
     use flashgrep::mcp::code_io::batch_write_code;
     use serde_json::json;
     use std::fs;
@@ -264,16 +267,14 @@ mod behavior {
     #[test]
     fn test_policy_route_evaluation_overhead_is_bounded() {
         let policy_hash = current_policy_hash();
+        let args = json!({
+            "text": "main",
+            "policy_hash": policy_hash,
+            "policy_version": "1.1"
+        });
         let start = std::time::Instant::now();
         for _ in 0..5000 {
-            let decision = evaluate_policy_route(
-                "query",
-                &json!({
-                    "text": "main",
-                    "policy_hash": policy_hash,
-                    "policy_version": "1.1"
-                }),
-            );
+            let decision = evaluate_policy_route("query", &args);
             assert_eq!(decision.route_state, PolicyRouteState::AllowedNative);
         }
         let elapsed = start.elapsed();
@@ -281,5 +282,61 @@ mod behavior {
             elapsed.as_millis() < 200,
             "policy route evaluation overhead too high: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn test_ai_unavailable_routes_to_deterministic_fallback() {
+        let decision = evaluate_ai_discovery_fallback(
+            &json!({
+                "text": "find auth middleware",
+                "retrieval_mode": "neural",
+                "ai_mode": "discovery",
+                "simulate_ai_unavailable": true,
+                "prompt_version": "1.0"
+            }),
+            true,
+        )
+        .expect("fallback decision");
+        assert_eq!(decision.route_state, PolicyRouteState::AllowedFallback);
+        assert_eq!(decision.reason_code.as_deref(), Some("ai_mode_disabled"));
+        assert_eq!(
+            decision.fallback_gate_id.as_deref(),
+            Some("neural_mode_disabled")
+        );
+    }
+
+    #[test]
+    fn test_budget_metadata_reports_usage_and_continuation() {
+        let telemetry = prompt_budget_telemetry(
+            &json!({"budget_profile": "fast", "token_budget": 24}),
+            "main",
+            &["fn main() { println!(\"hello\"); }".to_string()],
+            true,
+            Some(20),
+        );
+        assert_eq!(telemetry["budget_profile"], json!("fast"));
+        assert!(telemetry["tokens_used"].as_u64().unwrap_or(0) <= 24);
+        assert_eq!(telemetry["reduction_applied"], json!(true));
+        assert_eq!(telemetry["continuation_id"], json!("query:20"));
+    }
+
+    #[test]
+    fn test_prompt_governance_returns_stable_version_and_hash() {
+        let first = prompt_governance_from_arguments(&json!({
+            "prompt_id": "flashgrep-core",
+            "prompt_version": "1.0",
+            "policy_rule_hits": ["allow:default"]
+        }))
+        .expect("first prompt governance record");
+        let second = prompt_governance_from_arguments(&json!({
+            "prompt_id": "flashgrep-core",
+            "prompt_version": "1.0",
+            "policy_rule_hits": ["allow:default"]
+        }))
+        .expect("second prompt governance record");
+
+        assert_eq!(first.prompt_version, "1.0");
+        assert_eq!(first.prompt_hash, second.prompt_hash);
+        assert_eq!(first.prompt_hash.len(), 64);
     }
 }

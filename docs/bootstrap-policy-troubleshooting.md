@@ -57,6 +57,13 @@ Native fallback is allowed only under explicit gates:
 
 If no gate applies, re-route to Flashgrep-native tools.
 
+For AI-first query flows, verify explicit controls and metadata:
+
+- request fields include `ai_mode`, `budget_profile`, and `prompt_version`
+- response includes `route_state`, `reason_code`, and `fallback_gate_id` when fallback occurs
+- response includes `prompt_governance.prompt_hash` and `prompt_governance.policy_rule_hits`
+- response includes `prompt_budget.tokens_used`, `prompt_budget.reduction_applied`, and `prompt_budget.continuation_id`
+
 Also verify ban-list metadata:
 
 - `policy_metadata.prohibited_native_tools.search`
@@ -99,3 +106,4 @@ For fallback search tooling (`search*`), verify policy enforcement diagnostics:
 - missing gate metadata returns `error = policy_denied`
 - denied payload includes typed `reason_code` (`fallback_gate_required`, `unsupported_fallback_reason_code`, or `fallback_gate_mismatch`)
 - drift mismatches return `reason_code = policy_state_mismatch` with recovery hint
+- prompt governance mismatches return typed denials (`prompt_version_unsupported`, `prompt_policy_violation`, `prompt_policy_escalation_required`)

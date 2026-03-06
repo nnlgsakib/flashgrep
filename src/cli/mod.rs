@@ -182,6 +182,32 @@ pub enum Commands {
         #[arg(long, value_enum, default_value_t = OutputMode::Text)]
         output: OutputMode,
     },
+    /// Ask a natural-language question about the codebase
+    Ask {
+        /// Natural-language question
+        question: String,
+        /// Path to the repository (defaults to current directory)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        /// Maximum number of evidence snippets
+        #[arg(short, long, default_value_t = 8)]
+        limit: usize,
+        /// Retrieval mode
+        #[arg(long = "retrieval-mode", value_enum, default_value_t = RetrievalModeArg::Neural)]
+        retrieval_mode: RetrievalModeArg,
+        /// Include path glob filter (repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Exclude path glob filter (repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Number of context lines around each match
+        #[arg(short = 'C', long = "context", default_value_t = 1)]
+        context: usize,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputMode::Text)]
+        output: OutputMode,
+    },
     /// Filesystem operations (create/list/stat/copy/move/remove)
     Fs {
         #[command(subcommand)]
@@ -520,6 +546,104 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
             } else {
                 Ok(RunOutcome::Success)
             }
+        }
+        Commands::Ask {
+            question,
+            path,
+            limit,
+            retrieval_mode,
+            include,
+            exclude,
+            context,
+            output,
+        } => {
+            let (repo_root, searcher) = create_searcher(path.as_deref())?;
+            let mut options = QueryOptions::new(question.clone(), limit.max(1));
+            options.mode = QueryMode::Smart;
+            options.retrieval_mode = retrieval_mode.into();
+            options.case_sensitive = false;
+            options.include = include;
+            options.exclude = exclude;
+            options.context = context;
+
+            let query_response = searcher.query_with_options(&options)?;
+            let mut results = query_response.results;
+            results.sort_by(|a, b| {
+                b.relevance_score
+                    .total_cmp(&a.relevance_score)
+                    .then_with(|| a.file_path.cmp(&b.file_path))
+                    .then_with(|| a.start_line.cmp(&b.start_line))
+                    .then_with(|| a.end_line.cmp(&b.end_line))
+            });
+            results.truncate(limit.max(1));
+
+            match output {
+                OutputMode::Json => {
+                    let payload = serde_json::json!({
+                        "question": question,
+                        "answer": if results.is_empty() {
+                            "I could not find a confident answer in the current index.".to_string()
+                        } else {
+                            format!(
+                                "I found {} likely location(s) related to your question.",
+                                results.len()
+                            )
+                        },
+                        "evidence": results
+                            .iter()
+                            .map(|r| serde_json::json!({
+                                "file_path": r.file_path.to_string_lossy(),
+                                "start_line": r.start_line,
+                                "end_line": r.end_line,
+                                "score": r.relevance_score,
+                                "preview": r.preview,
+                            }))
+                            .collect::<Vec<_>>(),
+                        "truncated": query_response.truncated,
+                        "scanned_files": query_response.scanned_files,
+                        "retrieval_mode": format!("{:?}", options.retrieval_mode).to_lowercase(),
+                        "repo_root": repo_root,
+                    });
+                    println!("{}", serde_json::to_string(&payload)?);
+                }
+                OutputMode::Text => {
+                    if results.is_empty() {
+                        println!("Question: {}", question);
+                        println!("Answer: I could not find a confident answer in the current index.");
+                        if options.retrieval_mode == QueryRetrievalMode::Neural {
+                            println!("Hint: try lexical mode or reindex with 'flashgrep index'.");
+                        }
+                        return Ok(RunOutcome::NoMatch);
+                    }
+
+                    println!("Question: {}", question);
+                    println!(
+                        "Answer: I found {} likely code location(s). Top evidence:",
+                        results.len()
+                    );
+                    for (i, r) in results.iter().enumerate() {
+                        println!(
+                            "{}. {}:{}-{} (score: {:.3})",
+                            i + 1,
+                            r.file_path.display(),
+                            r.start_line,
+                            r.end_line,
+                            r.relevance_score
+                        );
+                        if !r.preview.is_empty() {
+                            println!("   {}", r.preview.replace('\n', "\\n"));
+                        }
+                    }
+                    println!(
+                        "(repo: {}, scanned_files={}, truncated={})",
+                        repo_root.display(),
+                        query_response.scanned_files,
+                        query_response.truncated
+                    );
+                }
+            }
+
+            Ok(RunOutcome::Success)
         }
         Commands::Files {
             filter,
@@ -1087,6 +1211,28 @@ mod tests {
                 assert_eq!(output, OutputMode::Json);
             }
             _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_with_neural_mode() {
+        let cli = Cli::parse_from([
+            "flashgrep",
+            "ask",
+            "where is mcp query handled",
+            "--retrieval-mode",
+            "neural",
+        ]);
+        match cli.command {
+            Commands::Ask {
+                retrieval_mode,
+                question,
+                ..
+            } => {
+                assert_eq!(retrieval_mode, RetrievalModeArg::Neural);
+                assert_eq!(question, "where is mcp query handled");
+            }
+            _ => panic!("expected ask command"),
         }
     }
 
