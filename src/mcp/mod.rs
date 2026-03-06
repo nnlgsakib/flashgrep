@@ -213,7 +213,9 @@ async fn handle_request(
 
             if route_decision.route_state == PolicyRouteState::AllowedAi {
                 let config = Config::from_file(&paths.config_file()).unwrap_or_default();
-                if let Some(fallback) = evaluate_ai_discovery_fallback(&request.params, config.neural.enabled) {
+                if let Some(fallback) =
+                    evaluate_ai_discovery_fallback(&request.params, config.neural.enabled)
+                {
                     route_decision = fallback;
                     options.retrieval_mode = QueryRetrievalMode::Lexical;
                 }
@@ -381,7 +383,9 @@ async fn handle_request(
 
             if route_decision.route_state == PolicyRouteState::AllowedAi {
                 let config = Config::from_file(&paths.config_file()).unwrap_or_default();
-                if let Some(fallback) = evaluate_ai_discovery_fallback(&normalized, config.neural.enabled) {
+                if let Some(fallback) =
+                    evaluate_ai_discovery_fallback(&normalized, config.neural.enabled)
+                {
                     route_decision = fallback;
                     options.retrieval_mode = QueryRetrievalMode::Lexical;
                 }
@@ -424,7 +428,8 @@ async fn handle_request(
                                 })
                                 .collect();
                             let answer = if evidence.is_empty() {
-                                "I could not find a confident answer in the current index.".to_string()
+                                "I could not find a confident answer in the current index."
+                                    .to_string()
                             } else {
                                 format!(
                                     "I found {} likely code location(s) related to your question.",
@@ -1398,7 +1403,9 @@ mod tests {
             id: Some(3),
         };
 
-        let response = handle_request(req, &paths, Some(&index)).await.expect("response");
+        let response = handle_request(req, &paths, Some(&index))
+            .await
+            .expect("response");
         let payload = response.result.expect("result payload");
         assert!(payload["answer"].as_str().is_some());
         assert!(payload["evidence"].is_array());

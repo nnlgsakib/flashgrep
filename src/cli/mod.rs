@@ -609,7 +609,9 @@ pub async fn run() -> FlashgrepResult<RunOutcome> {
                 OutputMode::Text => {
                     if results.is_empty() {
                         println!("Question: {}", question);
-                        println!("Answer: I could not find a confident answer in the current index.");
+                        println!(
+                            "Answer: I could not find a confident answer in the current index."
+                        );
                         if options.retrieval_mode == QueryRetrievalMode::Neural {
                             println!("Hint: try lexical mode or reindex with 'flashgrep index'.");
                         }
