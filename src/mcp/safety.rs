@@ -11,6 +11,17 @@ pub const MAX_MCP_WRITE_REPLACEMENT_BYTES: usize = 128 * 1024;
 pub const REASON_FILE_NOT_FOUND: &str = "file_not_found";
 pub const REASON_DIRECTORY_NOT_FOUND: &str = "directory_not_found";
 pub const REASON_PATH_NOT_FOUND: &str = "path_not_found";
+pub const REASON_INVALID_RANGE: &str = "invalid_range";
+pub const REASON_PRECONDITION_FAILED: &str = "precondition_failed";
+pub const REASON_INVALID_CONTINUATION_STATE: &str = "invalid_continuation_state";
+pub const REASON_PAYLOAD_TOO_LARGE: &str = "payload_too_large";
+pub const REASON_INTERNAL_ERROR: &str = "internal_error";
+pub const REASON_BATCH_DUPLICATE_OPERATION_ID: &str = "duplicate_operation_id";
+pub const REASON_BATCH_DUPLICATE_TARGET: &str = "duplicate_target";
+pub const REASON_BATCH_OVERLAPPING_OPERATIONS: &str = "overlapping_operations";
+pub const REASON_FALLBACK_GATE_REQUIRED: &str = "fallback_gate_required";
+pub const REASON_UNSUPPORTED_FALLBACK_REASON_CODE: &str = "unsupported_fallback_reason_code";
+pub const REASON_FALLBACK_GATE_MISMATCH: &str = "fallback_gate_mismatch";
 
 pub fn json_size_bytes(value: &Value) -> FlashgrepResult<usize> {
     Ok(serde_json::to_vec(value)?.len())

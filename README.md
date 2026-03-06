@@ -319,7 +319,7 @@ Use stdio transport for MCP clients that launch local tools as child processes.
 1. Build and install `flashgrep`.
 2. Index the repository you want to search: `flashgrep index`.
 3. Configure your MCP client with the Flashgrep server entry.
-4. Start your client and verify Flashgrep tools are available (`query`, `glob`, `get_slice`, `read_code`, `write_code`, `fs_create`, `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_copy`, `fs_move`, `fs_remove`, `get_symbol`, `list_files`, `stats`, `bootstrap_skill`, `flashgrep-init`, `fgrep-boot`).
+4. Start your client and verify Flashgrep tools are available (`query`, `glob`, `get_slice`, `read_code`, `write_code`, `batch_write_code`, `fs_create`, `fs_read`, `fs_write`, `fs_list`, `fs_stat`, `fs_copy`, `fs_move`, `fs_remove`, `get_symbol`, `list_files`, `stats`, `bootstrap_skill`, `flashgrep-init`, `fgrep-boot`).
 5. Bootstrap is injected automatically during `initialize` using embedded policy guidance.
 6. Optionally call `bootstrap_skill` (or alias) to inspect/refresh session policy metadata.
 
@@ -366,7 +366,7 @@ Bootstrap behavior:
 - Repeated call in same server session returns `status: already_injected`
 - Embedded payload is default (`payload_source: embedded`) and does not require local skill files
 - Optional repository override is opt-in (`allow_repo_override: true`) and falls back deterministically when unreadable
-- Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`) over generic grep/glob fallbacks
+- Policy guidance in response recommends Flashgrep-first tools (`query`, `glob`, `files`, `symbol`, `read_code`, `write_code`, `batch_write_code`) over generic grep/glob fallbacks
 - Search routing defaults to neural-first discovery when enabled, with deterministic lexical fallback when neural routing is unavailable or non-relevant
 
 Bootstrap policy metadata:
@@ -392,9 +392,21 @@ Fallback gate defaults:
 - `flashgrep_tool_runtime_failure`
 - `repo_override_unavailable`
 
+Policy enforcement response for ungated fallback routes:
+
+```json
+{
+  "ok": false,
+  "error": "policy_denied",
+  "reason_code": "fallback_gate_required",
+  "recovery_hint": "Provide fallback_reason_code and fallback_gate, or route via native Flashgrep tools"
+}
+```
+
 Native-tool routing expectations:
 - Agents should avoid host-native `Read`/`Write`/`Glob`/`Grep` and shell `grep`/`cat`/ad-hoc globbing unless a declared fallback gate is active.
-- Preferred Flashgrep routes remain `query`, `files`/`glob`, `symbol`/`get_symbol`, `read_code`, `write_code`.
+- Preferred Flashgrep routes remain `query`, `files`/`glob`, `symbol`/`get_symbol`, `read_code`, `write_code`, `batch_write_code`.
+- Fallback tooling (`search`, `search-in-directory`, `search-with-context`, `search-by-regex`) requires explicit `fallback_gate` and `fallback_reason_code`.
 
 Compatibility and rollback notes:
 - Legacy bootstrap fields (`status`, `canonical_trigger`, `skill_hash`, `skill_version`, `policy`) remain available.
@@ -603,6 +615,40 @@ Large-IO safety notes:
   "id": 7
 }
 ```
+
+#### `batch_write_code(mode, operations, dry_run?)`
+
+Apply deterministic ordered line-range edits in a single request. Supports two
+explicit modes:
+
+- `atomic`: all edits succeed or all edits are rolled back
+- `best_effort`: valid edits apply while failed/conflicting edits are reported
+
+Each operation requires: `id`, `file_path`, `start_line`, `end_line`, `replacement`.
+Optional per-op preconditions are supported (`expected_file_hash`, line text guards).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "batch_write_code",
+  "params": {
+    "mode": "atomic",
+    "operations": [
+      {
+        "id": "op1",
+        "file_path": "src/example.rs",
+        "start_line": 10,
+        "end_line": 10,
+        "replacement": "let x = 42;"
+      }
+    ]
+  },
+  "id": 8
+}
+```
+
+Response includes per-operation `status` (`applied|failed|conflict|skipped`),
+typed `reason_code`, and summary counters.
 
 #### `get_symbol(symbol_name)`
 

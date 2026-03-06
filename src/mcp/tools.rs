@@ -14,6 +14,7 @@ pub struct ToolDefinition {
 pub fn create_tools() -> Vec<ToolDefinition> {
     vec![
         create_glob_tool(),
+        create_batch_write_code_tool(),
         create_fs_create_tool(),
         create_fs_read_tool(),
         create_fs_write_tool(),
@@ -199,6 +200,44 @@ fn create_glob_tool() -> ToolDefinition {
                 "total": {"type": "integer"}
             }
         }),
+    }
+}
+
+fn create_batch_write_code_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "batch_write_code".to_string(),
+        description: "Apply deterministic ordered line-range edits across files".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["atomic", "best_effort"]},
+                "dry_run": {"type": "boolean"},
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "file_path": {"type": "string"},
+                            "start_line": {"type": "integer", "minimum": 1},
+                            "end_line": {"type": "integer", "minimum": 1},
+                            "replacement": {"type": "string"},
+                            "precondition": {
+                                "type": "object",
+                                "properties": {
+                                    "expected_file_hash": {"type": "string"},
+                                    "expected_start_line_text": {"type": "string"},
+                                    "expected_end_line_text": {"type": "string"}
+                                }
+                            }
+                        },
+                        "required": ["id", "file_path", "start_line", "end_line", "replacement"]
+                    }
+                }
+            },
+            "required": ["operations"]
+        }),
+        returns: serde_json::json!({"type": "object"}),
     }
 }
 

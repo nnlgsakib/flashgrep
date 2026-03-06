@@ -2,12 +2,16 @@ use crate::config::paths::FlashgrepPaths;
 use crate::db::Database;
 use crate::mcp::safety::{
     chunking_guidance, continuation_meta, payload_too_large_error, MAX_MCP_READ_BYTES,
-    MAX_MCP_WRITE_REPLACEMENT_BYTES,
+    MAX_MCP_WRITE_REPLACEMENT_BYTES, REASON_BATCH_DUPLICATE_OPERATION_ID,
+    REASON_BATCH_DUPLICATE_TARGET, REASON_BATCH_OVERLAPPING_OPERATIONS, REASON_FILE_NOT_FOUND,
+    REASON_INTERNAL_ERROR, REASON_INVALID_RANGE, REASON_PAYLOAD_TOO_LARGE,
+    REASON_PRECONDITION_FAILED,
 };
 use crate::{FlashgrepError, FlashgrepResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_SYMBOL_CONTEXT_LINES: usize = 20;
@@ -57,6 +61,48 @@ pub fn write_code_input_schema() -> Value {
             }
         },
         "required": ["file_path", "start_line", "end_line", "replacement"]
+    })
+}
+
+pub fn batch_write_code_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["atomic", "best_effort"],
+                "default": "atomic",
+                "description": "Batch mode: atomic(all-or-nothing) or best_effort"
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "Validate/preflight only without writing"
+            },
+            "operations": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "file_path": {"type": "string"},
+                        "start_line": {"type": "integer", "minimum": 1},
+                        "end_line": {"type": "integer", "minimum": 1},
+                        "replacement": {"type": "string"},
+                        "precondition": {
+                            "type": "object",
+                            "properties": {
+                                "expected_file_hash": {"type": "string"},
+                                "expected_start_line_text": {"type": "string"},
+                                "expected_end_line_text": {"type": "string"}
+                            }
+                        }
+                    },
+                    "required": ["id", "file_path", "start_line", "end_line", "replacement"]
+                }
+            }
+        },
+        "required": ["operations"]
     })
 }
 
@@ -261,6 +307,409 @@ pub fn write_code(arguments: &Value) -> FlashgrepResult<Value> {
         "file_hash_before": original_hash,
         "file_hash_after": new_hash
     }))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchMode {
+    Atomic,
+    BestEffort,
+}
+
+#[derive(Clone)]
+struct BatchOperation {
+    id: String,
+    file_path: String,
+    start_line: usize,
+    end_line: usize,
+    replacement: String,
+    precondition: Option<Value>,
+}
+
+#[derive(Clone)]
+struct BatchState {
+    operation: BatchOperation,
+    status: String,
+    reason_code: Option<String>,
+    message: Option<String>,
+    file_hash_before: Option<String>,
+    file_hash_after: Option<String>,
+}
+
+#[derive(Clone)]
+struct FileSnapshot {
+    original_content: String,
+    lines: Vec<String>,
+    file_hash_before: String,
+}
+
+pub fn batch_write_code(arguments: &Value) -> FlashgrepResult<Value> {
+    let mode = match arguments.get("mode").and_then(Value::as_str) {
+        None | Some("atomic") => BatchMode::Atomic,
+        Some("best_effort") => BatchMode::BestEffort,
+        Some(other) => {
+            return Err(FlashgrepError::Config(format!(
+                "Invalid mode '{}'. Expected 'atomic' or 'best_effort'",
+                other
+            )))
+        }
+    };
+    let dry_run = arguments
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let operations = parse_batch_operations(arguments)?;
+    let mut states = operations
+        .into_iter()
+        .map(|operation| BatchState {
+            operation,
+            status: "pending".to_string(),
+            reason_code: None,
+            message: None,
+            file_hash_before: None,
+            file_hash_after: None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut file_snapshots: HashMap<String, FileSnapshot> = HashMap::new();
+    let mut seen_ids = HashSet::new();
+    let mut seen_targets = HashSet::new();
+    let mut seen_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+
+    for state in &mut states {
+        let op = &state.operation;
+
+        if !seen_ids.insert(op.id.clone()) {
+            state.status = "failed".to_string();
+            state.reason_code = Some(REASON_BATCH_DUPLICATE_OPERATION_ID.to_string());
+            state.message = Some(format!("Duplicate operation id '{}'", op.id));
+            continue;
+        }
+
+        let target_key = format!("{}:{}:{}", op.file_path, op.start_line, op.end_line);
+        if !seen_targets.insert(target_key) {
+            state.status = "failed".to_string();
+            state.reason_code = Some(REASON_BATCH_DUPLICATE_TARGET.to_string());
+            state.message = Some("Duplicate batch target".to_string());
+            continue;
+        }
+
+        if op.replacement.len() > MAX_MCP_WRITE_REPLACEMENT_BYTES {
+            state.status = "failed".to_string();
+            state.reason_code = Some(REASON_PAYLOAD_TOO_LARGE.to_string());
+            state.message = Some(format!(
+                "Replacement exceeds {} bytes",
+                MAX_MCP_WRITE_REPLACEMENT_BYTES
+            ));
+            continue;
+        }
+
+        if op.start_line == 0 || op.end_line == 0 || op.start_line > op.end_line {
+            state.status = "failed".to_string();
+            state.reason_code = Some(REASON_INVALID_RANGE.to_string());
+            state.message = Some("Invalid line range".to_string());
+            continue;
+        }
+
+        let ranges = seen_ranges.entry(op.file_path.clone()).or_default();
+        if ranges
+            .iter()
+            .any(|(s, e)| op.start_line <= *e && *s <= op.end_line)
+        {
+            state.status = "failed".to_string();
+            state.reason_code = Some(REASON_BATCH_OVERLAPPING_OPERATIONS.to_string());
+            state.message = Some("Overlapping operation range in same file".to_string());
+            continue;
+        }
+        ranges.push((op.start_line, op.end_line));
+
+        if !file_snapshots.contains_key(&op.file_path) {
+            let path = PathBuf::from(&op.file_path);
+            let original_content = match std::fs::read_to_string(&path) {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    state.status = "failed".to_string();
+                    state.reason_code = Some(REASON_FILE_NOT_FOUND.to_string());
+                    state.message = Some("Target file not found".to_string());
+                    continue;
+                }
+                Err(e) => return Err(FlashgrepError::Io(e)),
+            };
+
+            let lines: Vec<String> = original_content.lines().map(ToString::to_string).collect();
+            let snapshot = FileSnapshot {
+                file_hash_before: calculate_sha256(&original_content),
+                original_content,
+                lines,
+            };
+            file_snapshots.insert(op.file_path.clone(), snapshot);
+        }
+
+        if let Some(snapshot) = file_snapshots.get(&op.file_path) {
+            state.file_hash_before = Some(snapshot.file_hash_before.clone());
+            if snapshot.lines.is_empty() || op.end_line > snapshot.lines.len() {
+                state.status = "failed".to_string();
+                state.reason_code = Some(REASON_INVALID_RANGE.to_string());
+                state.message = Some(format!(
+                    "end_line {} exceeds line count {}",
+                    op.end_line,
+                    snapshot.lines.len()
+                ));
+                continue;
+            }
+
+            if let Some(conflict_payload) = check_preconditions(
+                op.precondition.as_ref(),
+                &snapshot.lines,
+                &snapshot.file_hash_before,
+                op.start_line,
+                op.end_line,
+            ) {
+                state.status = "conflict".to_string();
+                state.reason_code = Some(REASON_PRECONDITION_FAILED.to_string());
+                state.message = Some(conflict_payload.to_string());
+                continue;
+            }
+        }
+    }
+
+    let has_blocking = states
+        .iter()
+        .any(|s| s.status == "failed" || s.status == "conflict");
+    if mode == BatchMode::Atomic && has_blocking {
+        for state in &mut states {
+            if state.status == "pending" {
+                state.status = "skipped".to_string();
+                state.reason_code = Some("atomic_aborted_preflight".to_string());
+                state.message = Some("Skipped due to atomic preflight failure".to_string());
+            }
+        }
+        return Ok(batch_result_payload(mode, states));
+    }
+
+    if dry_run {
+        for state in &mut states {
+            if state.status == "pending" {
+                state.status = "skipped".to_string();
+                state.reason_code = Some("dry_run".to_string());
+                state.message = Some("Validated in dry_run mode".to_string());
+            }
+        }
+        return Ok(batch_result_payload(mode, states));
+    }
+
+    let mut touched_files = HashSet::new();
+    for idx in 0..states.len() {
+        if states[idx].status != "pending" {
+            continue;
+        }
+
+        let op = states[idx].operation.clone();
+        let args = json!({
+            "file_path": op.file_path,
+            "start_line": op.start_line,
+            "end_line": op.end_line,
+            "replacement": op.replacement,
+            "precondition": op.precondition,
+        });
+
+        match write_code(&args) {
+            Ok(payload) => {
+                if payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    touched_files.insert(states[idx].operation.file_path.clone());
+                    states[idx].status = "applied".to_string();
+                    states[idx].file_hash_before = payload
+                        .get("file_hash_before")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| states[idx].file_hash_before.clone());
+                    states[idx].file_hash_after = payload
+                        .get("file_hash_after")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                } else {
+                    let reason = payload
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or(REASON_INTERNAL_ERROR);
+                    states[idx].status = if reason == REASON_PRECONDITION_FAILED {
+                        "conflict".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    states[idx].reason_code = Some(reason.to_string());
+                    states[idx].message = payload
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| payload.get("conflict").map(ToString::to_string));
+
+                    if mode == BatchMode::Atomic {
+                        rollback_atomic_files(&touched_files, &file_snapshots)?;
+                        for state in &mut states {
+                            if state.status == "applied" {
+                                state.status = "skipped".to_string();
+                                state.reason_code = Some("atomic_rolled_back".to_string());
+                                state.message =
+                                    Some("Rolled back due to atomic failure".to_string());
+                                state.file_hash_after = None;
+                            } else if state.status == "pending" {
+                                state.status = "skipped".to_string();
+                                state.reason_code = Some("atomic_aborted".to_string());
+                                state.message =
+                                    Some("Skipped due to earlier atomic failure".to_string());
+                            }
+                        }
+                        return Ok(batch_result_payload(mode, states));
+                    }
+                }
+            }
+            Err(e) => {
+                states[idx].status = "failed".to_string();
+                states[idx].reason_code = Some(match &e {
+                    FlashgrepError::Io(ioe) if ioe.kind() == std::io::ErrorKind::NotFound => {
+                        REASON_FILE_NOT_FOUND.to_string()
+                    }
+                    _ => REASON_INTERNAL_ERROR.to_string(),
+                });
+                states[idx].message = Some(e.to_string());
+
+                if mode == BatchMode::Atomic {
+                    rollback_atomic_files(&touched_files, &file_snapshots)?;
+                    for state in &mut states {
+                        if state.status == "applied" {
+                            state.status = "skipped".to_string();
+                            state.reason_code = Some("atomic_rolled_back".to_string());
+                            state.message = Some("Rolled back due to atomic failure".to_string());
+                            state.file_hash_after = None;
+                        } else if state.status == "pending" {
+                            state.status = "skipped".to_string();
+                            state.reason_code = Some("atomic_aborted".to_string());
+                            state.message =
+                                Some("Skipped due to earlier atomic failure".to_string());
+                        }
+                    }
+                    return Ok(batch_result_payload(mode, states));
+                }
+            }
+        }
+    }
+
+    Ok(batch_result_payload(mode, states))
+}
+
+fn parse_batch_operations(arguments: &Value) -> FlashgrepResult<Vec<BatchOperation>> {
+    let operations = arguments
+        .get("operations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            FlashgrepError::Config("Missing required parameter: operations".to_string())
+        })?;
+
+    if operations.is_empty() {
+        return Err(FlashgrepError::Config(
+            "operations must contain at least one item".to_string(),
+        ));
+    }
+
+    operations
+        .iter()
+        .map(|op| {
+            let id = op
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| FlashgrepError::Config("Batch operation missing id".to_string()))?
+                .to_string();
+            let file_path = op
+                .get("file_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    FlashgrepError::Config(format!("Operation '{}' missing file_path", id))
+                })?
+                .to_string();
+            let start_line = op
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    FlashgrepError::Config(format!("Operation '{}' missing start_line", id))
+                })? as usize;
+            let end_line = op.get("end_line").and_then(Value::as_u64).ok_or_else(|| {
+                FlashgrepError::Config(format!("Operation '{}' missing end_line", id))
+            })? as usize;
+            let replacement = op
+                .get("replacement")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    FlashgrepError::Config(format!("Operation '{}' missing replacement", id))
+                })?
+                .to_string();
+
+            Ok(BatchOperation {
+                id,
+                file_path,
+                start_line,
+                end_line,
+                replacement,
+                precondition: op.get("precondition").cloned(),
+            })
+        })
+        .collect()
+}
+
+fn rollback_atomic_files(
+    touched_files: &HashSet<String>,
+    snapshots: &HashMap<String, FileSnapshot>,
+) -> FlashgrepResult<()> {
+    for path in touched_files {
+        if let Some(snapshot) = snapshots.get(path) {
+            std::fs::write(path, &snapshot.original_content)?;
+        }
+    }
+    Ok(())
+}
+
+fn batch_result_payload(mode: BatchMode, states: Vec<BatchState>) -> Value {
+    let mut applied_count = 0usize;
+    let mut failed_count = 0usize;
+    let mut conflict_count = 0usize;
+    let mut skipped_count = 0usize;
+
+    let results = states
+        .into_iter()
+        .map(|state| {
+            match state.status.as_str() {
+                "applied" => applied_count += 1,
+                "failed" => failed_count += 1,
+                "conflict" => conflict_count += 1,
+                _ => skipped_count += 1,
+            }
+            json!({
+                "id": state.operation.id,
+                "status": state.status,
+                "reason_code": state.reason_code,
+                "message": state.message,
+                "file_path": state.operation.file_path,
+                "start_line": state.operation.start_line,
+                "end_line": state.operation.end_line,
+                "file_hash_before": state.file_hash_before,
+                "file_hash_after": state.file_hash_after,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let ok = failed_count == 0 && conflict_count == 0;
+    json!({
+        "ok": ok,
+        "mode": match mode {
+            BatchMode::Atomic => "atomic",
+            BatchMode::BestEffort => "best_effort",
+        },
+        "results": results,
+        "applied_count": applied_count,
+        "failed_count": failed_count,
+        "conflict_count": conflict_count,
+        "skipped_count": skipped_count,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1047,5 +1496,122 @@ mod tests {
 
         let updated = fs::read_to_string(file_path).expect("updated");
         assert_eq!(updated, "a\nhello world\nc\n");
+    }
+
+    #[test]
+    fn batch_write_code_atomic_rejects_overlap() {
+        let (_temp, file_path) = setup_file("a\nb\nc\n");
+        let result = batch_write_code(&json!({
+            "mode": "atomic",
+            "operations": [
+                {
+                    "id": "op1",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 2,
+                    "replacement": "x\ny"
+                },
+                {
+                    "id": "op2",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 2,
+                    "end_line": 3,
+                    "replacement": "z\nw"
+                }
+            ]
+        }))
+        .expect("batch result");
+
+        assert_eq!(result["ok"], Value::Bool(false));
+        assert_eq!(result["failed_count"], Value::Number(1u64.into()));
+        assert_eq!(result["skipped_count"], Value::Number(1u64.into()));
+        let content = fs::read_to_string(file_path).expect("file read");
+        assert_eq!(content, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn batch_write_code_best_effort_applies_valid_ops() {
+        let (_temp, file_path) = setup_file("a\nb\nc\n");
+        let result = batch_write_code(&json!({
+            "mode": "best_effort",
+            "operations": [
+                {
+                    "id": "op1",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "replacement": "alpha"
+                },
+                {
+                    "id": "op2",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 10,
+                    "end_line": 10,
+                    "replacement": "omega"
+                }
+            ]
+        }))
+        .expect("batch result");
+
+        assert_eq!(result["applied_count"], Value::Number(1u64.into()));
+        assert_eq!(result["failed_count"], Value::Number(1u64.into()));
+        let content = fs::read_to_string(file_path).expect("file read");
+        assert_eq!(content, "alpha\nb\nc\n");
+    }
+
+    #[test]
+    fn batch_write_code_atomic_rolls_back_on_runtime_failure() {
+        let (_temp, file_path) = setup_file("a\nb\nc\n");
+        let result = batch_write_code(&json!({
+            "mode": "atomic",
+            "operations": [
+                {
+                    "id": "op1",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "replacement": "alpha"
+                },
+                {
+                    "id": "op2",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "beta",
+                    "precondition": {
+                        "expected_start_line_text": "does-not-match"
+                    }
+                }
+            ]
+        }))
+        .expect("batch result");
+
+        assert_eq!(result["ok"], Value::Bool(false));
+        let content = fs::read_to_string(file_path).expect("file read");
+        assert_eq!(content, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn batch_write_code_dry_run_does_not_mutate_files() {
+        let (_temp, file_path) = setup_file("a\nb\nc\n");
+        let result = batch_write_code(&json!({
+            "mode": "best_effort",
+            "dry_run": true,
+            "operations": [
+                {
+                    "id": "op1",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "beta"
+                }
+            ]
+        }))
+        .expect("batch result");
+
+        assert_eq!(result["ok"], Value::Bool(true));
+        assert_eq!(result["skipped_count"], Value::Number(1u64.into()));
+        let content = fs::read_to_string(file_path).expect("file read");
+        assert_eq!(content, "a\nb\nc\n");
     }
 }

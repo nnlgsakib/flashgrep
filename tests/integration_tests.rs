@@ -472,3 +472,47 @@ fn test_ignore_file_update_prunes_newly_ignored_indexed_files() {
     let hits = searcher.query("TRANSIENT_IGNORE_TOKEN", 10).unwrap();
     assert!(hits.is_empty());
 }
+
+#[test]
+fn test_readme_documents_batch_write_code_contract_fields() {
+    let readme = fs::read_to_string("README.md").expect("read README.md");
+    assert!(readme.contains("batch_write_code"));
+    assert!(readme.contains("atomic"));
+    assert!(readme.contains("best_effort"));
+    assert!(readme.contains("reason_code"));
+}
+
+#[test]
+fn test_skill_includes_precondition_safe_batch_workflow() {
+    let skill = fs::read_to_string("skills/SKILL.md").expect("read skills/SKILL.md");
+    assert!(skill.contains("batch_write_code"));
+    assert!(skill.contains("PRECONDITION"));
+    assert!(skill.contains("WORKFLOW batch_edit"));
+}
+
+#[test]
+fn test_readme_documents_policy_denied_and_fallback_gate() {
+    let readme = fs::read_to_string("README.md").expect("read README.md");
+    assert!(readme.contains("policy_denied"));
+    assert!(readme.contains("fallback_gate"));
+    assert!(readme.contains("fallback_reason_code"));
+}
+
+#[test]
+fn test_skill_route_policy_includes_fallback_rules() {
+    let skill = fs::read_to_string("skills/SKILL.md").expect("read skills/SKILL.md");
+    assert!(skill.contains("NATIVE_TOOL_POLICY"));
+    assert!(skill.contains("fallback_gate_active"));
+}
+
+#[test]
+fn test_release_docs_cover_policy_parity_checks() {
+    let troubleshooting = fs::read_to_string("docs/bootstrap-policy-troubleshooting.md")
+        .expect("read troubleshooting doc");
+    let readiness =
+        fs::read_to_string("docs/release-readiness-checklist.md").expect("read readiness doc");
+
+    assert!(troubleshooting.contains("fallback_reason_code"));
+    assert!(readiness.contains("README"));
+    assert!(readiness.contains("skills/SKILL.md"));
+}

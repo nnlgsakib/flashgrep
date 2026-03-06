@@ -70,7 +70,7 @@ These should map to tools your agent must avoid unless a declared fallback gate 
 1. Re-run bootstrap with force.
 2. Confirm strict metadata (`policy_strength`, `enforcement_mode`).
 3. Confirm `payload_source` and `bootstrap_state`.
-4. Resume Flashgrep-first routing (`query`, `files/glob`, `symbol`, `read_code`, `write_code`).
+4. Resume Flashgrep-first routing (`query`, `files/glob`, `symbol`, `read_code`, `write_code`, `batch_write_code`).
 
 ## 6) Missing path and filesystem diagnostics
 
@@ -86,3 +86,16 @@ For filesystem mutations (`fs_write`, `fs_copy`, `fs_move`, `fs_remove`), verify
 - conflict without overwrite: `error = conflict`, `reason_code = destination_exists`
 - invalid combination: `error = invalid_params` with deterministic `reason_code`
 - `dry_run = true` returns operation plan without mutation
+
+For batch edits (`batch_write_code`), verify deterministic edit diagnostics:
+
+- explicit `mode` is required for non-default semantics
+- per-operation `status` is one of `applied|failed|conflict|skipped`
+- typed `reason_code` appears for failed/conflicting/skipped operations
+- summary counters (`applied_count`, `failed_count`, `conflict_count`, `skipped_count`) are present
+
+For fallback search tooling (`search*`), verify policy enforcement diagnostics:
+
+- missing gate metadata returns `error = policy_denied`
+- denied payload includes typed `reason_code` (`fallback_gate_required`, `unsupported_fallback_reason_code`, or `fallback_gate_mismatch`)
+- drift mismatches return `reason_code = policy_state_mismatch` with recovery hint

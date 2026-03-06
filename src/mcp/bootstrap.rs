@@ -1,4 +1,8 @@
 use crate::config::paths::FlashgrepPaths;
+use crate::mcp::safety::{
+    REASON_FALLBACK_GATE_MISMATCH, REASON_FALLBACK_GATE_REQUIRED,
+    REASON_UNSUPPORTED_FALLBACK_REASON_CODE,
+};
 use crate::mcp::skill::{
     bootstrap_policy, bootstrap_policy_metadata, get_skill_documentation, get_skill_info,
 };
@@ -7,6 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 pub const CANONICAL_BOOTSTRAP_TRIGGER: &str = "flashgrep-init";
 pub const BOOTSTRAP_TOOL_ALIASES: [&str; 5] = [
@@ -17,7 +22,199 @@ pub const BOOTSTRAP_TOOL_ALIASES: [&str; 5] = [
     "fgrep_boot",
 ];
 
+const FALLBACK_ROUTE_TOOLS: [&str; 4] = [
+    "search",
+    "search-in-directory",
+    "search-with-context",
+    "search-by-regex",
+];
+
+const NATIVE_ROUTE_TOOLS: [&str; 17] = [
+    "query",
+    "glob",
+    "get_slice",
+    "read_code",
+    "write_code",
+    "batch_write_code",
+    "get_symbol",
+    "list_files",
+    "stats",
+    "fs_create",
+    "fs_read",
+    "fs_write",
+    "fs_list",
+    "fs_stat",
+    "fs_copy",
+    "fs_move",
+    "fs_remove",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRouteState {
+    AllowedNative,
+    AllowedFallback,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRouteDecision {
+    pub route_state: PolicyRouteState,
+    pub reason_code: Option<String>,
+    pub fallback_gate_id: Option<String>,
+    pub recovery_hint: Option<String>,
+}
+
+impl PolicyRouteDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self.route_state {
+            PolicyRouteState::AllowedNative => "allowed_native",
+            PolicyRouteState::AllowedFallback => "allowed_fallback",
+            PolicyRouteState::Denied => "denied",
+        }
+    }
+}
+
 const EMBEDDED_SKILL_MARKDOWN: &str = include_str!("../../skills/SKILL.md");
+static POLICY_HASH_CACHE: OnceLock<String> = OnceLock::new();
+
+pub fn current_policy_hash() -> String {
+    POLICY_HASH_CACHE
+        .get_or_init(|| {
+            let mut hasher = Sha256::new();
+            hasher.update(bootstrap_policy().join("\n").as_bytes());
+            hasher.update(bootstrap_policy_metadata().to_string().as_bytes());
+            hex::encode(hasher.finalize())
+        })
+        .clone()
+}
+
+pub fn policy_denied_payload(tool_name: &str, decision: &PolicyRouteDecision) -> Value {
+    json!({
+        "ok": false,
+        "error": "policy_denied",
+        "route_state": decision.as_str(),
+        "requested_tool": tool_name,
+        "reason_code": decision.reason_code,
+        "fallback_gate_id": decision.fallback_gate_id,
+        "recovery_hint": decision.recovery_hint,
+        "policy_hash": current_policy_hash(),
+    })
+}
+
+pub fn evaluate_policy_route(tool_name: &str, arguments: &Value) -> PolicyRouteDecision {
+    if let Some(observed_hash) = arguments.get("policy_hash").and_then(Value::as_str) {
+        let expected_hash = current_policy_hash();
+        if observed_hash != expected_hash {
+            return PolicyRouteDecision {
+                route_state: PolicyRouteState::Denied,
+                reason_code: Some("policy_state_mismatch".to_string()),
+                fallback_gate_id: None,
+                recovery_hint: Some(
+                    "Policy hash mismatch. Re-run bootstrap with force=true and retry".to_string(),
+                ),
+            };
+        }
+    }
+
+    if let Some(observed_version) = arguments.get("policy_version").and_then(Value::as_str) {
+        let metadata = bootstrap_policy_metadata();
+        let expected_version = metadata["policy_version"].as_str().unwrap_or("1.1");
+        if observed_version != expected_version {
+            return PolicyRouteDecision {
+                route_state: PolicyRouteState::Denied,
+                reason_code: Some("policy_state_mismatch".to_string()),
+                fallback_gate_id: None,
+                recovery_hint: Some(
+                    "Policy version mismatch. Re-run bootstrap with force=true and retry"
+                        .to_string(),
+                ),
+            };
+        }
+    }
+
+    if is_bootstrap_tool(tool_name) || NATIVE_ROUTE_TOOLS.contains(&tool_name) {
+        return PolicyRouteDecision {
+            route_state: PolicyRouteState::AllowedNative,
+            reason_code: None,
+            fallback_gate_id: None,
+            recovery_hint: None,
+        };
+    }
+
+    if FALLBACK_ROUTE_TOOLS.contains(&tool_name) {
+        let fallback_reason = arguments
+            .get("fallback_reason_code")
+            .and_then(Value::as_str);
+        let fallback_gate = arguments.get("fallback_gate").and_then(Value::as_str);
+
+        let Some(reason) = fallback_reason else {
+            return PolicyRouteDecision {
+                route_state: PolicyRouteState::Denied,
+                reason_code: Some(REASON_FALLBACK_GATE_REQUIRED.to_string()),
+                fallback_gate_id: None,
+                recovery_hint: Some(
+                    "Provide fallback_reason_code and fallback_gate, or route via native Flashgrep tools"
+                        .to_string(),
+                ),
+            };
+        };
+
+        let Some(expected_gate) = reason_to_gate_id(reason) else {
+            return PolicyRouteDecision {
+                route_state: PolicyRouteState::Denied,
+                reason_code: Some(REASON_UNSUPPORTED_FALLBACK_REASON_CODE.to_string()),
+                fallback_gate_id: fallback_gate.map(ToString::to_string),
+                recovery_hint: Some(
+                    "Use a supported fallback_reason_code from policy metadata fallback rules"
+                        .to_string(),
+                ),
+            };
+        };
+
+        if let Some(gate) = fallback_gate {
+            if gate != expected_gate {
+                return PolicyRouteDecision {
+                    route_state: PolicyRouteState::Denied,
+                    reason_code: Some(REASON_FALLBACK_GATE_MISMATCH.to_string()),
+                    fallback_gate_id: Some(gate.to_string()),
+                    recovery_hint: Some(format!(
+                        "fallback_gate '{}' must match reason_code '{}'",
+                        expected_gate, reason
+                    )),
+                };
+            }
+        }
+
+        return PolicyRouteDecision {
+            route_state: PolicyRouteState::AllowedFallback,
+            reason_code: Some(reason.to_string()),
+            fallback_gate_id: Some(expected_gate.to_string()),
+            recovery_hint: None,
+        };
+    }
+
+    PolicyRouteDecision {
+        route_state: PolicyRouteState::Denied,
+        reason_code: Some("flashgrep_operation_not_supported".to_string()),
+        fallback_gate_id: None,
+        recovery_hint: Some("Use a supported Flashgrep MCP tool".to_string()),
+    }
+}
+
+fn reason_to_gate_id(reason_code: &str) -> Option<&'static str> {
+    match reason_code {
+        "neural_mode_disabled" => Some("neural_mode_disabled"),
+        "neural_provider_failure" => Some("neural_provider_failure"),
+        "neural_no_relevant_matches" => Some("neural_no_relevant_matches"),
+        "exact_match_required" => Some("exact_match_required"),
+        "query_parse_constraints" => Some("query_parse_constraints"),
+        "flashgrep_index_unavailable" => Some("index_unavailable"),
+        "flashgrep_operation_not_supported" => Some("unsupported_operation"),
+        "flashgrep_tool_runtime_failure" => Some("tool_runtime_failure"),
+        "repo_override_unavailable" => Some("repo_override_read_failed"),
+        _ => None,
+    }
+}
 
 pub fn is_bootstrap_tool(name: &str) -> bool {
     BOOTSTRAP_TOOL_ALIASES.contains(&name)
@@ -202,6 +399,10 @@ fn annotate_policy_metadata(
         obj.insert(
             "override_requested".to_string(),
             Value::Bool(resolution.override_requested),
+        );
+        obj.insert(
+            "policy_hash".to_string(),
+            Value::String(current_policy_hash()),
         );
         if let Some(path) = resolution.source_path.as_ref() {
             obj.insert("source_path".to_string(), Value::String(path.clone()));
@@ -421,5 +622,95 @@ mod tests {
 
         assert!(as_strings.contains(&"exact_match_required"));
         assert!(as_strings.contains(&"query_parse_constraints"));
+    }
+
+    #[test]
+    fn evaluate_policy_route_denies_fallback_without_reason_code() {
+        let decision = evaluate_policy_route("search", &json!({}));
+        assert_eq!(decision.route_state, PolicyRouteState::Denied);
+        assert_eq!(
+            decision.reason_code,
+            Some("fallback_gate_required".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_policy_route_allows_valid_fallback_gate_and_reason() {
+        let decision = evaluate_policy_route(
+            "search-by-regex",
+            &json!({
+                "fallback_gate": "tool_runtime_failure",
+                "fallback_reason_code": "flashgrep_tool_runtime_failure"
+            }),
+        );
+        assert_eq!(decision.route_state, PolicyRouteState::AllowedFallback);
+        assert_eq!(
+            decision.fallback_gate_id,
+            Some("tool_runtime_failure".to_string())
+        );
+    }
+
+    #[test]
+    fn evaluate_policy_route_detects_policy_hash_mismatch() {
+        let decision = evaluate_policy_route(
+            "query",
+            &json!({
+                "policy_hash": "stale-hash"
+            }),
+        );
+        assert_eq!(decision.route_state, PolicyRouteState::Denied);
+        assert_eq!(
+            decision.reason_code,
+            Some("policy_state_mismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn bootstrap_payload_includes_policy_hash_metadata() {
+        let (_temp, paths, injected) = setup_paths_with_skill(None);
+        let payload = build_bootstrap_payload(
+            &paths,
+            "flashgrep-init",
+            &json!({"compact": true, "force": true}),
+            &injected,
+        )
+        .expect("payload");
+
+        assert!(payload["policy_metadata"]["policy_hash"].as_str().is_some());
+    }
+
+    #[test]
+    fn force_reinjection_restores_injected_state() {
+        let (_temp, paths, injected) = setup_paths_with_skill(None);
+
+        let first = build_bootstrap_payload(
+            &paths,
+            "flashgrep-init",
+            &json!({"compact": true}),
+            &injected,
+        )
+        .expect("first payload");
+        assert_eq!(first["status"], Value::String("injected".to_string()));
+
+        let second = build_bootstrap_payload(
+            &paths,
+            "flashgrep-init",
+            &json!({"compact": true}),
+            &injected,
+        )
+        .expect("second payload");
+        assert_eq!(
+            second["status"],
+            Value::String("already_injected".to_string())
+        );
+
+        let forced = build_bootstrap_payload(
+            &paths,
+            "flashgrep-init",
+            &json!({"compact": true, "force": true}),
+            &injected,
+        )
+        .expect("forced payload");
+        assert_eq!(forced["status"], Value::String("injected".to_string()));
     }
 }

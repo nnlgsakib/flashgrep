@@ -315,7 +315,7 @@ pub fn bootstrap_policy() -> Vec<String> {
         "FORMAT v1 HYBRID_ENFORCED".to_string(),
         "ENFORCE bootstrap_required=true reason_code_required=true".to_string(),
         "ROUTE discovery primary=query(neural) fallback=query(lexical)".to_string(),
-        "ROUTE files primary=glob|files symbols=get_symbol reads=read_code writes=write_code".to_string(),
+        "ROUTE files primary=glob|files symbols=get_symbol reads=read_code writes=write_code|batch_write_code".to_string(),
         "RULE native_tools_banned=true unless=fallback_gate_active".to_string(),
         "RULE no_guessing=true empty_results_valid=true".to_string(),
         "FALLBACK neural_mode_disabled neural_provider_failure neural_no_relevant_matches".to_string(),
@@ -323,6 +323,7 @@ pub fn bootstrap_policy() -> Vec<String> {
         "FALLBACK flashgrep_operation_not_supported flashgrep_tool_runtime_failure repo_override_unavailable".to_string(),
         "WORKFLOW discovery query(neural)->query(lexical_on_fail_or_no_match)->get_symbol->read_code".to_string(),
         "WORKFLOW edit read_code->write_code(precondition)->read_code".to_string(),
+        "WORKFLOW batch_edit read_code->batch_write_code(mode+precondition)->read_code".to_string(),
         "WORKFLOW recovery bootstrap(force=true,compact=true)->verify(policy_metadata)->resume(route_order)".to_string(),
     ]
 }
@@ -355,12 +356,12 @@ pub fn bootstrap_policy_metadata() -> Value {
             "files_glob": ["files", "glob"],
             "symbol": ["symbol", "get_symbol"],
             "read": ["read_code", "get_slice"],
-            "write": ["write_code"]
+            "write": ["write_code", "batch_write_code"]
         },
         "preferred_tools": {
             "search": ["query", "files", "glob", "symbol", "get_symbol"],
             "read": ["read_code", "get_slice"],
-            "write": ["write_code"]
+            "write": ["write_code", "batch_write_code"]
         },
         "fallback_gate_ids": [
             "neural_mode_disabled",
