@@ -104,3 +104,182 @@ mod integration {
         println!("\n=== Test Complete ===\n");
     }
 }
+
+#[cfg(test)]
+mod behavior {
+    use flashgrep::mcp::bootstrap::{current_policy_hash, evaluate_policy_route, PolicyRouteState};
+    use flashgrep::mcp::code_io::batch_write_code;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_batch_write_code_reports_per_operation_statuses() {
+        let temp = TempDir::new().expect("temp dir");
+        let file_path = temp.path().join("sample.rs");
+        fs::write(&file_path, "one\ntwo\nthree\n").expect("write fixture");
+
+        let payload = batch_write_code(&json!({
+            "mode": "best_effort",
+            "operations": [
+                {
+                    "id": "ok-op",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "TWO"
+                },
+                {
+                    "id": "bad-op",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 99,
+                    "end_line": 99,
+                    "replacement": "X"
+                }
+            ]
+        }))
+        .expect("batch payload");
+
+        assert_eq!(
+            payload["applied_count"],
+            serde_json::Value::Number(1u64.into())
+        );
+        assert_eq!(
+            payload["failed_count"],
+            serde_json::Value::Number(1u64.into())
+        );
+        assert!(payload["results"].as_array().is_some());
+    }
+
+    #[test]
+    fn test_batch_write_code_atomic_keeps_file_on_failure() {
+        let temp = TempDir::new().expect("temp dir");
+        let file_path = temp.path().join("sample.rs");
+        fs::write(&file_path, "alpha\nbeta\ngamma\n").expect("write fixture");
+
+        let payload = batch_write_code(&json!({
+            "mode": "atomic",
+            "operations": [
+                {
+                    "id": "first",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 1,
+                    "end_line": 1,
+                    "replacement": "ALPHA"
+                },
+                {
+                    "id": "second",
+                    "file_path": file_path.to_string_lossy(),
+                    "start_line": 2,
+                    "end_line": 2,
+                    "replacement": "BETA",
+                    "precondition": {
+                        "expected_start_line_text": "not-beta"
+                    }
+                }
+            ]
+        }))
+        .expect("batch payload");
+
+        assert_eq!(payload["ok"], serde_json::Value::Bool(false));
+        let content = fs::read_to_string(&file_path).expect("read file");
+        assert_eq!(content, "alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn test_batch_write_code_small_batch_completes_quickly() {
+        let temp = TempDir::new().expect("temp dir");
+        let file_path = temp.path().join("sample.rs");
+        fs::write(&file_path, "l1\nl2\nl3\nl4\nl5\n").expect("write fixture");
+
+        let start = std::time::Instant::now();
+        let payload = batch_write_code(&json!({
+            "mode": "best_effort",
+            "operations": [
+                {"id": "op1", "file_path": file_path.to_string_lossy(), "start_line": 1, "end_line": 1, "replacement": "L1"},
+                {"id": "op2", "file_path": file_path.to_string_lossy(), "start_line": 3, "end_line": 3, "replacement": "L3"},
+                {"id": "op3", "file_path": file_path.to_string_lossy(), "start_line": 5, "end_line": 5, "replacement": "L5"}
+            ]
+        }))
+        .expect("batch payload");
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            payload["applied_count"],
+            serde_json::Value::Number(3u64.into())
+        );
+        assert!(
+            elapsed.as_secs_f64() < 3.0,
+            "batch edit too slow: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_policy_route_denies_ungated_fallback_tool() {
+        let decision = evaluate_policy_route(
+            "search",
+            &json!({
+                "pattern": "main"
+            }),
+        );
+        assert_eq!(decision.route_state, PolicyRouteState::Denied);
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("fallback_gate_required")
+        );
+    }
+
+    #[test]
+    fn test_policy_route_allows_gated_fallback_tool() {
+        let decision = evaluate_policy_route(
+            "search",
+            &json!({
+                "pattern": "main",
+                "fallback_gate": "tool_runtime_failure",
+                "fallback_reason_code": "flashgrep_tool_runtime_failure"
+            }),
+        );
+        assert_eq!(decision.route_state, PolicyRouteState::AllowedFallback);
+        assert_eq!(
+            decision.fallback_gate_id.as_deref(),
+            Some("tool_runtime_failure")
+        );
+    }
+
+    #[test]
+    fn test_policy_drift_mismatch_is_detected() {
+        let decision = evaluate_policy_route(
+            "query",
+            &json!({
+                "policy_hash": "stale-policy-hash"
+            }),
+        );
+        assert_eq!(decision.route_state, PolicyRouteState::Denied);
+        assert_eq!(
+            decision.reason_code.as_deref(),
+            Some("policy_state_mismatch")
+        );
+    }
+
+    #[test]
+    fn test_policy_route_evaluation_overhead_is_bounded() {
+        let policy_hash = current_policy_hash();
+        let start = std::time::Instant::now();
+        for _ in 0..5000 {
+            let decision = evaluate_policy_route(
+                "query",
+                &json!({
+                    "text": "main",
+                    "policy_hash": policy_hash,
+                    "policy_version": "1.1"
+                }),
+            );
+            assert_eq!(decision.route_state, PolicyRouteState::AllowedNative);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 200,
+            "policy route evaluation overhead too high: {elapsed:?}"
+        );
+    }
+}

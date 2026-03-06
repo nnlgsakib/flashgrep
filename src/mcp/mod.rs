@@ -10,8 +10,11 @@ pub mod tools;
 use crate::config::paths::FlashgrepPaths;
 use crate::config::Config;
 use crate::db::Database;
-use crate::mcp::bootstrap::{build_bootstrap_payload, is_bootstrap_tool};
-use crate::mcp::code_io::{read_code, write_code};
+use crate::mcp::bootstrap::{
+    build_bootstrap_payload, evaluate_policy_route, is_bootstrap_tool, policy_denied_payload,
+    PolicyRouteState,
+};
+use crate::mcp::code_io::{batch_write_code, read_code, write_code};
 use crate::mcp::fs_tools::{
     fs_copy, fs_create, fs_list, fs_move, fs_read, fs_remove, fs_stat, fs_write,
 };
@@ -350,6 +353,20 @@ async fn handle_request(
                 }
             }
         }
+        "batch_write_code" => {
+            if let Err(e) = check_arguments_size(&request.params, MAX_MCP_REQUEST_BYTES) {
+                Some(invalid_params_error(&e.to_string()))
+            } else {
+                match batch_write_code(&request.params) {
+                    Ok(payload) => Some(payload),
+                    Err(e) => Some(map_error_with_not_found(
+                        &e,
+                        request.params.get("file_path").and_then(Value::as_str),
+                        Some("file"),
+                    )),
+                }
+            }
+        }
         "glob" => match run_glob(&request.params) {
             Ok(payload) => Some(payload),
             Err(e) => {
@@ -441,6 +458,15 @@ async fn handle_request(
         }
         // New MCP tool methods
         "search" => {
+            let decision = evaluate_policy_route("search", &request.params);
+            if decision.route_state == PolicyRouteState::Denied {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(policy_denied_payload("search", &decision)),
+                    error: None,
+                });
+            }
             let pattern = request
                 .params
                 .get("pattern")
@@ -500,6 +526,15 @@ async fn handle_request(
             }
         }
         "search-in-directory" => {
+            let decision = evaluate_policy_route("search-in-directory", &request.params);
+            if decision.route_state == PolicyRouteState::Denied {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(policy_denied_payload("search-in-directory", &decision)),
+                    error: None,
+                });
+            }
             let pattern = request
                 .params
                 .get("pattern")
@@ -584,6 +619,15 @@ async fn handle_request(
             }
         }
         "search-with-context" => {
+            let decision = evaluate_policy_route("search-with-context", &request.params);
+            if decision.route_state == PolicyRouteState::Denied {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(policy_denied_payload("search-with-context", &decision)),
+                    error: None,
+                });
+            }
             let pattern = request
                 .params
                 .get("pattern")
@@ -659,6 +703,15 @@ async fn handle_request(
             }
         }
         "search-by-regex" => {
+            let decision = evaluate_policy_route("search-by-regex", &request.params);
+            if decision.route_state == PolicyRouteState::Denied {
+                return Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: request.id,
+                    result: Some(policy_denied_payload("search-by-regex", &decision)),
+                    error: None,
+                });
+            }
             let pattern = request
                 .params
                 .get("pattern")
@@ -989,5 +1042,60 @@ mod tests {
             serde_json::Value::String("neural_first".to_string())
         );
         assert_eq!(canonical["policy_metadata"], alias["policy_metadata"]);
+    }
+
+    #[tokio::test]
+    async fn tcp_search_requires_fallback_gate_and_reason_code() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main file");
+
+        let paths = FlashgrepPaths::new(&root);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "search".to_string(),
+            params: serde_json::json!({
+                "pattern": "main",
+                "files": [root.join("src/main.rs").to_string_lossy()]
+            }),
+            id: Some(1),
+        };
+
+        let response = handle_request(req, &paths, None).await.expect("response");
+        let payload = response.result.expect("result payload");
+        assert_eq!(
+            payload["error"],
+            serde_json::Value::String("policy_denied".to_string())
+        );
+        assert_eq!(
+            payload["reason_code"],
+            serde_json::Value::String("fallback_gate_required".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_search_allows_valid_fallback_gate() {
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("main file");
+
+        let paths = FlashgrepPaths::new(&root);
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "search".to_string(),
+            params: serde_json::json!({
+                "pattern": "main",
+                "files": [root.join("src/main.rs").to_string_lossy()],
+                "fallback_gate": "tool_runtime_failure",
+                "fallback_reason_code": "flashgrep_tool_runtime_failure"
+            }),
+            id: Some(1),
+        };
+
+        let response = handle_request(req, &paths, None).await.expect("response");
+        let payload = response.result.expect("result payload");
+        assert!(payload["results"].is_array());
     }
 }

@@ -1,0 +1,9 @@
+{
+  "name": "search",
+  "arguments": {
+    "pattern": "main",
+    "files": ["src/main.rs"],
+    "fallback_gate": "tool_runtime_failure",
+    "fallback_reason_code": "flashgrep_tool_runtime_failure"
+  }
+}

@@ -16,7 +16,7 @@ SEARCH_ROUTING default=neural_first fallback=lexical_deterministic
 TOOL_ORDER
 DISCOVERY query(retrieval_mode=neural) -> query(retrieval_mode=lexical) -> get_symbol -> read_code -> get_slice
 FILES glob|files|list_files
-EDIT write_code (after read_code/get_slice validation)
+EDIT write_code|batch_write_code (after read_code/get_slice validation)
 HEALTH stats
 FS fs_create|fs_read|fs_write|fs_list|fs_stat|fs_copy|fs_move|fs_remove
 
@@ -30,6 +30,7 @@ ALLOW flashgrep_index_unavailable
 ALLOW flashgrep_operation_not_supported
 ALLOW flashgrep_tool_runtime_failure
 ALLOW repo_override_unavailable
+REQUIRE fallback_gate + fallback_reason_code for non-native fallback tool usage
 
 NATIVE_TOOL_POLICY
 BAN grep rg find cat sed shell_glob Read Write Glob Grep
@@ -48,6 +49,7 @@ CONTINUE continuation_start_line until continuation.completed=true
 
 WRITE
 USE write_code minimal-range replacement
+USE batch_write_code for deterministic multi-edit jobs
 PRECONDITION expected_file_hash|expected_start_line_text|expected_end_line_text
 ON_ERROR precondition_failed => re-read and retry
 
@@ -70,6 +72,11 @@ STEP read_code file_path="src/auth.rs" symbol_name="login"
 STEP write_code file_path="src/auth.rs" start_line=<n> end_line=<m> replacement="..." 
 STEP read_code file_path="src/auth.rs" start_line=<n> max_lines=80
 
+WORKFLOW batch_edit
+STEP read_code file_path="<path>" start_line=<n> max_lines=120
+STEP batch_write_code mode="atomic|best_effort" operations=[...]
+STEP read_code file_path="<path>" start_line=<n> max_lines=120
+
 FS_WORKFLOW
 STEP fs_create path="notes/todo.txt" parents=true
 STEP fs_write path="notes/todo.txt" overwrite=true content="..."
@@ -78,6 +85,7 @@ STEP fs_stat path="notes/todo.txt"
 COMPLIANCE_RECOVERY
 STEP bootstrap_skill arguments={"force":true,"compact":true}
 STEP verify policy_metadata.search_routing + fallback_gates
+STEP verify denied fallback requests return error=policy_denied with typed reason_code
 STEP resume with query neural-first then lexical fallback
 
 GUARDRAILS

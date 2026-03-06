@@ -1,7 +1,11 @@
 # Rust
 /target/
+debug/
+release/
 Cargo.lock
 **/*.rs.bk
+*.rlib
+*.prof*
 *.pdb
 
 # IDE
@@ -29,6 +33,8 @@ Thumbs.db
 
 # Test artifacts
 *.log
+.env*
+*.tmp
 
 # Project specific
 prompt

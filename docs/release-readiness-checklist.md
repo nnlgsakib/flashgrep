@@ -8,6 +8,10 @@ Use this checklist before declaring Flashgrep production-ready as a grep/glob re
 - [ ] Query exit status contract is validated (`0` match, `1` no match, non-zero failure).
 - [ ] Include/exclude matching behaves deterministically with `/` and `\\` separators.
 - [ ] Files command supports deterministic windows with `sort + offset + limit`.
+- [ ] `write_code` exact-range replacement validated with precondition conflicts.
+- [ ] `batch_write_code` validates deterministic ordering and mode semantics (`atomic`/`best_effort`).
+- [ ] Ungated fallback search routes return typed `policy_denied` diagnostics.
+- [ ] Valid fallback gate + reason pairs are admitted and audited.
 
 ## Filesystem Operations
 
@@ -32,4 +36,6 @@ Use this checklist before declaring Flashgrep production-ready as a grep/glob re
 
 - [ ] README includes grep/glob mapping + filesystem examples.
 - [ ] `skills/SKILL.md` keeps Flashgrep-first routing with explicit fallback gates.
+- [ ] README and skill examples include `batch_write_code` fields and typed status semantics.
+- [ ] README and skill examples include `policy_denied`, `fallback_gate`, and `fallback_reason_code` semantics.
 - [ ] Parity matrix updated (`docs/grep-glob-production-parity-matrix.md`).

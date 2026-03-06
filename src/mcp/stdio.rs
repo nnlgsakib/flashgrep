@@ -6,9 +6,13 @@
 use crate::config::paths::FlashgrepPaths;
 use crate::db::Database;
 use crate::mcp::bootstrap::{
-    build_bootstrap_payload, is_bootstrap_tool, CANONICAL_BOOTSTRAP_TRIGGER,
+    build_bootstrap_payload, evaluate_policy_route, is_bootstrap_tool, policy_denied_payload,
+    PolicyRouteState, CANONICAL_BOOTSTRAP_TRIGGER,
 };
-use crate::mcp::code_io::{read_code, read_code_input_schema, write_code, write_code_input_schema};
+use crate::mcp::code_io::{
+    batch_write_code, batch_write_code_input_schema, read_code, read_code_input_schema, write_code,
+    write_code_input_schema,
+};
 use crate::mcp::fs_tools::{
     fs_copy, fs_create, fs_list, fs_move, fs_read, fs_remove, fs_stat, fs_write,
 };
@@ -216,6 +220,11 @@ impl McpStdioServer {
                         "inputSchema": write_code_input_schema()
                     }),
                     json!({
+                        "name": "batch_write_code",
+                        "description": "Apply deterministic ordered line-range edits across files",
+                        "inputSchema": batch_write_code_input_schema()
+                    }),
+                    json!({
                         "name": "glob",
                         "description": "Advanced glob discovery with filtering, sorting, and limits",
                         "inputSchema": glob_input_schema()
@@ -272,14 +281,31 @@ impl McpStdioServer {
                     "get_slice" => self.handle_get_slice_tool(&arguments)?,
                     "read_code" => self.handle_read_code_tool(&arguments)?,
                     "write_code" => self.handle_write_code_tool(&arguments)?,
+                    "batch_write_code" => self.handle_batch_write_code_tool(&arguments)?,
                     "glob" => self.handle_glob_tool(&arguments)?,
                     "get_symbol" => self.handle_get_symbol_tool(&arguments)?,
                     "list_files" => self.handle_list_files_tool()?,
                     "stats" => self.handle_stats_tool()?,
-                    "search" => self.handle_search_tool(&arguments)?,
-                    "search-in-directory" => self.handle_search_in_directory_tool(&arguments)?,
-                    "search-with-context" => self.handle_search_with_context_tool(&arguments)?,
-                    "search-by-regex" => self.handle_search_by_regex_tool(&arguments)?,
+                    "search" => {
+                        self.handle_policy_gated_fallback_tool("search", &arguments, |s| {
+                            self.handle_search_tool(s)
+                        })?
+                    }
+                    "search-in-directory" => self.handle_policy_gated_fallback_tool(
+                        "search-in-directory",
+                        &arguments,
+                        |s| self.handle_search_in_directory_tool(s),
+                    )?,
+                    "search-with-context" => self.handle_policy_gated_fallback_tool(
+                        "search-with-context",
+                        &arguments,
+                        |s| self.handle_search_with_context_tool(s),
+                    )?,
+                    "search-by-regex" => self.handle_policy_gated_fallback_tool(
+                        "search-by-regex",
+                        &arguments,
+                        |s| self.handle_search_by_regex_tool(s),
+                    )?,
                     "fs_create" => self.handle_fs_create_tool(&arguments)?,
                     "fs_read" => self.handle_fs_read_tool(&arguments)?,
                     "fs_write" => self.handle_fs_write_tool(&arguments)?,
@@ -407,6 +433,22 @@ impl McpStdioServer {
             "content": [{"type": "text", "text": serde_json::to_string(&payload)?}],
             "isError": is_error
         })))
+    }
+
+    fn handle_policy_gated_fallback_tool<F>(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+        handler: F,
+    ) -> FlashgrepResult<Option<Value>>
+    where
+        F: FnOnce(&Value) -> FlashgrepResult<Option<Value>>,
+    {
+        let decision = evaluate_policy_route(tool_name, arguments);
+        if decision.route_state == PolicyRouteState::Denied {
+            return Self::as_tool_envelope(policy_denied_payload(tool_name, &decision));
+        }
+        handler(arguments)
     }
 
     fn handle_get_slice_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
@@ -561,6 +603,27 @@ impl McpStdioServer {
             Err(e) => {
                 let target = arguments.get("file_path").and_then(Value::as_str);
                 return Self::as_tool_envelope(map_error_with_not_found(&e, target, Some("file")));
+            }
+        };
+        Self::as_tool_envelope(payload)
+    }
+
+    fn handle_batch_write_code_tool(&self, arguments: &Value) -> FlashgrepResult<Option<Value>> {
+        if let Err(e) = check_arguments_size(arguments, MAX_MCP_REQUEST_BYTES) {
+            return Ok(Some(json!({
+                "content": [{"type": "text", "text": serde_json::to_string(&json!({"error": "invalid_params", "message": e.to_string()}))?}],
+                "isError": true
+            })));
+        }
+
+        let payload = match batch_write_code(arguments) {
+            Ok(v) => v,
+            Err(e) => {
+                return Self::as_tool_envelope(map_error_with_not_found(
+                    &e,
+                    arguments.get("file_path").and_then(Value::as_str),
+                    Some("file"),
+                ));
             }
         };
         Self::as_tool_envelope(payload)
@@ -1284,5 +1347,71 @@ mod tests {
             .expect("follow response")
             .expect("follow envelope");
         assert!(follow["content"][0]["text"].as_str().is_some());
+    }
+
+    #[test]
+    fn stdio_search_requires_fallback_gate_and_reason_code() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = temp.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write file");
+
+        let server = McpStdioServer::new(root.clone()).expect("server");
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": "search",
+                "arguments": {
+                    "pattern": "main",
+                    "files": [root.join("src/main.rs").to_string_lossy()]
+                }
+            }),
+            id: Some(1),
+        };
+
+        let response = server.handle_request(req, None).expect("response");
+        let result = response.result.expect("result payload");
+        let payload: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().expect("payload text"))
+                .expect("payload json");
+
+        assert_eq!(payload["error"], Value::String("policy_denied".to_string()));
+        assert_eq!(
+            payload["reason_code"],
+            Value::String("fallback_gate_required".to_string())
+        );
+    }
+
+    #[test]
+    fn stdio_force_bootstrap_reinjection_restores_injected_state() {
+        let (_temp, server) = setup_server_with_skill(None);
+
+        let first = payload_text(
+            server
+                .handle_skill_bootstrap_tool("flashgrep-init", &json!({"compact": true}))
+                .expect("first bootstrap"),
+        );
+        assert_eq!(first["status"], Value::String("injected".to_string()));
+
+        let second = payload_text(
+            server
+                .handle_skill_bootstrap_tool("flashgrep-init", &json!({"compact": true}))
+                .expect("second bootstrap"),
+        );
+        assert_eq!(
+            second["status"],
+            Value::String("already_injected".to_string())
+        );
+
+        let forced = payload_text(
+            server
+                .handle_skill_bootstrap_tool(
+                    "flashgrep-init",
+                    &json!({"compact": true, "force": true}),
+                )
+                .expect("forced bootstrap"),
+        );
+        assert_eq!(forced["status"], Value::String("injected".to_string()));
     }
 }
